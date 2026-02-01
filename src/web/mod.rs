@@ -7,6 +7,7 @@ pub mod routes;
 pub mod handlers;
 pub mod middleware;
 pub mod state;
+pub mod websocket;
 
 use axum::Router;
 use std::sync::Arc;
@@ -56,10 +57,17 @@ pub fn create_router(config: &Config, state: Arc<AppState>) -> Router {
         CorsLayer::new()
     };
     
+    // Create WebSocket state
+    let ws_state = Arc::new(websocket::WsState::new());
+    
     Router::new()
         // Health check
         .route("/", axum::routing::get(handlers::health_check))
         .route("/health", axum::routing::get(handlers::health_check))
+        
+        // WebSocket endpoint
+        .route("/ws", axum::routing::get(websocket::ws_handler))
+        .with_state(ws_state)
         
         // API v0 routes (compatibility with pyaleph)
         .nest("/api/v0", routes::api_v0())
