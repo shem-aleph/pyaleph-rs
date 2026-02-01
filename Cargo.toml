@@ -8,6 +8,8 @@ repository = "https://github.com/shem-aleph/pyaleph-rs"
 license = "MIT"
 
 [dependencies]
+# Official Aleph types (use git until published to crates.io)
+# aleph-types = { git = "https://github.com/aleph-im/aleph-rs", branch = "main" }
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
 async-trait = "0.1"
