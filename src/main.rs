@@ -2,9 +2,10 @@
 //!
 //! This is the main binary for running an Aleph network node.
 
-use aleph_core::{Config, web, db};
+use aleph_core::{Config, web, db, jobs};
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -33,6 +34,14 @@ struct Args {
     /// Run database migrations and exit
     #[arg(long)]
     migrate: bool,
+    
+    /// Enable chain synchronization (sync from blockchain/indexer)
+    #[arg(long)]
+    sync: bool,
+    
+    /// Use indexer-based sync (recommended, uses multichain.api.aleph.cloud)
+    #[arg(long)]
+    indexer_sync: bool,
 }
 
 #[tokio::main]
@@ -95,6 +104,29 @@ async fn main() -> anyhow::Result<()> {
         match db::init_db(&config.database).await {
             Ok(pool) => {
                 info!("Database connected and migrated");
+                
+                let config_arc = Arc::new(config.clone());
+                
+                // Start chain sync if enabled
+                if args.indexer_sync {
+                    info!("Starting indexer-based chain sync (multichain.api.aleph.cloud)");
+                    let pool_clone = pool.clone();
+                    let ipfs_url = config.ipfs.api_url.clone();
+                    tokio::spawn(async move {
+                        jobs::chain_sync::run_indexer_sync(
+                            config_arc,
+                            pool_clone,
+                            &ipfs_url,
+                        ).await;
+                    });
+                } else if args.sync {
+                    info!("Starting direct RPC chain sync");
+                    let pool_clone = pool.clone();
+                    tokio::spawn(async move {
+                        jobs::chain_sync::run_with_db(config_arc, pool_clone).await;
+                    });
+                }
+                
                 info!("Starting API server on {}:{}", config.api.host, config.api.port);
                 web::start_server_with_db(&config, pool).await?;
             }
