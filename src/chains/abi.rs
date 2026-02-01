@@ -3,10 +3,10 @@
 //! Decodes events from the Aleph smart contract.
 
 use ethers::abi::{decode, ParamType, Token};
-use ethers::types::{Log, H256};
+use ethers::types::Log;
 use thiserror::Error;
 
-use crate::types::{Chain, ChainRef, ItemType, Message, MessageType};
+use crate::types::Message;
 
 #[derive(Debug, Error)]
 pub enum AbiError {
@@ -128,9 +128,9 @@ pub fn decode_sync_event(log: &Log) -> Result<DecodedSyncEvent, AbiError> {
 /// Parse message content into a Message struct
 pub fn parse_message_content(
     content: &[u8],
-    chain: Chain,
-    tx_hash: &str,
-    block_number: u64,
+    _chain: crate::types::Chain,
+    _tx_hash: &str,
+    _block_number: u64,
 ) -> Result<Message, AbiError> {
     // Content should be JSON
     let content_str = std::str::from_utf8(content)

@@ -4,7 +4,7 @@
 //! Reference: aleph/web/controllers/
 
 use axum::{
-    routing::{get, post, delete},
+    routing::{get, post},
     Router,
 };
 use std::sync::Arc;
@@ -80,7 +80,13 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/stats", get(handlers::get_stats))
         .route("/stats/:address", get(handlers::get_address_stats))
         
-        // WebSocket
+        // Pending messages - matches pyaleph /pending endpoint
+        .route("/pending", get(handlers::get_pending_messages))
+        
+        // Chain sync status - matches pyaleph /sync/status
+        .route("/sync/status", get(handlers::get_sync_status))
+        
+        // WebSocket - real-time message streaming
         .route("/ws", get(websocket::ws_handler))
 }
 
@@ -91,6 +97,10 @@ fn legacy_routes() -> Router<Arc<AppState>> {
         .route("/messages.json", get(handlers::list_messages))
         .route("/aggregates/:address.json", get(handlers::get_aggregates))
         .route("/posts.json", get(handlers::get_posts))
+        
+        // Legacy pending/sync at root level
+        .route("/pending", get(handlers::get_pending_messages))
+        .route("/sync/status", get(handlers::get_sync_status))
         
         // Health check
         .route("/", get(handlers::health_check))
@@ -106,10 +116,10 @@ fn internal_routes() -> Router<Arc<AppState>> {
         // Detailed status
         .route("/status", get(handlers::get_detailed_status))
         
-        // Chain sync status
+        // Chain sync status (also available at /sync)
         .route("/sync", get(handlers::get_sync_status))
         
-        // Pending messages
+        // Pending messages (also available at /pending)
         .route("/pending", get(handlers::get_pending_messages))
         
         // Cache stats

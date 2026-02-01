@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::collections::HashSet;
 use tokio::sync::{broadcast, RwLock, mpsc};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 
-use crate::types::{Message, MessageType};
+use crate::types::Message;
 use crate::network::rabbitmq::P2PMessage;
 
 /// WebSocket query parameters
@@ -317,8 +317,8 @@ async fn handle_socket(socket: WebSocket, ws_state: Arc<WsState>, query: WsQuery
     let sender = Arc::new(RwLock::new(sender));
     
     // Create subscription state from query
-    let mut filter = SubscriptionFilter::from_query(&query);
-    let mut subscribed = !filter.is_empty();
+    let filter = SubscriptionFilter::from_query(&query);
+    let subscribed = !filter.is_empty();
     let mut message_rx = ws_state.message_tx.subscribe();
     
     // Update client count

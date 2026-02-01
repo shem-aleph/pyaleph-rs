@@ -5,14 +5,13 @@
 //! Key features:
 //! - Dynamic pricing from aggregates (not hardcoded)
 //! - Volume discount calculation
-//! - GPU tier pricing
+//! - GPU tier pricing with device ID matching
 //! - Internet-enabled execution multiplier
 //! - Support for hold/payg/credit payment types
 //!
 //! Reference: aleph/services/cost.py
 
 use rust_decimal::Decimal;
-use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,14 +90,77 @@ impl Default for VolumeDiscount {
     }
 }
 
-/// GPU tier information
+/// GPU tier information with device matching
+/// 
+/// Reference: aleph/types/vms.py GpuProperties
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuTier {
+    /// Tier identifier (e.g., "nvidia-a100", "nvidia-rtx4090")
     pub id: String,
+    /// Display name
     pub name: String,
+    /// Compute units for this GPU
     pub compute_units: u32,
+    /// VRAM in gigabytes
     pub vram_gb: u32,
+    /// Cost multiplier
     pub multiplier: Decimal,
+    /// Device IDs that match this tier (PCI device IDs)
+    #[serde(default)]
+    pub device_ids: Vec<String>,
+    /// Device name patterns (for matching by name)
+    #[serde(default)]
+    pub name_patterns: Vec<String>,
+    /// Tier category: "premium" or "standard"
+    #[serde(default = "default_tier_category")]
+    pub category: String,
+}
+
+fn default_tier_category() -> String {
+    "standard".to_string()
+}
+
+impl GpuTier {
+    /// Check if a GPU device matches this tier
+    /// 
+    /// Matches by:
+    /// 1. Exact device ID match (highest priority)
+    /// 2. Device ID prefix match
+    /// 3. Name pattern match
+    pub fn matches(&self, device_id: Option<&str>, device_name: Option<&str>) -> bool {
+        // Check device ID match (highest priority)
+        if let Some(id) = device_id {
+            let id_lower = id.to_lowercase();
+            for tier_id in &self.device_ids {
+                let tier_id_lower = tier_id.to_lowercase();
+                if id_lower == tier_id_lower || id_lower.starts_with(&tier_id_lower) {
+                    return true;
+                }
+            }
+        }
+        
+        // Check name pattern match
+        if let Some(name) = device_name {
+            let name_lower = name.to_lowercase();
+            for pattern in &self.name_patterns {
+                let pattern_lower = pattern.to_lowercase();
+                if name_lower.contains(&pattern_lower) {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Check if this is a premium tier
+    pub fn is_premium(&self) -> bool {
+        self.category == "premium" || 
+        self.vram_gb >= 24 ||
+        self.name.to_lowercase().contains("a100") ||
+        self.name.to_lowercase().contains("h100") ||
+        self.name.to_lowercase().contains("a40")
+    }
 }
 
 /// Cost service for calculating resource costs
@@ -108,7 +170,7 @@ pub struct CostService {
     prices: Arc<RwLock<HashMap<ProductPriceType, ProductPrice>>>,
     /// Volume discounts
     volume_discounts: Arc<RwLock<Vec<VolumeDiscount>>>,
-    /// GPU tiers
+    /// GPU tiers with device matching
     gpu_tiers: Arc<RwLock<HashMap<String, GpuTier>>>,
     /// Internet access multiplier
     internet_multiplier: Decimal,
@@ -191,10 +253,110 @@ impl CostService {
             VolumeDiscount { min_compute_units: 500, discount: dec!(0.20) },
         ];
         
+        // Initialize default GPU tiers with device IDs
+        // Reference: aleph/types/vms.py GPU device mapping
+        let mut gpu_tiers = HashMap::new();
+        gpu_tiers.insert("nvidia-a100".to_string(), GpuTier {
+            id: "nvidia-a100".to_string(),
+            name: "NVIDIA A100".to_string(),
+            compute_units: 100,
+            vram_gb: 40,
+            multiplier: dec!(10.0),
+            device_ids: vec![
+                "20b0".to_string(), // A100 PCIe 40GB
+                "20b2".to_string(), // A100 SXM4 40GB
+                "20bf".to_string(), // A100 PCIe 80GB
+                "20b5".to_string(), // A100 SXM4 80GB
+            ],
+            name_patterns: vec!["A100".to_string()],
+            category: "premium".to_string(),
+        });
+        
+        gpu_tiers.insert("nvidia-h100".to_string(), GpuTier {
+            id: "nvidia-h100".to_string(),
+            name: "NVIDIA H100".to_string(),
+            compute_units: 150,
+            vram_gb: 80,
+            multiplier: dec!(15.0),
+            device_ids: vec![
+                "2330".to_string(), // H100 PCIe
+                "2331".to_string(), // H100 SXM
+            ],
+            name_patterns: vec!["H100".to_string()],
+            category: "premium".to_string(),
+        });
+        
+        gpu_tiers.insert("nvidia-rtx4090".to_string(), GpuTier {
+            id: "nvidia-rtx4090".to_string(),
+            name: "NVIDIA RTX 4090".to_string(),
+            compute_units: 60,
+            vram_gb: 24,
+            multiplier: dec!(8.0),
+            device_ids: vec![
+                "2684".to_string(), // RTX 4090
+            ],
+            name_patterns: vec!["RTX 4090".to_string(), "4090".to_string()],
+            category: "premium".to_string(),
+        });
+        
+        gpu_tiers.insert("nvidia-rtx3090".to_string(), GpuTier {
+            id: "nvidia-rtx3090".to_string(),
+            name: "NVIDIA RTX 3090".to_string(),
+            compute_units: 40,
+            vram_gb: 24,
+            multiplier: dec!(6.0),
+            device_ids: vec![
+                "2204".to_string(), // RTX 3090
+                "2208".to_string(), // RTX 3090 Ti
+            ],
+            name_patterns: vec!["RTX 3090".to_string(), "3090".to_string()],
+            category: "premium".to_string(),
+        });
+        
+        gpu_tiers.insert("nvidia-a40".to_string(), GpuTier {
+            id: "nvidia-a40".to_string(),
+            name: "NVIDIA A40".to_string(),
+            compute_units: 50,
+            vram_gb: 48,
+            multiplier: dec!(8.0),
+            device_ids: vec![
+                "2235".to_string(), // A40
+            ],
+            name_patterns: vec!["A40".to_string()],
+            category: "premium".to_string(),
+        });
+        
+        gpu_tiers.insert("nvidia-t4".to_string(), GpuTier {
+            id: "nvidia-t4".to_string(),
+            name: "NVIDIA T4".to_string(),
+            compute_units: 20,
+            vram_gb: 16,
+            multiplier: dec!(4.0),
+            device_ids: vec![
+                "1eb8".to_string(), // T4
+            ],
+            name_patterns: vec!["T4".to_string()],
+            category: "standard".to_string(),
+        });
+        
+        gpu_tiers.insert("nvidia-rtx3080".to_string(), GpuTier {
+            id: "nvidia-rtx3080".to_string(),
+            name: "NVIDIA RTX 3080".to_string(),
+            compute_units: 25,
+            vram_gb: 10,
+            multiplier: dec!(5.0),
+            device_ids: vec![
+                "2206".to_string(), // RTX 3080
+                "2216".to_string(), // RTX 3080 Ti
+            ],
+            name_patterns: vec!["RTX 3080".to_string(), "3080".to_string()],
+            category: "standard".to_string(),
+        });
+        
         Self {
             prices: Arc::new(RwLock::new(prices)),
             volume_discounts: Arc::new(RwLock::new(volume_discounts)),
-            gpu_tiers: Arc::new(RwLock::new(HashMap::new())),
+            gpu_tiers: Arc::new(RwLock::new(gpu_tiers)),
             internet_multiplier: defaults::internet_multiplier(),
         }
     }
@@ -230,10 +392,9 @@ impl CostService {
             vd.sort_by(|a, b| a.min_compute_units.cmp(&b.min_compute_units));
         }
         
-        // Parse GPU tiers
+        // Parse GPU tiers with device ID support
         if let Some(tiers) = aggregate.get("gpu_tiers").and_then(|v| v.as_object()) {
             let mut gt = self.gpu_tiers.write().await;
-            gt.clear();
             
             for (tier_id, tier_data) in tiers {
                 if let Ok(tier) = serde_json::from_value::<GpuTier>(tier_data.clone()) {
@@ -372,10 +533,64 @@ impl CostService {
         prices.insert(product_type, price);
     }
     
-    /// Get GPU tier information
+    /// Get GPU tier information by tier ID
     pub async fn get_gpu_tier(&self, tier_id: &str) -> Option<GpuTier> {
         let tiers = self.gpu_tiers.read().await;
         tiers.get(tier_id).cloned()
+    }
+    
+    /// Find GPU tier by device ID or name
+    /// 
+    /// This matches GPU devices to tiers using:
+    /// 1. Exact device ID match (PCI device ID)
+    /// 2. Device ID prefix match
+    /// 3. Device name pattern match
+    pub async fn find_gpu_tier_by_device(
+        &self,
+        device_id: Option<&str>,
+        device_name: Option<&str>,
+    ) -> Option<GpuTier> {
+        let tiers = self.gpu_tiers.read().await;
+        
+        // First try exact device ID match
+        if let Some(id) = device_id {
+            for tier in tiers.values() {
+                if tier.matches(Some(id), None) {
+                    return Some(tier.clone());
+                }
+            }
+        }
+        
+        // Then try name match
+        if let Some(name) = device_name {
+            for tier in tiers.values() {
+                if tier.matches(None, Some(name)) {
+                    return Some(tier.clone());
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Determine product type based on GPU device
+    /// 
+    /// Returns the appropriate price type (premium/standard) based on GPU.
+    pub async fn get_gpu_product_type(
+        &self,
+        device_id: Option<&str>,
+        device_name: Option<&str>,
+    ) -> ProductPriceType {
+        if let Some(tier) = self.find_gpu_tier_by_device(device_id, device_name).await {
+            if tier.is_premium() {
+                ProductPriceType::InstanceGpuPremium
+            } else {
+                ProductPriceType::InstanceGpuStandard
+            }
+        } else {
+            // Default to standard if no match
+            ProductPriceType::InstanceGpuStandard
+        }
     }
     
     /// Calculate cost for a GPU instance
@@ -391,7 +606,7 @@ impl CostService {
         let tier = self.get_gpu_tier(gpu_tier_id).await?;
         
         // Determine product type based on tier
-        let product_type = if gpu_tier_id.contains("premium") || tier.vram_gb >= 24 {
+        let product_type = if tier.is_premium() {
             ProductPriceType::InstanceGpuPremium
         } else {
             ProductPriceType::InstanceGpuStandard
@@ -415,6 +630,65 @@ impl CostService {
         };
         
         // Apply volume discount
+        let discount = self.get_volume_discount(compute_units).await;
+        let discount_multiplier = Decimal::ONE - discount;
+        
+        Some(CostResult {
+            holding: multiplied_cost.holding * discount_multiplier,
+            payg: multiplied_cost.payg * discount_multiplier,
+            credit: multiplied_cost.credit * discount_multiplier,
+        })
+    }
+    
+    /// Calculate cost for GPU instance by device ID/name
+    /// 
+    /// This is the preferred method as it automatically finds the right tier.
+    pub async fn calculate_gpu_instance_cost_by_device(
+        &self,
+        memory_mib: u32,
+        vcpus: u32,
+        storage_mib: u64,
+        hours: u64,
+        device_id: Option<&str>,
+        device_name: Option<&str>,
+        internet_enabled: bool,
+    ) -> Option<CostResult> {
+        let tier = self.find_gpu_tier_by_device(device_id, device_name).await;
+        
+        let product_type = if let Some(ref t) = tier {
+            if t.is_premium() {
+                ProductPriceType::InstanceGpuPremium
+            } else {
+                ProductPriceType::InstanceGpuStandard
+            }
+        } else {
+            ProductPriceType::InstanceGpuStandard
+        };
+        
+        let compute_units = if let Some(ref t) = tier {
+            if t.compute_units > 0 {
+                t.compute_units
+            } else {
+                self.calculate_compute_units(memory_mib, vcpus)
+            }
+        } else {
+            self.calculate_compute_units(memory_mib, vcpus)
+        };
+        
+        let multiplier = tier.map(|t| t.multiplier).unwrap_or_else(|| {
+            use rust_decimal_macros::dec;
+            dec!(5.0) // Default GPU multiplier
+        });
+        
+        let storage_cost = self.calculate_storage_cost(storage_mib, hours, product_type).await?;
+        let compute_cost = self.calculate_compute_cost(compute_units, hours, product_type, internet_enabled).await?;
+        
+        let multiplied_cost = CostResult {
+            holding: storage_cost.holding + (compute_cost.holding * multiplier),
+            payg: storage_cost.payg + (compute_cost.payg * multiplier),
+            credit: storage_cost.credit + (compute_cost.credit * multiplier),
+        };
+        
         let discount = self.get_volume_discount(compute_units).await;
         let discount_multiplier = Decimal::ONE - discount;
         
@@ -509,6 +783,43 @@ mod tests {
     }
     
     #[tokio::test]
+    async fn test_gpu_tier_matching() {
+        let cost = CostService::new();
+        
+        // Match by device ID
+        let tier = cost.find_gpu_tier_by_device(Some("20b0"), None).await;
+        assert!(tier.is_some());
+        assert_eq!(tier.unwrap().name, "NVIDIA A100");
+        
+        // Match by name
+        let tier = cost.find_gpu_tier_by_device(None, Some("RTX 4090")).await;
+        assert!(tier.is_some());
+        assert_eq!(tier.unwrap().id, "nvidia-rtx4090");
+        
+        // Match by partial name
+        let tier = cost.find_gpu_tier_by_device(None, Some("NVIDIA GeForce RTX 3090 Ti")).await;
+        assert!(tier.is_some());
+        assert!(tier.unwrap().name.contains("3090"));
+        
+        // No match
+        let tier = cost.find_gpu_tier_by_device(Some("unknown"), Some("Unknown GPU")).await;
+        assert!(tier.is_none());
+    }
+    
+    #[tokio::test]
+    async fn test_gpu_tier_is_premium() {
+        let cost = CostService::new();
+        
+        // A100 should be premium
+        let tier = cost.get_gpu_tier("nvidia-a100").await.unwrap();
+        assert!(tier.is_premium());
+        
+        // T4 should be standard
+        let tier = cost.get_gpu_tier("nvidia-t4").await.unwrap();
+        assert!(!tier.is_premium());
+    }
+    
+    #[tokio::test]
     async fn test_update_from_aggregate() {
         let cost = CostService::new();
         
@@ -521,6 +832,18 @@ mod tests {
                         "credit": "0.0040"
                     }
                 }
+            },
+            "gpu_tiers": {
+                "custom-gpu": {
+                    "id": "custom-gpu",
+                    "name": "Custom GPU",
+                    "compute_units": 50,
+                    "vram_gb": 16,
+                    "multiplier": "6.0",
+                    "device_ids": ["9999"],
+                    "name_patterns": ["Custom"],
+                    "category": "standard"
+                }
             }
         });
         
@@ -528,5 +851,9 @@ mod tests {
         
         let price = cost.get_price(&ProductPriceType::Storage).await.unwrap();
         assert_eq!(price.storage.credit, Decimal::from_str("0.0040").unwrap());
+        
+        let tier = cost.get_gpu_tier("custom-gpu").await;
+        assert!(tier.is_some());
+        assert_eq!(tier.unwrap().vram_gb, 16);
     }
 }

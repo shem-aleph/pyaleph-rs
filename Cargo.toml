@@ -30,11 +30,14 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "chrono", "uu
 # Crypto
 secp256k1 = { version = "0.28", features = ["recovery"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 sha3 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 bs58 = "0.5"
+ripemd = "0.1"
+bech32 = "0.11"
 
 # HTTP client
 reqwest = { version = "0.11", features = ["json", "multipart", "stream"] }
