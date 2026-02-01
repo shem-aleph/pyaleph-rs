@@ -52,6 +52,9 @@ clap = { version = "4.5", features = ["derive"] }
 # IPFS
 ipfs-api-backend-hyper = "0.6"
 
+# Message Queue (for p2p-service integration)
+lapin = "2.3"
+
 # Blockchain specific
 ethers = "2.0"
 # web3 = "0.19"

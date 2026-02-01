@@ -5,6 +5,7 @@
 
 pub mod peer;
 pub mod protocol;
+pub mod rabbitmq;
 
 use std::collections::HashMap;
 use std::sync::Arc;
