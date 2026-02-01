@@ -51,6 +51,16 @@ pub enum ItemType {
     Storage,
 }
 
+impl std::fmt::Display for ItemType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ItemType::Inline => write!(f, "inline"),
+            ItemType::Ipfs => write!(f, "ipfs"),
+            ItemType::Storage => write!(f, "storage"),
+        }
+    }
+}
+
 /// A message on the Aleph network
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
