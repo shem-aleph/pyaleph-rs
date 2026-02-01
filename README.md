@@ -4,7 +4,8 @@
 
 ## Status
 
-✅ **Feature Complete** — Full parity with Python pyaleph implementation.
+✅ **Feature Complete** — Full parity with Python pyaleph implementation.  
+🚀 **Live Node** — Running on Aleph Cloud, syncing from mainnet.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -14,12 +15,19 @@
 | Database | ✅ | PostgreSQL with migrations |
 | Message Handlers | ✅ | All 6 types (Aggregate, Post, Store, Program, Instance, Forget) |
 | Chain Indexers | ✅ | Ethereum, Avalanche, BSC, Solana, Tezos |
+| Multichain Indexer | ✅ | Sync via multichain.api.aleph.cloud GraphQL |
 | Signature Verification | ✅ | Ed25519, secp256k1, EIP-191 |
-| WebSocket | ✅ | Real-time subscriptions |
+| WebSocket | ✅ | Real-time subscriptions via RabbitMQ |
 | P2P Integration | ✅ | RabbitMQ bridge to p2p-service |
 | Redis Cache | ✅ | With in-memory fallback |
 | Metrics | ✅ | Prometheus endpoint |
 | Background Jobs | ✅ | Message processor, chain sync, GC, balance tracker |
+
+### Live Deployment
+
+A test node is running on Aleph Cloud:
+- **API**: `http://[2a01:240:ad00:2503:3:c670:f33c:c131]:8080/api/v0/`
+- **Status**: Syncing ~33k+ messages from multichain indexer
 
 ## Performance
 
@@ -59,9 +67,15 @@ cargo test
 
 # With PostgreSQL
 export DATABASE_URL="postgres://user:pass@localhost/aleph"
-./target/release/aleph-core
+./target/release/aleph-core -c config.toml
 
-# Run migrations first
+# Sync from multichain indexer (recommended for initial sync)
+./target/release/aleph-core --indexer-sync -c config.toml
+
+# Traditional chain sync (direct RPC indexing)
+./target/release/aleph-core --sync -c config.toml
+
+# Run migrations only
 ./target/release/aleph-core --migrate
 ```
 

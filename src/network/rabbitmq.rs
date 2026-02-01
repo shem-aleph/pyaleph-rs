@@ -101,12 +101,18 @@ pub struct PendingMessageEnvelope {
 }
 
 /// RabbitMQ service for P2P communication
+/// 
+/// The message channels are used for async message passing when P2P
+/// federation is enabled. Currently used for WebSocket real-time updates.
 #[derive(Debug)]
 pub struct RabbitMQService {
     config: RabbitMQConfig,
     connection: Option<Connection>,
     channel: Option<Channel>,
+    /// Sender for publishing messages to the P2P network
+    #[allow(dead_code)]
     message_tx: mpsc::Sender<P2PMessage>,
+    /// Receiver for incoming P2P messages (consumed by message processor)
     #[allow(dead_code)]
     message_rx: mpsc::Receiver<P2PMessage>,
 }
