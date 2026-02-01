@@ -351,7 +351,7 @@ pub struct ApiConfig {
     pub websocket_ping_interval: u64,
 }
 
-fn default_host() -> String { "0.0.0.0".to_string() }
+fn default_host() -> String { "::".to_string() }
 fn default_port() -> u16 { 8080 }
 fn default_cors_origins() -> Vec<String> { vec!["*".to_string()] }
 fn default_rate_limit() -> Option<u32> { Some(100) }
