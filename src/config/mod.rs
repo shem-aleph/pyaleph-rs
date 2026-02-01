@@ -681,7 +681,7 @@ impl Default for P2pConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpfsConfig {
     /// IPFS API endpoint
-    #[serde(default = "default_ipfs_api")]
+    #[serde(default = "default_ipfs_api", alias = "url")]
     pub api_url: String,
     
     /// Gateway URL for fetching content
