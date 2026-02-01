@@ -193,21 +193,45 @@ pub async fn list_messages(
     builder.limit(per_page as i64);
     builder.offset(offset);
     
-    let (query, count_query, _args) = builder.build_with_count();
+    // Get total count first (before consuming args)
+    let count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
+    // Re-apply the same filters for count
+    let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
     
-    // Execute queries with proper parameter handling
-    // Note: For simplicity, we re-build args for each query. In production,
-    // you'd want to clone or share the args properly.
-    let messages = sqlx::query_as::<_, crate::db::models::MessageDb>(&query)
-        .fetch_all(state.db())
-        .await
-        .unwrap_or_default();
+    if let Some(ref addresses) = params.addresses {
+        let addr_list = crate::db::parse_csv_param(addresses);
+        if !addr_list.is_empty() {
+            count_builder.and_in("sender", &addr_list);
+        }
+    }
+    if let Some(ref msg_type) = params.message_type {
+        count_builder.and_eq("message_type", msg_type.to_uppercase());
+    }
+    if let Some(ref channels) = params.channels {
+        let channel_list = crate::db::parse_csv_param(channels);
+        if !channel_list.is_empty() {
+            count_builder.and_in("channel", &channel_list);
+        }
+    }
+    if let Some(start) = params.start_date {
+        count_builder.and_gte("time", start);
+    }
+    if let Some(end) = params.end_date {
+        count_builder.and_lte("time", end);
+    }
     
-    // Get total count
-    let total: (i64,) = sqlx::query_as(&count_query)
+    let (count_query, count_args) = count_builder.build();
+    let total: (i64,) = sqlx::query_as_with(&count_query, count_args)
         .fetch_one(state.db())
         .await
         .unwrap_or((0,));
+
+    // Now get the messages with the main query
+    let (query, args) = builder.build();
+    let messages = sqlx::query_as_with::<_, crate::db::models::MessageDb, _>(&query, args)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default();
     
     // Convert to response format with confirmations
     let message_responses: Vec<MessageResponse> = messages.iter()
