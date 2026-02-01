@@ -11,6 +11,7 @@ pub mod abi;
 pub mod ethereum;
 pub mod avalanche;
 pub mod bsc;
+pub mod indexer;
 pub mod solana;
 pub mod tezos;
 pub mod tx_packer;

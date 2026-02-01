@@ -1,6 +1,9 @@
 //! Chain synchronization job
 //!
-//! Syncs messages from supported blockchains.
+//! Syncs messages from supported blockchains using:
+//! - Aleph multichain indexer (https://multichain.api.aleph.cloud)
+//! - Direct RPC for supplementary sync
+//! - IPFS for fetching message batches
 
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -9,8 +12,9 @@ use sqlx::PgPool;
 
 use crate::config::Config;
 use crate::chains::{start_indexers, ChainIndexer};
+use crate::chains::indexer::{IndexerClient, IndexerBlockchain, IndexerSyncEvent};
 use crate::db::SyncStateAccessor;
-use crate::types::Chain;
+use crate::types::{Chain, Message};
 
 /// Sync interval in seconds
 const SYNC_INTERVAL_SECS: u64 = 12; // Ethereum block time
@@ -161,4 +165,193 @@ pub struct ChainSyncStatus {
     pub last_block: u64,
     pub last_sync: String,
     pub synced: bool,
+}
+
+/// IPFS batch content containing messages
+#[derive(Debug, serde::Deserialize)]
+pub struct IpfsBatchContent {
+    pub protocol: String,
+    pub version: u32,
+    pub content: IpfsBatchMessages,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct IpfsBatchMessages {
+    pub messages: Vec<Message>,
+}
+
+/// Run indexer-based chain sync (recommended)
+/// 
+/// Uses the Aleph multichain indexer to fetch sync events,
+/// then retrieves message batches from IPFS.
+pub async fn run_indexer_sync(config: Arc<Config>, pool: PgPool, ipfs_url: &str) {
+    let indexer_client = IndexerClient::new(None);
+    let ipfs_client = reqwest::Client::new();
+    
+    info!("Starting indexer-based chain sync");
+    
+    let mut interval = interval(Duration::from_secs(30)); // Check every 30s
+    
+    loop {
+        interval.tick().await;
+        
+        // Sync Ethereum
+        if let Err(e) = sync_chain_from_indexer(
+            &indexer_client,
+            &ipfs_client,
+            ipfs_url,
+            &pool,
+            Chain::ETH,
+        ).await {
+            error!("Ethereum indexer sync error: {}", e);
+        }
+    }
+}
+
+/// Sync a chain using the indexer
+async fn sync_chain_from_indexer(
+    indexer: &IndexerClient,
+    ipfs_client: &reqwest::Client,
+    ipfs_url: &str,
+    pool: &PgPool,
+    chain: Chain,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let blockchain = IndexerBlockchain::from(chain);
+    
+    // Get last sync timestamp
+    let last_sync_ts = SyncStateAccessor::get_last_sync_timestamp(pool, chain)
+        .await?
+        .unwrap_or(0);
+    
+    // Current time in milliseconds
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    
+    // Fetch sync events from last sync to now
+    let events = indexer.fetch_sync_events(
+        blockchain,
+        last_sync_ts,
+        now_ms,
+        100,
+    ).await?;
+    
+    if events.is_empty() {
+        return Ok(0);
+    }
+    
+    info!("{}: Found {} sync events to process", chain, events.len());
+    
+    let mut total_messages = 0;
+    
+    for event in &events {
+        // Parse the sync message to get IPFS hash
+        let sync_content = match IndexerClient::parse_sync_message(&event.message) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to parse sync message: {}", e);
+                continue;
+            }
+        };
+        
+        // Fetch IPFS content
+        let ipfs_content = match fetch_ipfs_content(
+            ipfs_client,
+            ipfs_url,
+            &sync_content.content,
+        ).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to fetch IPFS content {}: {}", sync_content.content, e);
+                continue;
+            }
+        };
+        
+        // Parse and store messages
+        match parse_and_store_messages(pool, &ipfs_content, chain, event).await {
+            Ok(count) => {
+                total_messages += count;
+                debug!(
+                    "{}: Stored {} messages from IPFS {}",
+                    chain, count, sync_content.content
+                );
+            }
+            Err(e) => {
+                warn!("Failed to store messages from {}: {}", sync_content.content, e);
+            }
+        }
+    }
+    
+    // Update sync timestamp
+    if let Some(last_event) = events.last() {
+        SyncStateAccessor::update_last_sync_timestamp(pool, chain, last_event.timestamp).await?;
+    }
+    
+    if total_messages > 0 {
+        info!("{}: Synced {} messages from {} events", chain, total_messages, events.len());
+    }
+    
+    Ok(total_messages)
+}
+
+/// Fetch content from IPFS
+async fn fetch_ipfs_content(
+    client: &reqwest::Client,
+    ipfs_url: &str,
+    cid: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{}/api/v0/cat?arg={}", ipfs_url, cid);
+    
+    let response = client
+        .post(&url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?;
+    
+    if !response.status().is_success() {
+        return Err(format!("IPFS fetch failed: {}", response.status()).into());
+    }
+    
+    Ok(response.text().await?)
+}
+
+/// Parse IPFS content and store messages
+async fn parse_and_store_messages(
+    pool: &PgPool,
+    content: &str,
+    chain: Chain,
+    event: &IndexerSyncEvent,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let batch: IpfsBatchContent = serde_json::from_str(content)?;
+    
+    let mut count = 0;
+    
+    for message in &batch.content.messages {
+        // Store message
+        let result = sqlx::query(
+            r#"
+            INSERT INTO messages (
+                item_hash, message_type, chain, sender, signature,
+                item_type, item_content, channel, time, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            ON CONFLICT (item_hash) DO NOTHING
+            "#
+        )
+        .bind(&message.item_hash)
+        .bind(message.message_type.to_string())
+        .bind(message.chain.to_string())
+        .bind(&message.sender)
+        .bind(&message.signature)
+        .bind(message.item_type.to_string())
+        .bind(message.item_content.as_ref().map(|s| s.as_str()))
+        .bind(&message.channel)
+        .bind(message.time)
+        .execute(pool)
+        .await?;
+        
+        if result.rows_affected() > 0 {
+            count += 1;
+        }
+    }
+    
+    Ok(count)
 }

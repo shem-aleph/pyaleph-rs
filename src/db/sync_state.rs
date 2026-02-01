@@ -87,6 +87,43 @@ impl SyncStateAccessor {
         info!("Initialized sync state for {}: starting at block {}", chain, start_block);
         Ok(start_block)
     }
+    
+    /// Get last sync timestamp (milliseconds) for indexer-based sync
+    pub async fn get_last_sync_timestamp(
+        pool: &PgPool,
+        chain: Chain,
+    ) -> Result<Option<u64>, sqlx::Error> {
+        let result: Option<(i64,)> = sqlx::query_as(
+            "SELECT last_sync_timestamp FROM chain_sync_state WHERE chain = $1"
+        )
+        .bind(chain.to_string())
+        .fetch_optional(pool)
+        .await?;
+        
+        Ok(result.map(|(ts,)| ts as u64))
+    }
+    
+    /// Update last sync timestamp (milliseconds) for indexer-based sync
+    pub async fn update_last_sync_timestamp(
+        pool: &PgPool,
+        chain: Chain,
+        timestamp_ms: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE chain_sync_state 
+            SET last_sync_timestamp = $2, last_sync = NOW()
+            WHERE chain = $1
+            "#
+        )
+        .bind(chain.to_string())
+        .bind(timestamp_ms as i64)
+        .execute(pool)
+        .await?;
+        
+        debug!("Updated indexer sync timestamp for {}: {}", chain, timestamp_ms);
+        Ok(())
+    }
 }
 
 /// Chain sync state from database
