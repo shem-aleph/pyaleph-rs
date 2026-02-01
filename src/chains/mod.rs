@@ -2,6 +2,7 @@
 //!
 //! Handles synchronization with various blockchains.
 
+pub mod abi;
 pub mod ethereum;
 
 use async_trait::async_trait;

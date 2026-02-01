@@ -6,23 +6,16 @@ use async_trait::async_trait;
 use ethers::{
     prelude::*,
     providers::{Http, Provider},
-    types::{Address as EthAddress, Filter, Log, H256, U64},
+    types::{Address as EthAddress, Filter, Log},
 };
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 
 use crate::config::EthereumConfig;
-use crate::types::{Chain, ChainRef, ItemType, Message, MessageType};
+use crate::types::{Chain, ChainRef, Message};
 
+use super::abi::{self, signatures};
 use super::{ChainError, ChainIndexer, IndexResult, IndexedMessage};
-
-/// Aleph.im message event signature
-/// event Message(address indexed sender, string msgType, bytes content)
-const MESSAGE_EVENT_SIGNATURE: &str = "Message(address,string,bytes)";
-
-/// Sync event signature
-/// event SyncMessage(bytes content)
-const SYNC_EVENT_SIGNATURE: &str = "SyncMessage(bytes)";
 
 /// Ethereum chain indexer
 pub struct EthereumIndexer {
@@ -73,21 +66,73 @@ impl EthereumIndexer {
         
         let event_sig = log.topics[0];
         
-        // Parse based on event type
-        // For now, we'll implement basic parsing
-        // Full implementation would decode the ABI-encoded data
+        // Try to decode as Message event
+        if event_sig == *signatures::MESSAGE {
+            match abi::decode_message_event(log) {
+                Ok(decoded) => {
+                    debug!(
+                        "Decoded Message event: sender={}, type={}, content_len={}",
+                        decoded.sender, decoded.message_type, decoded.content.len()
+                    );
+                    
+                    // Parse the message content
+                    match abi::parse_message_content(
+                        &decoded.content,
+                        Chain::ETH,
+                        &tx_hash,
+                        block_number,
+                    ) {
+                        Ok(message) => {
+                            return Ok(Some(IndexedMessage {
+                                message,
+                                chain_ref: ChainRef {
+                                    chain: Chain::ETH,
+                                    height: block_number,
+                                    hash: tx_hash,
+                                },
+                                tx_hash: log.transaction_hash
+                                    .map(|h| format!("{:?}", h))
+                                    .unwrap_or_default(),
+                            }));
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse message content: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to decode Message event: {}", e);
+                }
+            }
+        }
         
-        debug!("Found log at block {}: tx={}", block_number, tx_hash);
+        // Try to decode as SyncMessage event
+        if event_sig == *signatures::SYNC_MESSAGE {
+            match abi::decode_sync_event(log) {
+                Ok(decoded) => {
+                    debug!(
+                        "Decoded SyncMessage event: content_len={}",
+                        decoded.content.len()
+                    );
+                    
+                    // Sync messages contain IPFS hashes to fetch
+                    match abi::parse_sync_content(&decoded.content) {
+                        Ok(hashes) => {
+                            debug!("Sync message contains {} hashes to fetch", hashes.len());
+                            // TODO: Queue these hashes for fetching from IPFS
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse sync content: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to decode SyncMessage event: {}", e);
+                }
+            }
+        }
         
-        // TODO: Implement full ABI decoding
-        // For now, return None (would need proper ABI parsing)
         Ok(None)
-    }
-    
-    /// Decode message data from log
-    fn decode_message_data(&self, _data: &[u8]) -> Result<Message, ChainError> {
-        // TODO: Implement proper ABI decoding
-        Err(ChainError::Parse("ABI decoding not yet implemented".to_string()))
     }
 }
 
@@ -132,6 +177,8 @@ impl ChainIndexer for EthereumIndexer {
                 Err(e) => warn!("Failed to parse log: {}", e),
             }
         }
+        
+        info!("Indexed {} messages from blocks {} to {}", messages.len(), start, end);
         
         Ok(IndexResult {
             messages,
@@ -183,9 +230,8 @@ mod tests {
             start_block: 10000000,
         };
         
-        // This will fail without a valid RPC endpoint, but tests the structure
+        // This will succeed since we're not making any calls yet
         let result = EthereumIndexer::new(&config).await;
-        // We expect this to succeed since we're not making any calls yet
         assert!(result.is_ok());
     }
 }
