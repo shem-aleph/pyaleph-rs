@@ -756,6 +756,8 @@ mod tests {
         assert_eq!(cost.calculate_compute_units(2048, 4), 4);
     }
     
+    use std::str::FromStr;
+    
     #[tokio::test]
     async fn test_storage_cost() {
         let cost = CostService::new();

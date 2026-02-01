@@ -40,8 +40,7 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/messages/:hash/status", get(handlers::get_message_status))
         .route("/messages/:hash/content", get(handlers::get_message_content))
         
-        // Aggregates
-        .route("/aggregates/:address.json", get(handlers::get_aggregates))
+        // Aggregates - use single route, handler can strip .json if needed
         .route("/aggregates/:address", get(handlers::get_aggregates))
         
         // Posts

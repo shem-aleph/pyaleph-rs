@@ -194,7 +194,11 @@ mod tests {
             files_dir: temp_dir.path().join("files"),
             cache_dir: temp_dir.path().join("cache"),
             max_file_size: 1024 * 1024,
+            max_unauthenticated_file_size: 25 * 1024 * 1024,
             enable_cache: true,
+            grace_period: 86400,
+            garbage_collection: false,
+            gc_period: 3600,
         };
         
         let service = StorageService::new(&config).unwrap();
@@ -213,7 +217,11 @@ mod tests {
             files_dir: temp_dir.path().join("files"),
             cache_dir: temp_dir.path().join("cache"),
             max_file_size: 10, // Very small limit
+            max_unauthenticated_file_size: 10,
             enable_cache: false,
+            grace_period: 86400,
+            garbage_collection: false,
+            gc_period: 3600,
         };
         
         let service = StorageService::new(&config).unwrap();

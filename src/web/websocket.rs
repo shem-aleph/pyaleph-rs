@@ -603,7 +603,7 @@ pub async fn connect_to_rabbitmq(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Chain, ItemType};
+    use crate::types::{Chain, ItemType, MessageType};
     
     #[test]
     fn test_filter_matches_all() {
