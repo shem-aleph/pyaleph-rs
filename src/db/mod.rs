@@ -6,6 +6,9 @@ pub mod models;
 pub mod accessors;
 pub mod migrations;
 pub mod pool;
+pub mod sync_state;
+
+pub use sync_state::SyncStateAccessor;
 
 use sqlx::postgres::PgPool;
 use crate::config::DatabaseConfig;
