@@ -26,6 +26,7 @@ pub enum StorageError {
 }
 
 /// Storage service for file operations
+#[derive(Debug)]
 pub struct StorageService {
     files_dir: PathBuf,
     cache_dir: PathBuf,

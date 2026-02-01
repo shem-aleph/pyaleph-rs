@@ -15,7 +15,7 @@ use crate::config::EthereumConfig;
 use crate::types::{Chain, ChainRef, Message};
 
 use super::abi::{self, signatures};
-use super::{ChainError, ChainIndexer, IndexResult, IndexedMessage};
+use super::{ChainError, ChainIndexer, IndexResult, IndexedMessage, SyncEvent};
 
 /// Ethereum chain indexer
 pub struct EthereumIndexer {
@@ -88,11 +88,12 @@ impl EthereumIndexer {
                                 chain_ref: ChainRef {
                                     chain: Chain::ETH,
                                     height: block_number,
-                                    hash: tx_hash,
+                                    hash: tx_hash.clone(),
                                 },
                                 tx_hash: log.transaction_hash
                                     .map(|h| format!("{:?}", h))
                                     .unwrap_or_default(),
+                                block_time: None, // Block time would need to be fetched separately
                             }));
                         }
                         Err(e) => {
@@ -182,8 +183,68 @@ impl ChainIndexer for EthereumIndexer {
         
         Ok(IndexResult {
             messages,
+            sync_hashes: Vec::new(),
             last_block: end,
+            blocks_processed: end - start + 1,
         })
+    }
+    
+    async fn index_sync_events(&self, start: u64, end: u64) -> Result<Vec<SyncEvent>, ChainError> {
+        info!("Indexing sync events from Ethereum blocks {} to {}", start, end);
+        
+        // Create filter for SyncMessage events only
+        let filter = Filter::new()
+            .address(self.contract_address)
+            .from_block(start)
+            .to_block(end)
+            .topic0(*signatures::SYNC_MESSAGE);
+        
+        // Get logs
+        let logs = self.provider
+            .get_logs(&filter)
+            .await
+            .map_err(|e| ChainError::Rpc(e.to_string()))?;
+        
+        debug!("Found {} sync event logs in blocks {} to {}", logs.len(), start, end);
+        
+        // Parse logs into sync events
+        let mut events = Vec::new();
+        for log in &logs {
+            let tx_hash = log.transaction_hash
+                .map(|h| format!("{:?}", h))
+                .unwrap_or_default();
+            
+            let block_number = log.block_number
+                .map(|n| n.as_u64())
+                .unwrap_or(0);
+            
+            match abi::decode_sync_event(log) {
+                Ok(decoded) => {
+                    match abi::parse_sync_content(&decoded.content) {
+                        Ok(hashes) => {
+                            for hash in hashes {
+                                events.push(SyncEvent {
+                                    content_hash: hash,
+                                    block_height: block_number,
+                                    tx_hash: tx_hash.clone(),
+                                    emitter: format!("{:?}", self.contract_address),
+                                    timestamp: None, // Would need to fetch block timestamp
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse sync content: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to decode SyncMessage event: {}", e);
+                }
+            }
+        }
+        
+        info!("Indexed {} sync events from blocks {} to {}", events.len(), start, end);
+        Ok(events)
     }
     
     async fn watch(&self) -> Result<(), ChainError> {

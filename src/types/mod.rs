@@ -7,12 +7,14 @@ mod chain;
 mod channel;
 mod message;
 mod message_status;
+mod origin;
 mod pricing;
 
 pub use chain::*;
 pub use channel::*;
 pub use message::*;
 pub use message_status::*;
+pub use origin::*;
 pub use pricing::*;
 
 // Note: Deserialize and Serialize are re-exported by submodules

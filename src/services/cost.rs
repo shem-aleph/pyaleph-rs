@@ -1,16 +1,117 @@
 //! Cost calculation service
 //!
 //! Calculates costs for storage and compute resources.
+//! 
+//! Key features:
+//! - Dynamic pricing from aggregates (not hardcoded)
+//! - Volume discount calculation
+//! - GPU tier pricing
+//! - Internet-enabled execution multiplier
+//! - Support for hold/payg/credit payment types
+//!
+//! Reference: aleph/services/cost.py
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::types::{ProductPriceType, ProductPrice, ProductPriceOptions};
 
+/// Address that holds the pricing aggregate
+pub const PRICING_AGGREGATE_ADDRESS: &str = "0x4D52380D3191274a04846c89c069E6C3F2Ed94e4";
+/// Key for the pricing aggregate
+pub const PRICING_AGGREGATE_KEY: &str = "pricing";
+
+/// Default fallback prices (used if aggregate unavailable)
+/// 
+/// These use compile-time validated constants to avoid unwrap at runtime.
+mod defaults {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    
+    /// Storage holding cost per MiB per hour
+    pub const fn storage_holding() -> Decimal {
+        dec!(0.000000016)
+    }
+    
+    /// Storage credit cost per MiB per hour
+    pub const fn storage_credit() -> Decimal {
+        dec!(0.0033)
+    }
+    
+    /// Compute holding cost per unit per hour
+    pub const fn compute_holding() -> Decimal {
+        dec!(0.0011)
+    }
+    
+    /// Compute credit cost per unit per hour
+    pub const fn compute_credit() -> Decimal {
+        dec!(0.011)
+    }
+    
+    /// Confidential instance multiplier
+    pub const fn confidential_multiplier() -> Decimal {
+        dec!(2.0)
+    }
+    
+    /// GPU premium tier multiplier
+    pub const fn gpu_premium_multiplier() -> Decimal {
+        dec!(10.0)
+    }
+    
+    /// GPU standard tier multiplier
+    pub const fn gpu_standard_multiplier() -> Decimal {
+        dec!(5.0)
+    }
+    
+    /// Internet-enabled execution multiplier
+    pub const fn internet_multiplier() -> Decimal {
+        dec!(1.2)
+    }
+}
+
+/// Volume discount configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeDiscount {
+    /// Minimum compute units to qualify
+    pub min_compute_units: u32,
+    /// Discount percentage (0.0 to 1.0)
+    pub discount: Decimal,
+}
+
+impl Default for VolumeDiscount {
+    fn default() -> Self {
+        Self {
+            min_compute_units: 0,
+            discount: Decimal::ZERO,
+        }
+    }
+}
+
+/// GPU tier information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuTier {
+    pub id: String,
+    pub name: String,
+    pub compute_units: u32,
+    pub vram_gb: u32,
+    pub multiplier: Decimal,
+}
+
 /// Cost service for calculating resource costs
+#[derive(Debug)]
 pub struct CostService {
-    prices: HashMap<ProductPriceType, ProductPrice>,
+    /// Cached prices from aggregate
+    prices: Arc<RwLock<HashMap<ProductPriceType, ProductPrice>>>,
+    /// Volume discounts
+    volume_discounts: Arc<RwLock<Vec<VolumeDiscount>>>,
+    /// GPU tiers
+    gpu_tiers: Arc<RwLock<HashMap<String, GpuTier>>>,
+    /// Internet access multiplier
+    internet_multiplier: Decimal,
 }
 
 impl Default for CostService {
@@ -24,66 +125,135 @@ impl CostService {
     pub fn new() -> Self {
         let mut prices = HashMap::new();
         
-        // Default prices (per MiB per hour for storage, per compute unit per hour for compute)
+        // Initialize with default prices (will be overwritten by aggregate)
+        let default_storage = ProductPriceOptions::new(
+            defaults::storage_holding(),
+            Decimal::ZERO,
+            defaults::storage_credit(),
+        );
+        
+        let default_compute = ProductPriceOptions::new(
+            defaults::compute_holding(),
+            Decimal::ZERO,
+            defaults::compute_credit(),
+        );
+        
         prices.insert(ProductPriceType::Storage, ProductPrice {
-            storage: ProductPriceOptions::new(
-                Decimal::from_str("0.000000016").unwrap(),
-                Decimal::ZERO,
-                Decimal::from_str("0.0033").unwrap(),
-            ),
+            storage: default_storage.clone(),
             compute_unit: None,
         });
         
         prices.insert(ProductPriceType::Program, ProductPrice {
-            storage: ProductPriceOptions::new(
-                Decimal::from_str("0.000000016").unwrap(),
-                Decimal::ZERO,
-                Decimal::from_str("0.0033").unwrap(),
-            ),
-            compute_unit: Some(ProductPriceOptions::new(
-                Decimal::from_str("0.0011").unwrap(),
-                Decimal::ZERO,
-                Decimal::from_str("0.011").unwrap(),
-            )),
+            storage: default_storage.clone(),
+            compute_unit: Some(default_compute.clone()),
         });
         
         prices.insert(ProductPriceType::Instance, ProductPrice {
-            storage: ProductPriceOptions::new(
-                Decimal::from_str("0.000000016").unwrap(),
-                Decimal::ZERO,
-                Decimal::from_str("0.0033").unwrap(),
-            ),
-            compute_unit: Some(ProductPriceOptions::new(
-                Decimal::from_str("0.0011").unwrap(),
-                Decimal::ZERO,
-                Decimal::from_str("0.011").unwrap(),
-            )),
+            storage: default_storage.clone(),
+            compute_unit: Some(default_compute.clone()),
         });
         
+        // Confidential instances cost 2x
         prices.insert(ProductPriceType::InstanceConfidential, ProductPrice {
-            storage: ProductPriceOptions::new(
-                Decimal::from_str("0.000000016").unwrap(),
-                Decimal::ZERO,
-                Decimal::from_str("0.0033").unwrap(),
-            ),
+            storage: default_storage.clone(),
             compute_unit: Some(ProductPriceOptions::new(
-                Decimal::from_str("0.0022").unwrap(), // 2x for confidential
+                defaults::compute_holding() * defaults::confidential_multiplier(),
                 Decimal::ZERO,
-                Decimal::from_str("0.022").unwrap(),
+                defaults::compute_credit() * defaults::confidential_multiplier(),
             )),
         });
         
-        Self { prices }
+        // GPU instances
+        prices.insert(ProductPriceType::InstanceGpuPremium, ProductPrice {
+            storage: default_storage.clone(),
+            compute_unit: Some(ProductPriceOptions::new(
+                defaults::compute_holding() * defaults::gpu_premium_multiplier(),
+                Decimal::ZERO,
+                defaults::compute_credit() * defaults::gpu_premium_multiplier(),
+            )),
+        });
+        
+        prices.insert(ProductPriceType::InstanceGpuStandard, ProductPrice {
+            storage: default_storage.clone(),
+            compute_unit: Some(ProductPriceOptions::new(
+                defaults::compute_holding() * defaults::gpu_standard_multiplier(),
+                Decimal::ZERO,
+                defaults::compute_credit() * defaults::gpu_standard_multiplier(),
+            )),
+        });
+        
+        // Default volume discounts using compile-time validated decimals
+        use rust_decimal_macros::dec;
+        let volume_discounts = vec![
+            VolumeDiscount { min_compute_units: 10, discount: dec!(0.05) },
+            VolumeDiscount { min_compute_units: 50, discount: dec!(0.10) },
+            VolumeDiscount { min_compute_units: 100, discount: dec!(0.15) },
+            VolumeDiscount { min_compute_units: 500, discount: dec!(0.20) },
+        ];
+        
+        Self {
+            prices: Arc::new(RwLock::new(prices)),
+            volume_discounts: Arc::new(RwLock::new(volume_discounts)),
+            gpu_tiers: Arc::new(RwLock::new(HashMap::new())),
+            internet_multiplier: defaults::internet_multiplier(),
+        }
+    }
+    
+    /// Update prices from an aggregate value
+    /// 
+    /// This should be called when the pricing aggregate is updated.
+    pub async fn update_from_aggregate(&self, aggregate: &serde_json::Value) -> Result<(), String> {
+        let mut prices = self.prices.write().await;
+        
+        // Parse prices from aggregate
+        if let Some(pricing) = aggregate.get("pricing").and_then(|v| v.as_object()) {
+            for (key, value) in pricing {
+                if let Ok(product_type) = serde_json::from_str::<ProductPriceType>(&format!("\"{}\"", key)) {
+                    if let Ok(price) = serde_json::from_value::<ProductPrice>(value.clone()) {
+                        prices.insert(product_type, price);
+                        tracing::info!("Updated price for {:?} from aggregate", product_type);
+                    }
+                }
+            }
+        }
+        
+        // Parse volume discounts
+        if let Some(discounts) = aggregate.get("volume_discounts").and_then(|v| v.as_array()) {
+            let mut vd = self.volume_discounts.write().await;
+            vd.clear();
+            
+            for discount in discounts {
+                if let Ok(d) = serde_json::from_value::<VolumeDiscount>(discount.clone()) {
+                    vd.push(d);
+                }
+            }
+            vd.sort_by(|a, b| a.min_compute_units.cmp(&b.min_compute_units));
+        }
+        
+        // Parse GPU tiers
+        if let Some(tiers) = aggregate.get("gpu_tiers").and_then(|v| v.as_object()) {
+            let mut gt = self.gpu_tiers.write().await;
+            gt.clear();
+            
+            for (tier_id, tier_data) in tiers {
+                if let Ok(tier) = serde_json::from_value::<GpuTier>(tier_data.clone()) {
+                    gt.insert(tier_id.clone(), tier);
+                }
+            }
+        }
+        
+        Ok(())
     }
     
     /// Calculate storage cost
-    pub fn calculate_storage_cost(
+    pub async fn calculate_storage_cost(
         &self,
         size_mib: u64,
         hours: u64,
         product_type: ProductPriceType,
     ) -> Option<CostResult> {
-        let price = self.prices.get(&product_type)?;
+        let prices = self.prices.read().await;
+        let price = prices.get(&product_type)?;
         
         let size = Decimal::from(size_mib);
         let duration = Decimal::from(hours);
@@ -95,69 +265,169 @@ impl CostService {
         })
     }
     
-    /// Calculate compute cost
-    pub fn calculate_compute_cost(
+    /// Calculate compute cost with optional internet multiplier
+    pub async fn calculate_compute_cost(
         &self,
         compute_units: u32,
         hours: u64,
         product_type: ProductPriceType,
+        internet_enabled: bool,
     ) -> Option<CostResult> {
-        let price = self.prices.get(&product_type)?;
+        let prices = self.prices.read().await;
+        let price = prices.get(&product_type)?;
         let compute_price = price.compute_unit.as_ref()?;
         
         let units = Decimal::from(compute_units);
         let duration = Decimal::from(hours);
         
+        // Apply internet multiplier if enabled
+        let multiplier = if internet_enabled {
+            self.internet_multiplier
+        } else {
+            Decimal::ONE
+        };
+        
         Some(CostResult {
-            holding: compute_price.holding * units * duration,
-            payg: compute_price.payg * units * duration,
-            credit: compute_price.credit * units * duration,
+            holding: compute_price.holding * units * duration * multiplier,
+            payg: compute_price.payg * units * duration * multiplier,
+            credit: compute_price.credit * units * duration * multiplier,
         })
     }
     
-    /// Calculate total cost for an instance
-    pub fn calculate_instance_cost(
+    /// Get volume discount for a given number of compute units
+    pub async fn get_volume_discount(&self, compute_units: u32) -> Decimal {
+        let discounts = self.volume_discounts.read().await;
+        
+        let mut applicable_discount = Decimal::ZERO;
+        for discount in discounts.iter() {
+            if compute_units >= discount.min_compute_units {
+                applicable_discount = discount.discount;
+            } else {
+                break;
+            }
+        }
+        
+        applicable_discount
+    }
+    
+    /// Calculate total cost for an instance with volume discount
+    pub async fn calculate_instance_cost(
         &self,
         memory_mib: u32,
         vcpus: u32,
         storage_mib: u64,
         hours: u64,
         product_type: ProductPriceType,
+        internet_enabled: bool,
     ) -> Option<CostResult> {
         // Calculate compute units (simplified: 1 CU = 2GB RAM + 1 vCPU)
         let compute_units = self.calculate_compute_units(memory_mib, vcpus);
         
-        let storage_cost = self.calculate_storage_cost(storage_mib, hours, product_type)?;
-        let compute_cost = self.calculate_compute_cost(compute_units, hours, product_type)?;
+        let storage_cost = self.calculate_storage_cost(storage_mib, hours, product_type).await?;
+        let compute_cost = self.calculate_compute_cost(compute_units, hours, product_type, internet_enabled).await?;
+        
+        // Apply volume discount
+        let discount = self.get_volume_discount(compute_units).await;
+        let discount_multiplier = Decimal::ONE - discount;
         
         Some(CostResult {
-            holding: storage_cost.holding + compute_cost.holding,
-            payg: storage_cost.payg + compute_cost.payg,
-            credit: storage_cost.credit + compute_cost.credit,
+            holding: (storage_cost.holding + compute_cost.holding) * discount_multiplier,
+            payg: (storage_cost.payg + compute_cost.payg) * discount_multiplier,
+            credit: (storage_cost.credit + compute_cost.credit) * discount_multiplier,
         })
     }
     
     /// Calculate compute units from memory and vCPUs
+    /// 
+    /// # Formula
+    /// 
+    /// 1 compute unit = 2048 MiB RAM and 1 vCPU.
+    /// The result is the maximum of memory-based units and vCPU count,
+    /// ensuring resources are always covered.
+    /// 
+    /// # Examples
+    /// 
+    /// ```rust
+    /// let cost = CostService::new();
+    /// assert_eq!(cost.calculate_compute_units(2048, 1), 1);  // 1 CU
+    /// assert_eq!(cost.calculate_compute_units(4096, 2), 2);  // 2 CU
+    /// assert_eq!(cost.calculate_compute_units(8192, 2), 4);  // Memory dominates
+    /// ```
+    #[inline]
     pub fn calculate_compute_units(&self, memory_mib: u32, vcpus: u32) -> u32 {
-        // 1 compute unit = 2048 MiB RAM and 1 vCPU
-        let memory_units = (memory_mib + 2047) / 2048;
-        let vcpu_units = vcpus;
-        std::cmp::max(memory_units, vcpu_units)
+        // Round up memory to nearest compute unit
+        let memory_units = memory_mib.saturating_add(2047) / 2048;
+        std::cmp::max(memory_units, vcpus)
     }
     
     /// Get price for a product type
-    pub fn get_price(&self, product_type: &ProductPriceType) -> Option<&ProductPrice> {
-        self.prices.get(product_type)
+    pub async fn get_price(&self, product_type: &ProductPriceType) -> Option<ProductPrice> {
+        let prices = self.prices.read().await;
+        prices.get(product_type).cloned()
     }
     
-    /// Update price for a product type
-    pub fn set_price(&mut self, product_type: ProductPriceType, price: ProductPrice) {
-        self.prices.insert(product_type, price);
+    /// Update price for a product type manually
+    pub async fn set_price(&self, product_type: ProductPriceType, price: ProductPrice) {
+        let mut prices = self.prices.write().await;
+        prices.insert(product_type, price);
+    }
+    
+    /// Get GPU tier information
+    pub async fn get_gpu_tier(&self, tier_id: &str) -> Option<GpuTier> {
+        let tiers = self.gpu_tiers.read().await;
+        tiers.get(tier_id).cloned()
+    }
+    
+    /// Calculate cost for a GPU instance
+    pub async fn calculate_gpu_instance_cost(
+        &self,
+        memory_mib: u32,
+        vcpus: u32,
+        storage_mib: u64,
+        hours: u64,
+        gpu_tier_id: &str,
+        internet_enabled: bool,
+    ) -> Option<CostResult> {
+        let tier = self.get_gpu_tier(gpu_tier_id).await?;
+        
+        // Determine product type based on tier
+        let product_type = if gpu_tier_id.contains("premium") || tier.vram_gb >= 24 {
+            ProductPriceType::InstanceGpuPremium
+        } else {
+            ProductPriceType::InstanceGpuStandard
+        };
+        
+        // Use tier compute units if specified
+        let compute_units = if tier.compute_units > 0 {
+            tier.compute_units
+        } else {
+            self.calculate_compute_units(memory_mib, vcpus)
+        };
+        
+        let storage_cost = self.calculate_storage_cost(storage_mib, hours, product_type).await?;
+        let compute_cost = self.calculate_compute_cost(compute_units, hours, product_type, internet_enabled).await?;
+        
+        // Apply GPU tier multiplier
+        let multiplied_cost = CostResult {
+            holding: storage_cost.holding + (compute_cost.holding * tier.multiplier),
+            payg: storage_cost.payg + (compute_cost.payg * tier.multiplier),
+            credit: storage_cost.credit + (compute_cost.credit * tier.multiplier),
+        };
+        
+        // Apply volume discount
+        let discount = self.get_volume_discount(compute_units).await;
+        let discount_multiplier = Decimal::ONE - discount;
+        
+        Some(CostResult {
+            holding: multiplied_cost.holding * discount_multiplier,
+            payg: multiplied_cost.payg * discount_multiplier,
+            credit: multiplied_cost.credit * discount_multiplier,
+        })
     }
 }
 
 /// Result of a cost calculation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostResult {
     pub holding: Decimal,
     pub payg: Decimal,
@@ -179,14 +449,24 @@ impl CostResult {
     pub fn credit_cost(&self) -> Decimal {
         self.credit
     }
+    
+    /// Get cost for a specific payment type
+    pub fn for_payment_type(&self, payment_type: &str) -> Decimal {
+        match payment_type.to_lowercase().as_str() {
+            "hold" | "holding" => self.holding,
+            "payg" | "pay-as-you-go" => self.payg,
+            "credit" => self.credit,
+            _ => self.holding, // Default to holding
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     
-    #[test]
-    fn test_compute_units() {
+    #[tokio::test]
+    async fn test_compute_units() {
         let cost = CostService::new();
         
         // 2GB RAM, 1 vCPU = 1 CU
@@ -202,15 +482,51 @@ mod tests {
         assert_eq!(cost.calculate_compute_units(2048, 4), 4);
     }
     
-    #[test]
-    fn test_storage_cost() {
+    #[tokio::test]
+    async fn test_storage_cost() {
         let cost = CostService::new();
         
         // 100 MiB for 24 hours
-        let result = cost.calculate_storage_cost(100, 24, ProductPriceType::Storage).unwrap();
+        let result = cost.calculate_storage_cost(100, 24, ProductPriceType::Storage).await.unwrap();
         
         // Should be positive
         assert!(result.holding > Decimal::ZERO);
         assert!(result.credit > Decimal::ZERO);
+    }
+    
+    #[tokio::test]
+    async fn test_volume_discount() {
+        let cost = CostService::new();
+        
+        // No discount for small usage
+        assert_eq!(cost.get_volume_discount(5).await, Decimal::ZERO);
+        
+        // 5% discount for 10+ CU
+        assert_eq!(cost.get_volume_discount(10).await, Decimal::from_str("0.05").unwrap());
+        
+        // 20% discount for 500+ CU
+        assert_eq!(cost.get_volume_discount(500).await, Decimal::from_str("0.20").unwrap());
+    }
+    
+    #[tokio::test]
+    async fn test_update_from_aggregate() {
+        let cost = CostService::new();
+        
+        let aggregate = serde_json::json!({
+            "pricing": {
+                "storage": {
+                    "storage": {
+                        "holding": "0.000000020",
+                        "payg": "0.0",
+                        "credit": "0.0040"
+                    }
+                }
+            }
+        });
+        
+        cost.update_from_aggregate(&aggregate).await.unwrap();
+        
+        let price = cost.get_price(&ProductPriceType::Storage).await.unwrap();
+        assert_eq!(price.storage.credit, Decimal::from_str("0.0040").unwrap());
     }
 }

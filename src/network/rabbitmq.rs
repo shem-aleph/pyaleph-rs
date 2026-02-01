@@ -1,6 +1,9 @@
 //! RabbitMQ integration for p2p-service connectivity
 //!
 //! Connects to the Aleph p2p-service via RabbitMQ message queue.
+//! Exchange names and routing follow the pyaleph configuration for compatibility.
+//!
+//! Reference: aleph/config.py default rabbitmq settings
 
 use lapin::{
     options::*, types::FieldTable, BasicProperties, Channel, Connection,
@@ -14,45 +17,97 @@ use tracing::{debug, error, info, warn};
 
 use crate::types::Message;
 
-/// RabbitMQ configuration
+/// RabbitMQ configuration matching pyaleph defaults
+/// 
+/// These exchange names MUST match the p2p-service configuration
+/// for proper network communication.
 #[derive(Debug, Clone)]
 pub struct RabbitMQConfig {
+    /// RabbitMQ connection URL
     pub url: String,
-    pub exchange: String,
+    
+    /// Exchange for publishing messages to the p2p network
+    /// Default: "p2p-publish" (matches pyaleph)
+    pub pub_exchange: String,
+    
+    /// Exchange for receiving messages from the p2p network
+    /// Default: "p2p-subscribe" (matches pyaleph)
+    pub sub_exchange: String,
+    
+    /// Exchange for processed messages
+    /// Default: "aleph-messages" (matches pyaleph)
+    pub message_exchange: String,
+    
+    /// Exchange for pending messages awaiting processing
+    /// Default: "aleph-pending-messages" (matches pyaleph)
+    pub pending_message_exchange: String,
+    
+    /// Exchange for pending blockchain transactions
+    /// Default: "aleph-pending-txs" (matches pyaleph)
+    pub pending_tx_exchange: String,
+    
+    /// Queue name for incoming messages
     pub queue_incoming: String,
+    
+    /// Queue name for outgoing messages
     pub queue_outgoing: String,
+    
+    /// Routing key for messages
     pub routing_key: String,
 }
 
 impl Default for RabbitMQConfig {
     fn default() -> Self {
+        // These defaults match pyaleph config.py
         Self {
             url: "amqp://localhost:5672".to_string(),
-            exchange: "aleph-p2p".to_string(),
+            pub_exchange: "p2p-publish".to_string(),      // CRITICAL: Must match p2p-service
+            sub_exchange: "p2p-subscribe".to_string(),    // CRITICAL: Must match p2p-service
+            message_exchange: "aleph-messages".to_string(),
+            pending_message_exchange: "aleph-pending-messages".to_string(),
+            pending_tx_exchange: "aleph-pending-txs".to_string(),
             queue_incoming: "aleph-incoming".to_string(),
             queue_outgoing: "aleph-outgoing".to_string(),
-            routing_key: "messages".to_string(),
+            routing_key: "#".to_string(), // Subscribe to all topics
         }
     }
 }
 
-/// P2P message from RabbitMQ
+/// P2P message envelope from RabbitMQ
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct P2PMessage {
     /// Message content (serialized Aleph message)
     pub content: String,
     /// Source peer ID
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub from_peer: Option<String>,
     /// Topic
     pub topic: String,
 }
 
+/// Pending message for processing queue
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingMessageEnvelope {
+    /// The message to process
+    pub message: Message,
+    /// When the message was received
+    pub reception_time: f64,
+    /// Number of processing attempts
+    pub retries: u32,
+    /// Next attempt timestamp
+    pub next_attempt: f64,
+    /// Whether content has been fetched (for IPFS/storage messages)
+    pub fetched: bool,
+}
+
 /// RabbitMQ service for P2P communication
+#[derive(Debug)]
 pub struct RabbitMQService {
     config: RabbitMQConfig,
     connection: Option<Connection>,
     channel: Option<Channel>,
     message_tx: mpsc::Sender<P2PMessage>,
+    #[allow(dead_code)]
     message_rx: mpsc::Receiver<P2PMessage>,
 }
 
@@ -70,7 +125,7 @@ impl RabbitMQService {
         }
     }
     
-    /// Connect to RabbitMQ
+    /// Connect to RabbitMQ and set up exchanges
     pub async fn connect(&mut self) -> Result<(), lapin::Error> {
         info!("Connecting to RabbitMQ: {}", self.config.url);
         
@@ -81,34 +136,115 @@ impl RabbitMQService {
         
         let channel = connection.create_channel().await?;
         
-        // Declare exchange
-        channel.exchange_declare(
-            &self.config.exchange,
-            lapin::ExchangeKind::Topic,
-            ExchangeDeclareOptions::default(),
-            FieldTable::default(),
-        ).await?;
+        // Declare all exchanges needed for p2p-service compatibility
+        self.setup_exchanges(&channel).await?;
         
-        // Declare incoming queue
-        channel.queue_declare(
-            &self.config.queue_incoming,
-            QueueDeclareOptions::default(),
-            FieldTable::default(),
-        ).await?;
-        
-        // Bind queue to exchange
-        channel.queue_bind(
-            &self.config.queue_incoming,
-            &self.config.exchange,
-            &self.config.routing_key,
-            QueueBindOptions::default(),
-            FieldTable::default(),
-        ).await?;
+        // Set up queues and bindings
+        self.setup_queues(&channel).await?;
         
         self.connection = Some(connection);
         self.channel = Some(channel);
         
         info!("Connected to RabbitMQ successfully");
+        Ok(())
+    }
+    
+    /// Set up exchanges matching pyaleph configuration
+    async fn setup_exchanges(&self, channel: &Channel) -> Result<(), lapin::Error> {
+        // Publishing exchange (to p2p network)
+        channel.exchange_declare(
+            &self.config.pub_exchange,
+            lapin::ExchangeKind::Topic,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        ).await?;
+        info!("Declared exchange: {}", self.config.pub_exchange);
+        
+        // Subscribe exchange (from p2p network)
+        channel.exchange_declare(
+            &self.config.sub_exchange,
+            lapin::ExchangeKind::Topic,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        ).await?;
+        info!("Declared exchange: {}", self.config.sub_exchange);
+        
+        // Processed messages exchange
+        channel.exchange_declare(
+            &self.config.message_exchange,
+            lapin::ExchangeKind::Topic,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        ).await?;
+        info!("Declared exchange: {}", self.config.message_exchange);
+        
+        // Pending messages exchange
+        channel.exchange_declare(
+            &self.config.pending_message_exchange,
+            lapin::ExchangeKind::Topic,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        ).await?;
+        info!("Declared exchange: {}", self.config.pending_message_exchange);
+        
+        // Pending transactions exchange
+        channel.exchange_declare(
+            &self.config.pending_tx_exchange,
+            lapin::ExchangeKind::Topic,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        ).await?;
+        info!("Declared exchange: {}", self.config.pending_tx_exchange);
+        
+        Ok(())
+    }
+    
+    /// Set up queues and bindings
+    async fn setup_queues(&self, channel: &Channel) -> Result<(), lapin::Error> {
+        // Incoming queue (messages from p2p network)
+        channel.queue_declare(
+            &self.config.queue_incoming,
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        ).await?;
+        
+        // Bind to p2p-subscribe exchange
+        channel.queue_bind(
+            &self.config.queue_incoming,
+            &self.config.sub_exchange,
+            &self.config.routing_key,
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        ).await?;
+        info!("Bound queue {} to exchange {}", self.config.queue_incoming, self.config.sub_exchange);
+        
+        // Also bind to pending messages exchange
+        channel.queue_bind(
+            &self.config.queue_incoming,
+            &self.config.pending_message_exchange,
+            &self.config.routing_key,
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        ).await?;
+        
         Ok(())
     }
     
@@ -128,28 +264,74 @@ impl RabbitMQService {
         Ok(consumer)
     }
     
-    /// Publish a message to the network
-    pub async fn publish(&self, message: &Message) -> Result<(), lapin::Error> {
+    /// Publish a message to the P2P network
+    pub async fn publish_to_network(&self, message: &Message) -> Result<(), lapin::Error> {
         let channel = self.channel.as_ref()
             .ok_or_else(|| lapin::Error::InvalidChannel(0))?;
         
         let p2p_msg = P2PMessage {
             content: serde_json::to_string(message).unwrap_or_default(),
-            from_peer: None,
-            topic: "aleph-messages".to_string(),
+            from_peer: None, // Will be filled by p2p-service
+            topic: format!("messages.{}", message.message_type),
         };
         
         let payload = serde_json::to_vec(&p2p_msg).unwrap_or_default();
+        let routing_key = format!("messages.{}", message.message_type.to_string().to_lowercase());
         
         channel.basic_publish(
-            &self.config.exchange,
-            &self.config.routing_key,
+            &self.config.pub_exchange,
+            &routing_key,
             BasicPublishOptions::default(),
             &payload,
-            BasicProperties::default(),
+            BasicProperties::default()
+                .with_content_type("application/json".into())
+                .with_delivery_mode(2), // Persistent
         ).await?;
         
-        debug!("Published message: {}", message.item_hash);
+        debug!("Published message {} to {}", message.item_hash, self.config.pub_exchange);
+        Ok(())
+    }
+    
+    /// Publish a pending message for processing
+    pub async fn publish_pending(&self, envelope: &PendingMessageEnvelope) -> Result<(), lapin::Error> {
+        let channel = self.channel.as_ref()
+            .ok_or_else(|| lapin::Error::InvalidChannel(0))?;
+        
+        let payload = serde_json::to_vec(envelope).unwrap_or_default();
+        let routing_key = format!("pending.{}", envelope.message.message_type.to_string().to_lowercase());
+        
+        channel.basic_publish(
+            &self.config.pending_message_exchange,
+            &routing_key,
+            BasicPublishOptions::default(),
+            &payload,
+            BasicProperties::default()
+                .with_content_type("application/json".into())
+                .with_delivery_mode(2),
+        ).await?;
+        
+        debug!("Published pending message {} to {}", envelope.message.item_hash, self.config.pending_message_exchange);
+        Ok(())
+    }
+    
+    /// Notify about a processed message
+    pub async fn publish_processed(&self, message: &Message) -> Result<(), lapin::Error> {
+        let channel = self.channel.as_ref()
+            .ok_or_else(|| lapin::Error::InvalidChannel(0))?;
+        
+        let payload = serde_json::to_vec(message).unwrap_or_default();
+        let routing_key = format!("processed.{}", message.message_type.to_string().to_lowercase());
+        
+        channel.basic_publish(
+            &self.config.message_exchange,
+            &routing_key,
+            BasicPublishOptions::default(),
+            &payload,
+            BasicProperties::default()
+                .with_content_type("application/json".into()),
+        ).await?;
+        
+        debug!("Published processed message {} to {}", message.item_hash, self.config.message_exchange);
         Ok(())
     }
     
@@ -207,7 +389,7 @@ pub async fn run_consumer(
                     // Parse message
                     match serde_json::from_slice::<P2PMessage>(&delivery.data) {
                         Ok(msg) => {
-                            debug!("Received P2P message from {:?}", msg.from_peer);
+                            debug!("Received P2P message from {:?} on topic {}", msg.from_peer, msg.topic);
                             if message_tx.send(msg).await.is_err() {
                                 warn!("Message channel closed");
                                 break;
@@ -233,5 +415,22 @@ pub async fn run_consumer(
         // Connection lost, retry
         warn!("RabbitMQ connection lost, reconnecting...");
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_default_config_matches_pyaleph() {
+        let config = RabbitMQConfig::default();
+        
+        // These must match pyaleph defaults
+        assert_eq!(config.pub_exchange, "p2p-publish");
+        assert_eq!(config.sub_exchange, "p2p-subscribe");
+        assert_eq!(config.message_exchange, "aleph-messages");
+        assert_eq!(config.pending_message_exchange, "aleph-pending-messages");
+        assert_eq!(config.pending_tx_exchange, "aleph-pending-txs");
     }
 }

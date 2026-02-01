@@ -85,15 +85,59 @@ pub struct Message {
 }
 
 impl Message {
-    /// Verify the message signature
-    pub fn verify_signature(&self) -> Result<bool, String> {
-        // TODO: Implement signature verification based on chain type
-        Ok(true)
+    /// Verify the message signature using the CryptoService
+    /// 
+    /// This is CRITICAL for security - never accept messages with invalid signatures.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `crypto` - The cryptographic service to use for verification
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(true)` if the signature is valid
+    /// * `Ok(false)` if the signature is invalid
+    /// * `Err(String)` if verification could not be performed
+    pub fn verify_signature(&self, crypto: &crate::services::crypto::CryptoService) -> Result<bool, String> {
+        // Get the message content to verify (no allocation needed)
+        let content = self.get_verification_content()
+            .map_err(|e| e.to_string())?;
+        
+        crypto.verify_signature(&self.chain, content, &self.signature, &self.sender)
+            .map_err(|e| e.to_string())
+    }
+    
+    /// Get the content that was signed
+    /// 
+    /// For inline messages, this is the serialized item_content.
+    /// For IPFS/storage messages, this is typically the item_hash.
+    fn get_verification_content(&self) -> Result<&str, &'static str> {
+        match self.item_type {
+            ItemType::Inline => {
+                self.item_content.as_deref()
+                    .ok_or("Inline message missing item_content")
+            }
+            ItemType::Ipfs | ItemType::Storage => {
+                // For external content, the signature is over the item_hash
+                Ok(&self.item_hash)
+            }
+        }
     }
     
     /// Get the item hash as bytes
     pub fn item_hash_bytes(&self) -> Result<Vec<u8>, hex::FromHexError> {
         hex::decode(&self.item_hash)
+    }
+    
+    /// Compute and verify the item hash matches the content
+    pub fn verify_item_hash(&self) -> Result<bool, String> {
+        let content = self.item_content.as_ref()
+            .ok_or_else(|| "No item_content to verify hash".to_string())?;
+        
+        use sha2::{Sha256, Digest};
+        let computed_hash = hex::encode(Sha256::digest(content.as_bytes()));
+        
+        Ok(computed_hash == self.item_hash)
     }
 }
 

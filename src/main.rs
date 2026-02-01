@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         _ => Level::INFO,
     };
     
-    let subscriber = FmtSubscriber::builder()
+    FmtSubscriber::builder()
         .with_max_level(level)
         .with_target(true)
         .with_thread_ids(true)

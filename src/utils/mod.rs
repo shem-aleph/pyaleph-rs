@@ -3,27 +3,49 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Get current Unix timestamp as f64
+/// 
+/// # Panics
+/// 
+/// Panics if system time is before UNIX epoch (should never happen in practice).
 pub fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("System time is before UNIX epoch")
         .as_secs_f64()
 }
 
 /// Get current Unix timestamp as u64 (seconds)
+/// 
+/// # Panics
+/// 
+/// Panics if system time is before UNIX epoch (should never happen in practice).
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("System time is before UNIX epoch")
         .as_secs()
 }
 
 /// Get current Unix timestamp as u128 (milliseconds)
+/// 
+/// # Panics
+/// 
+/// Panics if system time is before UNIX epoch (should never happen in practice).
 pub fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("System time is before UNIX epoch")
         .as_millis()
+}
+
+/// Get current Unix timestamp, returning None if unavailable
+/// 
+/// Safe version that doesn't panic.
+pub fn now_opt() -> Option<f64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs_f64())
 }
 
 /// Format bytes as human-readable string

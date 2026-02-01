@@ -57,9 +57,6 @@ pub fn create_router(config: &Config, state: Arc<AppState>) -> Router {
         CorsLayer::new()
     };
     
-    // Create WebSocket state
-    let ws_state = Arc::new(websocket::WsState::new());
-    
     Router::new()
         // Health check
         .route("/", axum::routing::get(handlers::health_check))
@@ -67,7 +64,6 @@ pub fn create_router(config: &Config, state: Arc<AppState>) -> Router {
         
         // WebSocket endpoint
         .route("/ws", axum::routing::get(websocket::ws_handler))
-        .with_state(ws_state)
         
         // API v0 routes (compatibility with pyaleph)
         .nest("/api/v0", routes::api_v0())

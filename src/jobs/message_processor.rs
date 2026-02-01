@@ -1,30 +1,66 @@
 //! Message processor job
 //!
-//! Processes pending messages from the queue.
+//! Processes pending messages from the queue with proper validation,
+//! content fetching, handler dispatch, and retry logic.
+//!
+//! Reference: aleph/jobs/process_pending_messages.py
 
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
-use tracing::{debug, error, info};
+use std::time::Duration;
+use tokio::time::interval;
+use tracing::{debug, error, info, warn};
+use sqlx::PgPool;
+use chrono::Utc;
 
 use crate::config::Config;
+use crate::types::{Message, MessageType, ItemType, ProcessingStatus, ErrorCode};
+use crate::services::crypto::CryptoService;
+use crate::services::ipfs::IpfsService;
+use crate::handlers::{self, HandlerContext};
+use crate::db::models::PendingMessageDb;
 
 /// Process interval in milliseconds
 const PROCESS_INTERVAL_MS: u64 = 1000;
 
 /// Maximum messages to process per batch
-const BATCH_SIZE: u32 = 100;
+const BATCH_SIZE: i64 = 100;
+
+/// Maximum number of retries before rejecting a message
+const MAX_RETRIES: i32 = 10;
+
+/// Base retry delay in seconds (exponential backoff)
+const BASE_RETRY_DELAY: f64 = 60.0;
+
+/// Maximum retry delay in seconds
+const MAX_RETRY_DELAY: f64 = 3600.0;
+
+/// Processing context containing all services
+pub struct ProcessorContext {
+    pub db: PgPool,
+    pub crypto: Arc<CryptoService>,
+    pub ipfs: Arc<IpfsService>,
+    pub config: Arc<Config>,
+}
+
+impl ProcessorContext {
+    pub fn new(db: PgPool, crypto: Arc<CryptoService>, ipfs: Arc<IpfsService>, config: Arc<Config>) -> Self {
+        Self { db, crypto, ipfs, config }
+    }
+}
 
 /// Run the message processor job
-pub async fn run(config: Arc<Config>) {
-    let mut interval = interval(Duration::from_millis(PROCESS_INTERVAL_MS));
+pub async fn run(ctx: Arc<ProcessorContext>) {
+    let mut ticker = interval(Duration::from_millis(PROCESS_INTERVAL_MS));
+    
+    info!("Message processor started");
     
     loop {
-        interval.tick().await;
+        ticker.tick().await;
         
-        match process_batch(&config).await {
-            Ok(count) => {
-                if count > 0 {
-                    debug!("Processed {} messages", count);
+        match process_batch(&ctx).await {
+            Ok(processed) => {
+                if processed > 0 {
+                    debug!("Processed {} messages", processed);
                 }
             }
             Err(e) => {
@@ -35,22 +71,424 @@ pub async fn run(config: Arc<Config>) {
 }
 
 /// Process a batch of pending messages
-async fn process_batch(_config: &Config) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    // TODO: Implement actual message processing
-    // 1. Fetch pending messages from database
-    // 2. For each message:
-    //    a. Verify signature
-    //    b. Fetch content if needed (IPFS)
-    //    c. Validate content
-    //    d. Process with appropriate handler
-    //    e. Update message status
-    // 3. Return count of processed messages
+pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError> {
+    let now = Utc::now().timestamp() as f64;
     
-    Ok(0)
+    // Fetch messages that are due for processing
+    let pending_messages = sqlx::query_as::<_, PendingMessageDb>(
+        r#"
+        SELECT * FROM pending_messages 
+        WHERE next_attempt <= $1 AND retries < $2
+        ORDER BY reception_time ASC
+        LIMIT $3
+        FOR UPDATE SKIP LOCKED
+        "#
+    )
+    .bind(now)
+    .bind(MAX_RETRIES)
+    .bind(BATCH_SIZE)
+    .fetch_all(&ctx.db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    if pending_messages.is_empty() {
+        return Ok(0);
+    }
+    
+    let mut processed_count = 0u32;
+    
+    for pending in pending_messages {
+        match process_single_message(ctx, &pending).await {
+            Ok(status) => {
+                processed_count += 1;
+                
+                match status {
+                    ProcessResult::Processed => {
+                        // Remove from pending, message is now in main table
+                        delete_pending(&ctx.db, &pending.item_hash).await?;
+                    }
+                    ProcessResult::Rejected(code, msg) => {
+                        // Move to rejected table
+                        move_to_rejected(&ctx.db, &pending, code, &msg).await?;
+                    }
+                    ProcessResult::Retry(reason) => {
+                        // Update retry count and next attempt time
+                        update_retry(&ctx.db, &pending, &reason).await?;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Error processing message {}: {}", pending.item_hash, e);
+                // Schedule retry
+                if let Err(retry_err) = update_retry(&ctx.db, &pending, &e.to_string()).await {
+                    error!("Failed to update retry: {}", retry_err);
+                }
+            }
+        }
+    }
+    
+    Ok(processed_count)
+}
+
+/// Result of processing a single message
+enum ProcessResult {
+    /// Message processed successfully
+    Processed,
+    /// Message rejected with error
+    Rejected(ErrorCode, String),
+    /// Message needs retry
+    Retry(String),
+}
+
+/// Process a single pending message
+async fn process_single_message(
+    ctx: &ProcessorContext,
+    pending: &PendingMessageDb,
+) -> Result<ProcessResult, ProcessorError> {
+    debug!("Processing message: {}", pending.item_hash);
+    
+    // Step 1: Parse the message
+    let message: Message = serde_json::from_value(pending.message.clone())
+        .map_err(|e| ProcessorError::InvalidMessage(format!("Failed to parse: {}", e)))?;
+    
+    // Step 2: Check for duplicate (already processed)
+    if is_duplicate(&ctx.db, &message.item_hash).await? {
+        debug!("Message {} is a duplicate, skipping", message.item_hash);
+        return Ok(ProcessResult::Processed); // Just remove from pending
+    }
+    
+    // Step 3: Fetch content if needed
+    let message = if needs_content_fetch(&message) && !pending.fetched {
+        match fetch_message_content(ctx, &message).await {
+            Ok(msg) => {
+                // Mark as fetched
+                mark_fetched(&ctx.db, &pending.item_hash).await?;
+                msg
+            }
+            Err(e) => {
+                return Ok(ProcessResult::Retry(format!("Content fetch failed: {}", e)));
+            }
+        }
+    } else {
+        message
+    };
+    
+    // Step 4: Verify signature
+    match message.verify_signature(&ctx.crypto) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(ProcessResult::Rejected(
+                ErrorCode::InvalidSignature,
+                "Signature verification failed".to_string(),
+            ));
+        }
+        Err(e) => {
+            return Ok(ProcessResult::Rejected(
+                ErrorCode::InvalidSignature,
+                format!("Signature verification error: {}", e),
+            ));
+        }
+    }
+    
+    // Step 5: Verify item hash matches content (for inline messages)
+    if message.item_type == ItemType::Inline {
+        match message.verify_item_hash() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(ProcessResult::Rejected(
+                    ErrorCode::InvalidFormat,
+                    "Item hash does not match content".to_string(),
+                ));
+            }
+            Err(e) => {
+                return Ok(ProcessResult::Rejected(
+                    ErrorCode::InvalidFormat,
+                    format!("Hash verification error: {}", e),
+                ));
+            }
+        }
+    }
+    
+    // Step 6: Create handler context
+    let handler_ctx = create_handler_context(ctx);
+    
+    // Step 7: Process with appropriate handler
+    let status = handlers::process_message(&message, &handler_ctx).await;
+    
+    // Step 8: Store result based on status
+    match status.status.as_str() {
+        "processed" => {
+            // Store in messages table
+            store_processed_message(&ctx.db, &message).await?;
+            Ok(ProcessResult::Processed)
+        }
+        "rejected" => {
+            Ok(ProcessResult::Rejected(
+                status.error_code.unwrap_or(ErrorCode::InternalError),
+                status.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+            ))
+        }
+        _ => {
+            Ok(ProcessResult::Retry("Processing returned unknown status".to_string()))
+        }
+    }
+}
+
+/// Check if message needs content to be fetched from IPFS/storage
+fn needs_content_fetch(message: &Message) -> bool {
+    match message.item_type {
+        ItemType::Inline => false,
+        ItemType::Ipfs | ItemType::Storage => message.item_content.is_none(),
+    }
 }
 
 /// Fetch content for a message from IPFS or storage
-async fn fetch_content(_hash: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    // TODO: Implement content fetching
-    Ok(vec![])
+async fn fetch_message_content(
+    ctx: &ProcessorContext,
+    message: &Message,
+) -> Result<Message, ProcessorError> {
+    let content = match message.item_type {
+        ItemType::Ipfs => {
+            ctx.ipfs.get(&message.item_hash).await
+                .map_err(|e| ProcessorError::ContentFetch(e.to_string()))?
+        }
+        ItemType::Storage => {
+            // Try IPFS gateway for storage items too
+            ctx.ipfs.get(&message.item_hash).await
+                .map_err(|e| ProcessorError::ContentFetch(e.to_string()))?
+        }
+        ItemType::Inline => {
+            return Ok(message.clone()); // No fetch needed
+        }
+    };
+    
+    let content_str = String::from_utf8(content)
+        .map_err(|e| ProcessorError::ContentFetch(format!("Invalid UTF-8: {}", e)))?;
+    
+    // Create new message with fetched content
+    let mut msg = message.clone();
+    msg.item_content = Some(content_str);
+    
+    Ok(msg)
+}
+
+/// Check if a message has already been processed (duplicate detection)
+async fn is_duplicate(db: &PgPool, item_hash: &str) -> Result<bool, ProcessorError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE item_hash = $1)"
+    )
+    .bind(item_hash)
+    .fetch_one(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    Ok(exists)
+}
+
+/// Mark a pending message as fetched
+async fn mark_fetched(db: &PgPool, item_hash: &str) -> Result<(), ProcessorError> {
+    sqlx::query("UPDATE pending_messages SET fetched = true WHERE item_hash = $1")
+        .bind(item_hash)
+        .execute(db)
+        .await
+        .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    Ok(())
+}
+
+/// Delete a pending message after successful processing
+async fn delete_pending(db: &PgPool, item_hash: &str) -> Result<(), ProcessorError> {
+    sqlx::query("DELETE FROM pending_messages WHERE item_hash = $1")
+        .bind(item_hash)
+        .execute(db)
+        .await
+        .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    Ok(())
+}
+
+/// Move a message to the rejected table
+async fn move_to_rejected(
+    db: &PgPool,
+    pending: &PendingMessageDb,
+    error_code: ErrorCode,
+    error_message: &str,
+) -> Result<(), ProcessorError> {
+    // Insert into rejected_messages
+    sqlx::query(
+        r#"
+        INSERT INTO rejected_messages (item_hash, message, error_code, error_message, rejected_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (item_hash) DO UPDATE SET
+            error_code = EXCLUDED.error_code,
+            error_message = EXCLUDED.error_message,
+            rejected_at = EXCLUDED.rejected_at
+        "#
+    )
+    .bind(&pending.item_hash)
+    .bind(&pending.message)
+    .bind(error_code.as_i32())
+    .bind(error_message)
+    .execute(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    // Delete from pending_messages
+    delete_pending(db, &pending.item_hash).await?;
+    
+    Ok(())
+}
+
+/// Update retry count and next attempt time with exponential backoff
+async fn update_retry(
+    db: &PgPool,
+    pending: &PendingMessageDb,
+    reason: &str,
+) -> Result<(), ProcessorError> {
+    let new_retries = pending.retries + 1;
+    
+    // Check if max retries exceeded
+    if new_retries >= MAX_RETRIES {
+        return move_to_rejected(
+            db, 
+            pending, 
+            ErrorCode::InternalError,
+            &format!("Max retries ({}) exceeded: {}", MAX_RETRIES, reason),
+        ).await;
+    }
+    
+    // Calculate next attempt with exponential backoff
+    let delay = (BASE_RETRY_DELAY * 2.0_f64.powi(pending.retries)).min(MAX_RETRY_DELAY);
+    let next_attempt = Utc::now().timestamp() as f64 + delay;
+    
+    sqlx::query(
+        "UPDATE pending_messages SET retries = $1, next_attempt = $2 WHERE item_hash = $3"
+    )
+    .bind(new_retries)
+    .bind(next_attempt)
+    .bind(&pending.item_hash)
+    .execute(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    debug!(
+        "Message {} scheduled for retry {} in {} seconds",
+        pending.item_hash, new_retries, delay
+    );
+    
+    Ok(())
+}
+
+/// Store a processed message in the main messages table
+async fn store_processed_message(db: &PgPool, message: &Message) -> Result<(), ProcessorError> {
+    sqlx::query(
+        r#"
+        INSERT INTO messages (
+            item_hash, message_type, chain, sender, signature, 
+            item_type, item_content, channel, time, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ON CONFLICT (item_hash) DO NOTHING
+        "#
+    )
+    .bind(&message.item_hash)
+    .bind(message.message_type.to_string())
+    .bind(message.chain.to_string())
+    .bind(&message.sender)
+    .bind(&message.signature)
+    .bind(format!("{:?}", message.item_type).to_lowercase())
+    .bind(&message.item_content)
+    .bind(&message.channel)
+    .bind(message.time)
+    .execute(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    Ok(())
+}
+
+/// Create a handler context from the processor context
+fn create_handler_context(ctx: &ProcessorContext) -> HandlerContext {
+    let mut handler_ctx = HandlerContext::new();
+    handler_ctx.crypto = Some(ctx.crypto.clone());
+    handler_ctx
+}
+
+/// Processor errors
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessorError {
+    #[error("Database error: {0}")]
+    Database(String),
+    
+    #[error("Invalid message: {0}")]
+    InvalidMessage(String),
+    
+    #[error("Content fetch failed: {0}")]
+    ContentFetch(String),
+    
+    #[error("Handler error: {0}")]
+    Handler(String),
+}
+
+/// Job statistics
+#[derive(Debug, Clone)]
+pub struct ProcessorStats {
+    pub messages_processed: u64,
+    pub messages_rejected: u64,
+    pub messages_pending: u64,
+    pub avg_process_time_ms: f64,
+}
+
+/// Get current processor statistics
+pub async fn get_stats(db: &PgPool) -> Result<ProcessorStats, ProcessorError> {
+    let pending_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM pending_messages"
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    let processed_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages"
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    let rejected_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM rejected_messages"
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    Ok(ProcessorStats {
+        messages_processed: processed_count.0 as u64,
+        messages_rejected: rejected_count.0 as u64,
+        messages_pending: pending_count.0 as u64,
+        avg_process_time_ms: 0.0, // Would need timing instrumentation
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_exponential_backoff() {
+        // Retry 0: 60 seconds
+        let delay_0 = (BASE_RETRY_DELAY * 2.0_f64.powi(0)).min(MAX_RETRY_DELAY);
+        assert_eq!(delay_0, 60.0);
+        
+        // Retry 1: 120 seconds
+        let delay_1 = (BASE_RETRY_DELAY * 2.0_f64.powi(1)).min(MAX_RETRY_DELAY);
+        assert_eq!(delay_1, 120.0);
+        
+        // Retry 5: 1920 seconds (~32 min)
+        let delay_5 = (BASE_RETRY_DELAY * 2.0_f64.powi(5)).min(MAX_RETRY_DELAY);
+        assert_eq!(delay_5, 1920.0);
+        
+        // Retry 10: capped at MAX_RETRY_DELAY
+        let delay_10 = (BASE_RETRY_DELAY * 2.0_f64.powi(10)).min(MAX_RETRY_DELAY);
+        assert_eq!(delay_10, MAX_RETRY_DELAY);
+    }
 }

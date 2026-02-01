@@ -65,7 +65,7 @@ impl MessageService {
         // 3. Validate timestamp (not too far in future)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("System time is before UNIX epoch")
             .as_secs_f64();
         
         if message.time > now + 300.0 {
@@ -187,9 +187,10 @@ impl MessageService {
     }
     
     async fn process_aggregate(&self, message: &Message, pool: &PgPool) -> Result<(), MessageError> {
-        let content: AggregateContent = serde_json::from_str(
-            message.item_content.as_ref().unwrap()
-        ).map_err(|e| MessageError::InvalidContent(e.to_string()))?;
+        let item_content = message.item_content.as_ref()
+            .ok_or_else(|| MessageError::InvalidContent("Missing item_content".to_string()))?;
+        let content: AggregateContent = serde_json::from_str(item_content)
+            .map_err(|e| MessageError::InvalidContent(e.to_string()))?;
         
         // Upsert aggregate
         sqlx::query(
@@ -211,9 +212,10 @@ impl MessageService {
     }
     
     async fn process_post(&self, message: &Message, pool: &PgPool) -> Result<(), MessageError> {
-        let content: PostContent = serde_json::from_str(
-            message.item_content.as_ref().unwrap()
-        ).map_err(|e| MessageError::InvalidContent(e.to_string()))?;
+        let item_content = message.item_content.as_ref()
+            .ok_or_else(|| MessageError::InvalidContent("Missing item_content".to_string()))?;
+        let content: PostContent = serde_json::from_str(item_content)
+            .map_err(|e| MessageError::InvalidContent(e.to_string()))?;
         
         sqlx::query(
             r#"
@@ -237,9 +239,10 @@ impl MessageService {
     }
     
     async fn process_store(&self, message: &Message, pool: &PgPool) -> Result<(), MessageError> {
-        let content: StoreContent = serde_json::from_str(
-            message.item_content.as_ref().unwrap()
-        ).map_err(|e| MessageError::InvalidContent(e.to_string()))?;
+        let item_content = message.item_content.as_ref()
+            .ok_or_else(|| MessageError::InvalidContent("Missing item_content".to_string()))?;
+        let content: StoreContent = serde_json::from_str(item_content)
+            .map_err(|e| MessageError::InvalidContent(e.to_string()))?;
         
         sqlx::query(
             r#"
@@ -260,9 +263,10 @@ impl MessageService {
     }
     
     async fn process_program(&self, message: &Message, pool: &PgPool) -> Result<(), MessageError> {
-        let content: ProgramContent = serde_json::from_str(
-            message.item_content.as_ref().unwrap()
-        ).map_err(|e| MessageError::InvalidContent(e.to_string()))?;
+        let item_content = message.item_content.as_ref()
+            .ok_or_else(|| MessageError::InvalidContent("Missing item_content".to_string()))?;
+        let content: ProgramContent = serde_json::from_str(item_content)
+            .map_err(|e| MessageError::InvalidContent(e.to_string()))?;
         
         sqlx::query(
             r#"
@@ -286,9 +290,10 @@ impl MessageService {
     }
     
     async fn process_instance(&self, message: &Message, pool: &PgPool) -> Result<(), MessageError> {
-        let content: InstanceContent = serde_json::from_str(
-            message.item_content.as_ref().unwrap()
-        ).map_err(|e| MessageError::InvalidContent(e.to_string()))?;
+        let item_content = message.item_content.as_ref()
+            .ok_or_else(|| MessageError::InvalidContent("Missing item_content".to_string()))?;
+        let content: InstanceContent = serde_json::from_str(item_content)
+            .map_err(|e| MessageError::InvalidContent(e.to_string()))?;
         
         let payment_type = content.payment.as_ref().map(|p| format!("{:?}", p.payment_type).to_lowercase());
         let payment_chain = content.payment.as_ref().map(|p| p.chain.to_string());
@@ -316,9 +321,10 @@ impl MessageService {
     }
     
     async fn process_forget(&self, message: &Message, pool: &PgPool) -> Result<(), MessageError> {
-        let content: ForgetContent = serde_json::from_str(
-            message.item_content.as_ref().unwrap()
-        ).map_err(|e| MessageError::InvalidContent(e.to_string()))?;
+        let item_content = message.item_content.as_ref()
+            .ok_or_else(|| MessageError::InvalidContent("Missing item_content".to_string()))?;
+        let content: ForgetContent = serde_json::from_str(item_content)
+            .map_err(|e| MessageError::InvalidContent(e.to_string()))?;
         
         for hash in &content.hashes {
             // Mark as forgotten
