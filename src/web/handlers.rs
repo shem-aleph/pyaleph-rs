@@ -124,10 +124,15 @@ pub struct MessageQuery {
     pub channels: Option<String>,
     #[serde(rename = "msgType")]
     pub message_type: Option<String>,
+    /// Also support msgTypes (plural) as alias
+    #[serde(rename = "msgTypes")]
+    pub message_types: Option<String>,
     pub hashes: Option<String>,
     pub refs: Option<String>,
     pub tags: Option<String>,
     pub pagination: Option<u32>,
+    /// Alias for pagination (pyaleph compatibility)
+    pub limit: Option<u32>,
     pub page: Option<u32>,
     /// Start time filter (Unix timestamp)
     pub start_date: Option<f64>,
@@ -143,8 +148,12 @@ pub async fn list_messages(
     Query(params): Query<MessageQuery>,
 ) -> impl IntoResponse {
     let page = params.page.unwrap_or(1);
-    let per_page = params.pagination.unwrap_or(20).min(1000); // Max 1000 per page
+    // Support both 'limit' and 'pagination' parameters (limit takes precedence)
+    let per_page = params.limit.or(params.pagination).unwrap_or(20).min(1000); // Max 1000 per page
     let offset = ((page - 1) * per_page) as i64;
+    
+    // Merge msgType and msgTypes (msgType takes precedence)
+    let message_type_filter = params.message_type.or(params.message_types);
     
     if !state.has_db() {
         return Json(json!({
@@ -168,7 +177,7 @@ pub async fn list_messages(
     }
     
     // Parse message type filter (parameterized)
-    if let Some(ref msg_type) = params.message_type {
+    if let Some(ref msg_type) = message_type_filter {
         builder.and_eq("message_type", msg_type.to_uppercase());
     }
     
@@ -204,7 +213,7 @@ pub async fn list_messages(
             count_builder.and_in("sender", &addr_list);
         }
     }
-    if let Some(ref msg_type) = params.message_type {
+    if let Some(ref msg_type) = message_type_filter {
         count_builder.and_eq("message_type", msg_type.to_uppercase());
     }
     if let Some(ref channels) = params.channels {
