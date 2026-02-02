@@ -178,6 +178,8 @@ impl QueryBuilder {
     }
     
     /// Add an AND IN condition for JSONB text field
+    /// Add an AND IN condition for JSONB text field
+    /// Supports nested paths like "content.type"
     pub fn and_jsonb_text_in(&mut self, column: &str, json_path: &str, values: &[String]) -> &mut Self {
         if values.is_empty() {
             return self;
@@ -195,7 +197,16 @@ impl QueryBuilder {
             .map(|i| format!("${}", self.param_index + i as i32))
             .collect();
         
-        let clause = format!(" AND ({}::jsonb->>'{}') IN ({})", column, json_path, placeholders.join(", "));
+        // Handle nested paths - convert "content.type" to path array
+        let path_parts: Vec<&str> = json_path.split('.').collect();
+        let clause = if path_parts.len() > 1 {
+            // Nested path - use #>> operator with path array format
+            let path_array = path_parts.join(",");
+            format!(" AND ({}::jsonb #>> '{{{}}}') IN ({})", column, path_array, placeholders.join(", "))
+        } else {
+            // Simple path
+            format!(" AND ({}::jsonb->>'{}') IN ({})", column, json_path, placeholders.join(", "))
+        };
         self.query.push_str(&clause);
         self.count_query.push_str(&clause);
         
@@ -208,6 +219,8 @@ impl QueryBuilder {
     }
     
     /// Add an AND condition checking if JSONB array contains a value
+    /// Add an AND condition checking if JSONB array contains a value
+    /// Supports nested paths like "content.tags"
     pub fn and_jsonb_array_contains(&mut self, column: &str, json_path: &str, value: String) -> &mut Self {
         // Validate column and path names
         if !column.chars().all(|c| c.is_alphanumeric() || c == '_') {
@@ -217,8 +230,16 @@ impl QueryBuilder {
             panic!("Invalid json path: {}", json_path);
         }
         
-        // Use ? operator to check if array contains the value
-        let clause = format!(" AND ({}::jsonb->'{}') ? ${}", column, json_path, self.param_index);
+        // Handle nested paths - convert "content.tags" to path array
+        let path_parts: Vec<&str> = json_path.split('.').collect();
+        let clause = if path_parts.len() > 1 {
+            // Nested path - use #> operator with path array
+            let path_array = path_parts.join(",");
+            format!(" AND ({}::jsonb #> '{{{}}}') ? ${}", column, path_array, self.param_index)
+        } else {
+            // Simple path - use -> operator
+            format!(" AND ({}::jsonb->'{}') ? ${}", column, json_path, self.param_index)
+        };
         self.query.push_str(&clause);
         self.count_query.push_str(&clause);
         let _ = self.args.add(value);

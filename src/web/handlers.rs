@@ -141,6 +141,19 @@ pub struct MessageQuery {
     pub hashes: Option<String>,
     pub refs: Option<String>,
     pub tags: Option<String>,
+    /// Filter by content.type field (comma-separated)
+    #[serde(rename = "contentTypes")]
+    pub content_types: Option<String>,
+    /// Filter by content.item_hash (comma-separated)
+    #[serde(rename = "contentHashes")]
+    pub content_hashes: Option<String>,
+    /// Filter by content key names (comma-separated)  
+    #[serde(rename = "contentKeys")]
+    pub content_keys: Option<String>,
+    /// Filter by chain (comma-separated)
+    pub chains: Option<String>,
+    /// Filter by content.address for programs/instances (comma-separated)
+    pub owners: Option<String>,
     pub pagination: Option<u32>,
     /// Alias for pagination (pyaleph compatibility)
     pub limit: Option<u32>,
@@ -238,6 +251,62 @@ pub async fn list_messages(
         }
     }
     
+    // Parse hashes filter (filter by item_hash)
+    if let Some(ref hashes) = params.hashes {
+        let hash_list = crate::db::parse_csv_param(hashes);
+        if !hash_list.is_empty() {
+            builder.and_in("item_hash", &hash_list);
+        }
+    }
+    
+    // Parse chains filter
+    if let Some(ref chains) = params.chains {
+        let chain_list = crate::db::parse_csv_param(chains);
+        if !chain_list.is_empty() {
+            builder.and_in("chain", &chain_list);
+        }
+    }
+    
+    // Parse refs filter (content.ref field - requires JSONB query)
+    if let Some(ref refs) = params.refs {
+        let ref_list = crate::db::parse_csv_param(refs);
+        if !ref_list.is_empty() {
+            builder.and_jsonb_text_in("item_content", "ref", &ref_list);
+        }
+    }
+    
+    // Parse tags filter (content.content.tags array - requires JSONB containment)
+    if let Some(ref tags) = params.tags {
+        let tag_list = crate::db::parse_csv_param(tags);
+        for tag in tag_list {
+            builder.and_jsonb_array_contains("item_content", "content.tags", tag);
+        }
+    }
+    
+    // Parse contentTypes filter (content.type field)
+    if let Some(ref content_types) = params.content_types {
+        let type_list = crate::db::parse_csv_param(content_types);
+        if !type_list.is_empty() {
+            builder.and_jsonb_text_in("item_content", "type", &type_list);
+        }
+    }
+    
+    // Parse contentHashes filter (content.item_hash field)
+    if let Some(ref content_hashes) = params.content_hashes {
+        let hash_list = crate::db::parse_csv_param(content_hashes);
+        if !hash_list.is_empty() {
+            builder.and_jsonb_text_in("item_content", "item_hash", &hash_list);
+        }
+    }
+    
+    // Parse owners filter (content.address field for programs/instances)
+    if let Some(ref owners) = params.owners {
+        let owner_list = crate::db::parse_csv_param(owners);
+        if !owner_list.is_empty() {
+            builder.and_jsonb_text_in("item_content", "address", &owner_list);
+        }
+    }
+    
     // Time filters (parameterized)
     if let Some(start) = params.start_date {
         builder.and_gte("time", start);
@@ -297,6 +366,49 @@ pub async fn list_messages(
         let channel_list = crate::db::parse_csv_param(channels);
         if !channel_list.is_empty() {
             count_builder.and_in("channel", &channel_list);
+        }
+    }
+    // Add same filters to count builder
+    if let Some(ref hashes) = params.hashes {
+        let hash_list = crate::db::parse_csv_param(hashes);
+        if !hash_list.is_empty() {
+            count_builder.and_in("item_hash", &hash_list);
+        }
+    }
+    if let Some(ref chains) = params.chains {
+        let chain_list = crate::db::parse_csv_param(chains);
+        if !chain_list.is_empty() {
+            count_builder.and_in("chain", &chain_list);
+        }
+    }
+    if let Some(ref refs) = params.refs {
+        let ref_list = crate::db::parse_csv_param(refs);
+        if !ref_list.is_empty() {
+            count_builder.and_jsonb_text_in("item_content", "ref", &ref_list);
+        }
+    }
+    if let Some(ref tags) = params.tags {
+        let tag_list = crate::db::parse_csv_param(tags);
+        for tag in tag_list {
+            count_builder.and_jsonb_array_contains("item_content", "content.tags", tag.clone());
+        }
+    }
+    if let Some(ref content_types) = params.content_types {
+        let type_list = crate::db::parse_csv_param(content_types);
+        if !type_list.is_empty() {
+            count_builder.and_jsonb_text_in("item_content", "type", &type_list);
+        }
+    }
+    if let Some(ref content_hashes) = params.content_hashes {
+        let hash_list = crate::db::parse_csv_param(content_hashes);
+        if !hash_list.is_empty() {
+            count_builder.and_jsonb_text_in("item_content", "item_hash", &hash_list);
+        }
+    }
+    if let Some(ref owners) = params.owners {
+        let owner_list = crate::db::parse_csv_param(owners);
+        if !owner_list.is_empty() {
+            count_builder.and_jsonb_text_in("item_content", "address", &owner_list);
         }
     }
     if let Some(start) = params.start_date {
@@ -857,6 +969,40 @@ pub struct PostsQuery {
     pub sort_order: Option<i8>,
 }
 
+/// Post response format for v0 API - includes message-level fields
+/// Reference: aleph/web/controllers/posts.py
+#[derive(Debug, Clone, Serialize)]
+pub struct PostResponseV0 {
+    // From posts table
+    pub item_hash: String,
+    #[serde(rename = "ref")]
+    pub ref_: Option<String>,
+    pub address: String,
+    #[serde(rename = "type")]
+    pub message_type: String,  // Always "POST"
+    pub post_type: String,
+    pub content: serde_json::Value,
+    pub channel: Option<String>,
+    pub time: f64,
+    pub original_item_hash: Option<String>,
+    #[serde(rename = "hash")]
+    pub hash: Option<String>,  // Alias for original_item_hash
+    // From messages table (joined)
+    pub chain: String,
+    pub sender: String,
+    pub signature: String,
+    pub item_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_content: Option<String>,
+    pub size: i64,
+    pub confirmed: bool,
+    pub confirmations: Vec<ConfirmationResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_type: Option<String>,
+}
+
 /// Get posts - matches pyaleph format
 /// Reference: aleph/web/controllers/posts.py
 pub async fn get_posts(
@@ -864,7 +1010,7 @@ pub async fn get_posts(
     Query(params): Query<PostsQuery>,
 ) -> impl IntoResponse {
     let page = params.page.unwrap_or(1);
-    // Support both 'limit' and 'pagination' parameters (limit takes precedence)
+    // Support both limit and pagination parameters (limit takes precedence)
     let per_page = params.limit.or(params.pagination).unwrap_or(20).min(1000);
     let offset = ((page - 1) * per_page) as i64;
     
@@ -880,16 +1026,23 @@ pub async fn get_posts(
         }));
     }
     
-    // Build query with safe parameterized filters
-    let mut builder = crate::db::QueryBuilder::new("SELECT * FROM posts WHERE 1=1");
-    let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM posts WHERE 1=1");
+    // Build query with JOIN to messages table for message-level fields
+    let mut builder = crate::db::QueryBuilder::new(
+        "SELECT p.item_hash, p.address, p.post_type, p.content, p.ref_, p.channel, p.time, \
+         p.original_item_hash, p.latest_amend, p.amends, \
+         m.chain, m.sender, m.signature, m.item_type, m.item_content \
+         FROM posts p \
+         LEFT JOIN messages m ON p.item_hash = m.item_hash \
+         WHERE 1=1"
+    );
+    let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM posts p WHERE 1=1");
     
     // Filter by addresses (sender)
     if let Some(ref addresses) = params.addresses {
         let addr_list = crate::db::parse_csv_param(addresses);
         if !addr_list.is_empty() {
-            builder.and_in("address", &addr_list);
-            count_builder.and_in("address", &addr_list);
+            builder.and_in("p.address", &addr_list);
+            count_builder.and_in("p.address", &addr_list);
         }
     }
     
@@ -897,8 +1050,8 @@ pub async fn get_posts(
     if let Some(ref channels) = params.channels {
         let channel_list = crate::db::parse_csv_param(channels);
         if !channel_list.is_empty() {
-            builder.and_in("channel", &channel_list);
-            count_builder.and_in("channel", &channel_list);
+            builder.and_in("p.channel", &channel_list);
+            count_builder.and_in("p.channel", &channel_list);
         }
     }
     
@@ -906,8 +1059,8 @@ pub async fn get_posts(
     if let Some(ref types) = params.types {
         let type_list = crate::db::parse_csv_param(types);
         if !type_list.is_empty() {
-            builder.and_in("post_type", &type_list);
-            count_builder.and_in("post_type", &type_list);
+            builder.and_in("p.post_type", &type_list);
+            count_builder.and_in("p.post_type", &type_list);
         }
     }
     
@@ -915,8 +1068,8 @@ pub async fn get_posts(
     if let Some(ref refs) = params.refs {
         let ref_list = crate::db::parse_csv_param(refs);
         if !ref_list.is_empty() {
-            builder.and_in("ref_", &ref_list);
-            count_builder.and_in("ref_", &ref_list);
+            builder.and_in("p.ref_", &ref_list);
+            count_builder.and_in("p.ref_", &ref_list);
         }
     }
     
@@ -924,29 +1077,27 @@ pub async fn get_posts(
     if let Some(ref hashes) = params.hashes {
         let hash_list = crate::db::parse_csv_param(hashes);
         if !hash_list.is_empty() {
-            builder.and_in("item_hash", &hash_list);
-            count_builder.and_in("item_hash", &hash_list);
+            builder.and_in("p.item_hash", &hash_list);
+            count_builder.and_in("p.item_hash", &hash_list);
         }
     }
     
     // Time filters
     if let Some(start) = params.start_date {
-        builder.and_gte("time", start);
-        count_builder.and_gte("time", start);
+        builder.and_gte("p.time", start);
+        count_builder.and_gte("p.time", start);
     }
     if let Some(end) = params.end_date {
-        builder.and_lte("time", end);
-        count_builder.and_lte("time", end);
+        builder.and_lte("p.time", end);
+        count_builder.and_lte("p.time", end);
     }
     
-    // Filter by tags (searches content->'tags' array)
+    // Filter by tags (searches content->tags array)
     if let Some(ref tags) = params.tags {
         let tag_list = crate::db::parse_csv_param(tags);
-        // For each tag, add a condition that the content->'tags' array contains it
-        // Using AND logic: all specified tags must be present
         for tag in tag_list {
-            builder.and_jsonb_array_contains("content", "tags", tag.clone());
-            count_builder.and_jsonb_array_contains("content", "tags", tag);
+            builder.and_jsonb_array_contains("p.content", "tags", tag.clone());
+            count_builder.and_jsonb_array_contains("p.content", "tags", tag);
         }
     }
     
@@ -955,13 +1106,15 @@ pub async fn get_posts(
     let sort_column = params.sort_by
         .as_deref()
         .and_then(|col| crate::db::validate_sort_column(col, allowed_sort))
-        .unwrap_or("time");
+        .map(|c| format!("p.{}", c))
+        .unwrap_or_else(|| "p.time".to_string());
     
     // Order: 1 = ascending, -1 = descending (default)
     let ascending = order_param.map(|o| o == 1).unwrap_or(false);
-    builder.order_by(sort_column, ascending);
-    builder.limit(per_page as i64);
-    builder.offset(offset);
+    
+    // Add raw ORDER BY since we have table prefix
+    let order_dir = if ascending { "ASC" } else { "DESC" };
+    builder.and_raw(&format!("1=1 ORDER BY {} {} LIMIT {} OFFSET {}", sort_column, order_dir, per_page, offset));
     
     // Get total count first
     let (count_query, count_args) = count_builder.build();
@@ -970,18 +1123,101 @@ pub async fn get_posts(
         .await
         .unwrap_or((0,));
     
-    // Get the posts
+    // Define row type for the joined query
+    type PostJoinRow = (
+        String,                    // item_hash
+        String,                    // address
+        String,                    // post_type
+        serde_json::Value,         // content
+        Option<String>,            // ref_
+        Option<String>,            // channel
+        f64,                       // time
+        Option<String>,            // original_item_hash
+        Option<String>,            // latest_amend
+        Option<serde_json::Value>, // amends
+        Option<String>,            // chain
+        Option<String>,            // sender
+        Option<String>,            // signature
+        Option<String>,            // item_type
+        Option<String>,            // item_content
+    );
+    
+    // Get the posts with joined message data
     let (query, args) = builder.build();
-    let posts = sqlx::query_as_with::<_, crate::db::models::PostDb, _>(&query, args)
+    let rows: Vec<PostJoinRow> = sqlx::query_as_with(&query, args)
         .fetch_all(state.db())
         .await
         .unwrap_or_default();
+    
+    // Get item_hashes for confirmation lookup
+    let item_hashes: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+    let mut confirmations_map: HashMap<String, Vec<ConfirmationResponse>> = HashMap::new();
+    
+    if !item_hashes.is_empty() {
+        let placeholders: Vec<String> = (1..=item_hashes.len())
+            .map(|i| format!("${}", i))
+            .collect();
+        let conf_query = format!(
+            "SELECT item_hash, chain, hash, height FROM chain_txs WHERE item_hash IN ({})",
+            placeholders.join(", ")
+        );
+        
+        let mut q = sqlx::query_as::<_, (String, String, String, i64)>(&conf_query);
+        for hash in &item_hashes {
+            q = q.bind(hash);
+        }
+        
+        let confirmations = q.fetch_all(state.db()).await.unwrap_or_default();
+        
+        for (item_hash, chain, hash, height) in confirmations {
+            confirmations_map
+                .entry(item_hash)
+                .or_insert_with(Vec::new)
+                .push(ConfirmationResponse { chain, hash, height: height as u64 });
+        }
+    }
+    
+    // Build response
+    let posts: Vec<PostResponseV0> = rows.iter().map(|row| {
+        let confirmations = confirmations_map
+            .get(&row.0)
+            .cloned()
+            .unwrap_or_default();
+        let confirmed = !confirmations.is_empty();
+        
+        // Calculate size from item_content if available
+        let size = row.14.as_ref().map(|c| c.len() as i64).unwrap_or(0);
+        
+        PostResponseV0 {
+            item_hash: row.0.clone(),
+            ref_: row.4.clone(),
+            address: row.1.clone(),
+            message_type: "POST".to_string(),
+            post_type: row.2.clone(),
+            content: row.3.clone(),
+            channel: row.5.clone(),
+            time: row.6,
+            original_item_hash: row.7.clone(),
+            hash: row.7.clone(),  // Alias
+            chain: row.10.clone().unwrap_or_else(|| "ETH".to_string()),
+            sender: row.11.clone().unwrap_or_else(|| row.1.clone()),
+            signature: row.12.clone().unwrap_or_default(),
+            item_type: row.13.clone().unwrap_or_else(|| "inline".to_string()),
+            item_content: row.14.clone(),
+            size,
+            confirmed,
+            confirmations,
+            original_signature: None,  // Would need additional join for amends
+            original_type: if row.7.is_some() { Some("amend".to_string()) } else { None },
+        }
+    }).collect();
     
     Json(json!({
         "posts": posts,
         "pagination_total": total.0,
         "pagination_page": page,
         "pagination_per_page": per_page,
+        "pagination_item": "posts",
     }))
 }
 
