@@ -18,12 +18,13 @@ use crate::services::crypto::CryptoService;
 use crate::services::ipfs::IpfsService;
 use crate::handlers::{self, HandlerContext};
 use crate::db::models::PendingMessageDb;
+use futures::stream::{self, StreamExt};
 
 /// Process interval in milliseconds
-const PROCESS_INTERVAL_MS: u64 = 1000;
+const PROCESS_INTERVAL_MS: u64 = 50;
 
 /// Maximum messages to process per batch
-const BATCH_SIZE: i64 = 100;
+const BATCH_SIZE: i64 = 1000;
 
 /// Maximum number of retries before rejecting a message
 const MAX_RETRIES: i32 = 10;
@@ -35,6 +36,7 @@ const BASE_RETRY_DELAY: f64 = 60.0;
 const MAX_RETRY_DELAY: f64 = 3600.0;
 
 /// Processing context containing all services
+#[derive(Clone)]
 pub struct ProcessorContext {
     pub db: PgPool,
     pub crypto: Arc<CryptoService>,
@@ -95,36 +97,67 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
         return Ok(0);
     }
     
+    // Group messages by sender address for safe parallel processing
+    // Messages from the same address must be processed sequentially
+    // (authorization messages must be processed before delegated writes)
+    use std::collections::HashMap;
+    let mut by_address: HashMap<String, Vec<PendingMessageDb>> = HashMap::new();
+    for msg in pending_messages {
+        by_address.entry(msg.message.get("sender").and_then(|s| s.as_str()).unwrap_or("").to_string()).or_default().push(msg);
+    }
+    
+    // Process address groups in parallel (up to 50 concurrent addresses)
+    let results: Vec<_> = stream::iter(by_address.into_values())
+        .map(|address_msgs| {
+            let ctx = ctx.clone();
+            async move {
+                let mut group_results = Vec::new();
+                // Sequential processing within each address
+                for pending in address_msgs {
+                    let hash = pending.item_hash.clone();
+                    let result = process_single_message(&ctx, &pending).await;
+                    group_results.push((hash, pending, result));
+                }
+                group_results
+            }
+        })
+        .buffer_unordered(50)
+        .collect::<Vec<_>>()
+        .await;
+    
+    // Flatten results
+    let results: Vec<_> = results.into_iter().flatten().collect();
+    
+    // Batch collect successful deletions
+    let mut to_delete: Vec<String> = Vec::new();
     let mut processed_count = 0u32;
     
-    for pending in pending_messages {
-        match process_single_message(ctx, &pending).await {
+    for (hash, pending, result) in results {
+        match result {
             Ok(status) => {
                 processed_count += 1;
-                
                 match status {
                     ProcessResult::Processed => {
-                        // Remove from pending, message is now in main table
-                        delete_pending(&ctx.db, &pending.item_hash).await?;
+                        to_delete.push(hash);
                     }
                     ProcessResult::Rejected(code, msg) => {
-                        // Move to rejected table
-                        move_to_rejected(&ctx.db, &pending, code, &msg).await?;
+                        let _ = move_to_rejected(&ctx.db, &pending, code, &msg).await;
                     }
                     ProcessResult::Retry(reason) => {
-                        // Update retry count and next attempt time
-                        update_retry(&ctx.db, &pending, &reason).await?;
+                        let _ = update_retry(&ctx.db, &pending, &reason).await;
                     }
                 }
             }
             Err(e) => {
-                error!("Error processing message {}: {}", pending.item_hash, e);
-                // Schedule retry
-                if let Err(retry_err) = update_retry(&ctx.db, &pending, &e.to_string()).await {
-                    error!("Failed to update retry: {}", retry_err);
-                }
+                error!("Error processing message {}: {}", hash, e);
+                let _ = update_retry(&ctx.db, &pending, &e.to_string()).await;
             }
         }
+    }
+    
+    // Batch delete processed messages
+    if !to_delete.is_empty() {
+        batch_delete_pending(&ctx.db, &to_delete).await?;
     }
     
     Ok(processed_count)
@@ -317,6 +350,21 @@ async fn delete_pending(db: &PgPool, item_hash: &str) -> Result<(), ProcessorErr
     sqlx::query("DELETE FROM pending_messages WHERE item_hash = $1")
         .bind(item_hash)
         .execute(db)
+        .await
+        .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    
+    Ok(())
+}
+
+/// Batch delete pending messages
+async fn batch_delete_pending(pool: &PgPool, hashes: &[String]) -> Result<(), ProcessorError> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    
+    sqlx::query("DELETE FROM pending_messages WHERE item_hash = ANY($1)")
+        .bind(hashes)
+        .execute(pool)
         .await
         .map_err(|e| ProcessorError::Database(e.to_string()))?;
     

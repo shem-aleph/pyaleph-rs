@@ -8,7 +8,7 @@
 //! 5. Queues messages to pending_messages for handler processing
 
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use tokio::time::{interval, Duration};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
@@ -29,7 +29,7 @@ const SYNC_INTERVAL_SECS: u64 = 12;
 const MAX_BLOCKS_PER_BATCH: u64 = 100;
 
 /// Maximum concurrent IPFS fetches
-const MAX_CONCURRENT_IPFS: usize = 20;
+const MAX_CONCURRENT_IPFS: usize = 100;
 
 /// Pagination limit for indexer queries
 const INDEXER_LIMIT: usize = 5000;
@@ -257,6 +257,10 @@ async fn sync_chain_from_indexer_optimized(
         for event in &events {
             if let Ok(sync_content) = IndexerClient::parse_sync_message(&event.message) {
                 cids_to_fetch.push((sync_content.content, event.timestamp));
+            } else {
+                if cids_to_fetch.is_empty() && events.len() > 0 {
+                    tracing::warn!("Failed to parse sync event. Sample: {:.100}", &event.message);
+                }
             }
         }
         
@@ -291,6 +295,14 @@ async fn sync_chain_from_indexer_optimized(
         info!("{}: Fetched {} IPFS batches, {} total messages", 
               chain, successful_fetches, all_messages.len());
         
+        // Deduplicate messages by item_hash (prevent ON CONFLICT duplicate row issue)
+        let mut seen: HashMap<String, Message> = HashMap::new();
+        for msg in all_messages {
+            seen.insert(msg.item_hash.clone(), msg);
+        }
+        let all_messages: Vec<Message> = seen.into_values().collect();
+        info!("{}: {} unique messages after deduplication", chain, all_messages.len());
+
         // Resolve content for storage-type messages
         if !all_messages.is_empty() {
             let messages_with_content = resolve_message_contents(
@@ -603,4 +615,55 @@ async fn parse_and_store_messages(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let batch: IpfsBatchContent = serde_json::from_str(content)?;
     batch_insert_messages_and_queue(pool, &batch.content.messages).await
+}
+
+/// Insert chain TX and link to messages
+async fn insert_chain_tx_confirmations(
+    pool: &PgPool,
+    tx_hash: &str,
+    chain: &str,
+    height: i64,
+    datetime_ms: u64,
+    publisher: &str,
+    content: &str,
+    item_hashes: &[String],
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    use chrono::{TimeZone, Utc};
+    
+    let datetime = Utc.timestamp_millis_opt(datetime_ms as i64).single();
+    
+    // Insert chain_txs entry
+    sqlx::query(
+        "INSERT INTO chain_txs (hash, chain, height, datetime, publisher, protocol, content)
+         VALUES ($1, $2, $3, $4, $5, 'aleph-offchain', $6::jsonb)
+         ON CONFLICT (hash) DO NOTHING"
+    )
+    .bind(tx_hash)
+    .bind(chain)
+    .bind(height)
+    .bind(datetime)
+    .bind(publisher)
+    .bind(serde_json::json!({"content": content}))
+    .execute(pool)
+    .await?;
+    
+    // Insert message_confirmations links
+    let mut count = 0;
+    for item_hash in item_hashes {
+        let result = sqlx::query(
+            "INSERT INTO message_confirmations (item_hash, tx_hash)
+             VALUES ($1, $2)
+             ON CONFLICT (item_hash, tx_hash) DO NOTHING"
+        )
+        .bind(item_hash)
+        .bind(tx_hash)
+        .execute(pool)
+        .await;
+        
+        if result.is_ok() {
+            count += 1;
+        }
+    }
+    
+    Ok(count)
 }
