@@ -44,6 +44,10 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/messages/:hash/content", get(handlers::get_message_content))
         
         // Aggregates - use single route, handler can strip .json if needed
+        // Aggregates - list endpoint (must come before :address route to match correctly)
+        .route("/aggregates.json", get(handlers::list_aggregates))
+        .route("/aggregates", get(handlers::list_aggregates))
+        // Aggregates - single address lookup
         .route("/aggregates/:address", get(handlers::get_aggregates))
         
         // Posts
@@ -141,6 +145,7 @@ fn legacy_routes() -> Router<Arc<AppState>> {
     Router::new()
         // Direct access to common endpoints
         .route("/messages.json", get(handlers::list_messages))
+        .route("/aggregates.json", get(handlers::list_aggregates))
         .route("/aggregates/:address.json", get(handlers::get_aggregates))
         .route("/posts.json", get(handlers::get_posts))
         

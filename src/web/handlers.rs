@@ -492,6 +492,7 @@ pub async fn list_messages(
         "pagination_total": total.0,
         "pagination_page": page,
         "pagination_per_page": per_page,
+        "pagination_item": "messages",
     }))
 }
 
@@ -2331,55 +2332,143 @@ pub async fn get_balances(
 }
 
 
-/// List all aggregates with pagination - matches pyaleph format
+/// Query parameters for listing aggregates
+/// Reference: aleph/schemas/api/base.py:ListAggregateQueryParams
+#[derive(Debug, Deserialize)]
+pub struct ListAggregatesQuery {
+    /// Filter by addresses (comma-separated)
+    pub addresses: Option<String>,
+    /// Filter by keys (comma-separated)
+    pub keys: Option<String>,
+    /// Items per page (default: 20, max: 1000)
+    pub limit: Option<u32>,
+    /// Alias for limit (pyaleph compatibility)
+    pub pagination: Option<u32>,
+    /// Page number (1-indexed)
+    pub page: Option<u32>,
+    /// Sort order: 1 for ascending, -1 for descending (default: -1, by last_updated)
+    #[serde(rename = "sortOrder")]
+    pub sort_order: Option<i8>,
+}
+
+/// Aggregate item in list response
+/// Reference: aleph/schemas/api/aggregates.py:AggregateListItemResponse  
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregateListItem {
+    pub address: String,
+    pub key: String,
+    pub content: serde_json::Value,
+    /// ISO 8601 timestamp when aggregate was created
+    pub created: String,
+    /// ISO 8601 timestamp when aggregate was last updated
+    pub last_updated: String,
+}
+
+/// List aggregates with filtering - matches pyaleph /api/v0/aggregates.json format
+/// Reference: aleph/web/controllers/aggregates.py:list_aggregates_view
+/// 
+/// Supports filtering by addresses and keys, with pagination.
+/// Returns aggregates with metadata (created, last_updated).
 pub async fn list_aggregates(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<MessageQuery>,
+    Query(params): Query<ListAggregatesQuery>,
 ) -> impl IntoResponse {
+    let page = params.page.unwrap_or(1).max(1);
+    // Support both limit and pagination params (limit takes precedence)
+    let per_page = params.limit.or(params.pagination).unwrap_or(20).min(1000);
+    let offset = ((page - 1) * per_page) as i64;
+    let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
+    
     if !state.has_db() {
         return Json(json!({
             "aggregates": [],
             "pagination_total": 0,
+            "pagination_page": page,
+            "pagination_per_page": per_page,
+            "pagination_item": "aggregates",
+            "error": "Database not available"
         }));
     }
     
-    let page = params.page.unwrap_or(1);
-    let per_page = params.pagination.unwrap_or(20).min(100);
-    let offset = ((page - 1) * per_page) as i64;
+    // Build query with filters
+    let mut builder = crate::db::QueryBuilder::new(
+        "SELECT a.address, a.key, a.content, a.time as created,          COALESCE(ae.time, a.time) as last_updated          FROM aggregates a          LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash          WHERE 1=1"
+    );
+    let mut count_builder = crate::db::QueryBuilder::new(
+        "SELECT COUNT(*) FROM aggregates WHERE 1=1"
+    );
     
-    let aggregates = sqlx::query_as::<_, (String, String, serde_json::Value, f64)>(
-        "SELECT address, key, content, time FROM aggregates ORDER BY time DESC LIMIT $1 OFFSET $2"
-    )
-    .bind(per_page as i64)
-    .bind(offset)
-    .fetch_all(state.db())
-    .await
-    .unwrap_or_default();
+    // Filter by addresses
+    if let Some(ref addresses) = params.addresses {
+        let addr_list = crate::db::parse_csv_param(addresses);
+        if !addr_list.is_empty() {
+            builder.and_in("a.address", &addr_list);
+            count_builder.and_in("address", &addr_list);
+        }
+    }
     
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM aggregates")
+    // Filter by keys
+    if let Some(ref keys) = params.keys {
+        let key_list = crate::db::parse_csv_param(keys);
+        if !key_list.is_empty() {
+            builder.and_in("a.key", &key_list);
+            count_builder.and_in("key", &key_list);
+        }
+    }
+    
+    // Order and pagination - order by last_updated (descending by default)
+    let order_dir = if ascending { "ASC" } else { "DESC" };
+    builder.and_raw(&format!(
+        "1=1 ORDER BY COALESCE(ae.time, a.time) {} LIMIT {} OFFSET {}",
+        order_dir, per_page, offset
+    ));
+    
+    // Get total count
+    let (count_query, count_args) = count_builder.build();
+    let total: (i64,) = sqlx::query_as_with(&count_query, count_args)
         .fetch_one(state.db())
         .await
         .unwrap_or((0,));
     
-    let formatted: Vec<serde_json::Value> = aggregates
+    // Get aggregates
+    let (query, args) = builder.build();
+    let aggregates: Vec<(String, String, serde_json::Value, f64, f64)> = 
+        sqlx::query_as_with(&query, args)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default();
+    
+    // Format response with ISO timestamps
+    let aggregate_items: Vec<AggregateListItem> = aggregates
         .into_iter()
-        .map(|(address, key, content, time)| {
-            json!({
-                "address": address,
-                "key": key,
-                "content": content,
-                "time": time,
-            })
+        .map(|(address, key, content, created, last_updated)| {
+            // Convert Unix timestamps to ISO 8601 format
+            let created_dt = chrono::DateTime::from_timestamp(created as i64, ((created.fract() * 1_000_000.0) as u32) * 1000)
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+                .unwrap_or_else(|| format!("{}", created));
+            let last_updated_dt = chrono::DateTime::from_timestamp(last_updated as i64, ((last_updated.fract() * 1_000_000.0) as u32) * 1000)
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+                .unwrap_or_else(|| format!("{}", last_updated));
+            
+            AggregateListItem {
+                address,
+                key,
+                content,
+                created: created_dt,
+                last_updated: last_updated_dt,
+            }
         })
         .collect();
     
     Json(json!({
-        "aggregates": formatted,
-        "pagination_total": total.0,
-        "pagination_page": page,
+        "aggregates": aggregate_items,
         "pagination_per_page": per_page,
+        "pagination_page": page,
+        "pagination_total": total.0,
+        "pagination_item": "aggregates",
     }))
 }
+
 
 // ===== Message Price Endpoint =====
 
@@ -3368,12 +3457,23 @@ pub async fn get_version() -> impl IntoResponse {
     }))
 }
 
-/// GET /api/v0/info/public.json - Public node info
-pub async fn get_public_info() -> impl IntoResponse {
+/// GET /api/v0/info/public.json - Public node info (pyaleph compatible)
+/// Reference: aleph/web/controllers/info.py:get_public_node_info
+/// Returns P2P multiaddresses for the node (matches Python pyaleph format)
+pub async fn get_public_info(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Build multiaddresses list from config
+    // In production, this would come from the P2P node's actual multiaddresses
+    let multiaddresses: Vec<String> = if state.config.p2p.enabled {
+        // Return configured listen addresses (these should include full multiaddrs)
+        state.config.p2p.listen_addrs.clone()
+    } else {
+        vec![]
+    };
+    
     Json(json!({
-        "node_id": "pyaleph-rs-node",
-        "version": "0.2.0",
-        "api_version": "v0"
+        "node_multi_addresses": multiaddresses
     }))
 }
 
