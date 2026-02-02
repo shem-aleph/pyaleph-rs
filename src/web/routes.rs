@@ -63,16 +63,17 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/posts/page/:page", get(handlers::list_posts_page))
         
         
-        // Storage
-        .route("/storage/:hash", get(handlers::get_storage))
-        .route("/storage/:hash/raw", get(handlers::get_storage_raw))
+        // Storage - IMPORTANT: More specific routes MUST come BEFORE generic :hash routes
         .route("/storage/upload", post(handlers::upload_file))
-        
-        // Storage metadata endpoints
         .route("/storage/add_json", post(handlers::add_json_storage))
         .route("/storage/by-message-hash/:hash", get(handlers::get_storage_by_message_hash))
         .route("/storage/by-ref/:address/:ref", get(handlers::get_storage_by_address_ref))
         .route("/storage/by-ref/:ref", get(handlers::get_storage_by_ref))
+        // P2: Storage count endpoint - BEFORE generic storage/:hash
+        .route("/storage/count/:hash", get(handlers::get_storage_count))
+        // Generic storage routes last
+        .route("/storage/:hash", get(handlers::get_storage))
+        .route("/storage/:hash/raw", get(handlers::get_storage_raw))
         
         // Hashes endpoint
         .route("/hashes", get(handlers::get_hashes))
@@ -84,8 +85,11 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/credits/:address", get(handlers::get_credit_balance))
         .route("/credit_balances", get(handlers::get_credit_balances))
         
-        // Address stats, files, credit history
+        // Address stats, files, credit history - specific routes before generic :address
         .route("/addresses/stats.json", get(handlers::get_addresses_stats_v0))
+        // P2: Address post_types and channels endpoints
+        .route("/addresses/:address/post_types", get(handlers::get_address_post_types))
+        .route("/addresses/:address/channels", get(handlers::get_address_channels))
         .route("/addresses/:address/files", get(handlers::get_address_files))
         .route("/addresses/:address/credit_history", get(handlers::get_address_credit_history))
         
@@ -102,8 +106,6 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/price", get(handlers::get_pricing))
         .route("/price/:hash", get(handlers::get_message_price))
         .route("/pricing", get(handlers::get_pricing))
-        // TODO: handler not implemented yet
-        // .route("/price/:hash", get(handlers::get_message_price))
         .route("/cost/estimate", post(handlers::estimate_cost))
         .route("/cost/:hash", get(handlers::get_resource_cost))
         
@@ -125,13 +127,15 @@ pub fn api_v0() -> Router<Arc<AppState>> {
 /// API ws0 routes (WebSocket compatibility with pyaleph)
 /// Python uses /api/ws0/messages while we have /api/v0/ws
 /// API v1 routes
-fn api_v1() -> Router<Arc<AppState>> {
+pub fn api_v1() -> Router<Arc<AppState>> {
     Router::new()
         .route("/posts.json", get(handlers::get_posts_v1))
         .route("/posts", get(handlers::get_posts_v1))
+        // P2: v1 addresses stats endpoint with pagination
+        .route("/addresses/stats.json", get(handlers::get_addresses_stats_v1))
 }
 
-fn api_ws0() -> Router<Arc<AppState>> {
+pub fn api_ws0() -> Router<Arc<AppState>> {
     Router::new()
         // WebSocket messages endpoint (pyaleph compatibility)
         // Supports query params: addresses, channels, msgTypes, hashes, history

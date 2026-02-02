@@ -163,6 +163,12 @@ pub fn create_router(config: &Config, state: Arc<AppState>) -> Router {
         // API v0 routes (compatibility with pyaleph)
         .nest("/api/v0", routes::api_v0())
         
+        // API v1 routes
+        .nest("/api/v1", routes::api_v1())
+        
+        // API ws0 routes (WebSocket compatibility)
+        .nest("/api/ws0", routes::api_ws0())
+        
         // State and middleware
         .with_state(state)
         .layer(cors)

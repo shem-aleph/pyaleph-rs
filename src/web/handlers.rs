@@ -3634,3 +3634,235 @@ pub async fn monitor_html() -> impl axum::response::IntoResponse {
     let html = include_str!("../../static/monitor.html");
     axum::response::Html(html)
 }
+
+// ===== P2 Missing Endpoints =====
+
+/// GET /api/v0/storage/count/{hash} - Get count of nodes storing a file
+/// Reference: aleph/web/controllers/storage.py:get_file_pins_count
+/// 
+/// Returns the number of nodes that have pinned/stored a file.
+/// Since we're a single node, we return 1 if we have the file, 0 otherwise.
+pub async fn get_storage_count(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    // Check if we have the file locally
+    let mut count = 0i64;
+    
+    // Check in file_pins table
+    if state.has_db() {
+        let exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM file_pins WHERE item_hash = $1)"
+        )
+        .bind(&hash)
+        .fetch_one(state.db())
+        .await
+        .unwrap_or((false,));
+        
+        if exists.0 {
+            count = 1;
+        }
+    }
+    
+    // Also check IPFS if not found in DB
+    if count == 0 {
+        if state.ipfs.exists(&hash).await {
+            count = 1;
+        }
+    }
+    
+    // Return just the count number to match pyaleph format
+    count.to_string()
+}
+
+/// GET /api/v0/addresses/{address}/post_types - Get post types used by an address
+/// Reference: aleph/web/controllers/accounts.py:get_address_post_types
+/// 
+/// Returns list of distinct post types that an address has used.
+pub async fn get_address_post_types(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return Json(json!({
+            "address": address,
+            "post_types": []
+        }));
+    }
+    
+    // Query distinct post types from posts table
+    let post_types: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT post_type FROM posts WHERE address = $1 ORDER BY post_type"
+    )
+    .bind(&address)
+    .fetch_all(state.db())
+    .await
+    .unwrap_or_default();
+    
+    let types: Vec<String> = post_types.into_iter().map(|(t,)| t).collect();
+    
+    Json(json!({
+        "address": address,
+        "post_types": types
+    }))
+}
+
+/// GET /api/v0/addresses/{address}/channels - Get channels used by an address
+/// Reference: aleph/web/controllers/accounts.py:get_address_channels
+/// 
+/// Returns list of distinct channels that an address has posted to.
+pub async fn get_address_channels(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return Json(json!({
+            "address": address,
+            "channels": []
+        }));
+    }
+    
+    // Query distinct channels from messages table for this sender
+    let channels: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT channel FROM messages WHERE sender = $1 AND channel IS NOT NULL AND channel != '' ORDER BY channel"
+    )
+    .bind(&address)
+    .fetch_all(state.db())
+    .await
+    .unwrap_or_default();
+    
+    let channel_list: Vec<String> = channels.into_iter().map(|(c,)| c).collect();
+    
+    Json(json!({
+        "address": address,
+        "channels": channel_list
+    }))
+}
+
+/// Query parameters for v1 address stats
+#[derive(Debug, Deserialize)]
+pub struct AddressStatsV1Query {
+    /// Items per page (default: 20, max: 1000)
+    pub pagination: Option<u32>,
+    /// Page number (1-indexed)
+    pub page: Option<u32>,
+    /// Sort order: 1 for ascending, -1 for descending (default: -1)
+    #[serde(rename = "sortOrder")]
+    pub sort_order: Option<i8>,
+}
+
+/// GET /api/v1/addresses/stats.json - Get paginated address statistics
+/// Reference: aleph/web/controllers/accounts.py:addresses_stats_view_v1
+/// 
+/// Returns paginated list of addresses with message counts by type.
+/// v1 adds pagination support compared to v0.
+pub async fn get_addresses_stats_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AddressStatsV1Query>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return Json(json!({
+            "data": {},
+            "pagination_total": 0,
+            "pagination_page": 1,
+            "pagination_per_page": 20,
+            "pagination_item": "addresses",
+            "error": "Database not available"
+        }));
+    }
+    
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.pagination.unwrap_or(20).min(1000);
+    let offset = ((page - 1) * per_page) as i64;
+    let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
+    
+    // Get total unique senders count
+    let total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT sender) FROM messages"
+    )
+    .fetch_one(state.db())
+    .await
+    .unwrap_or((0,));
+    
+    // Query addresses with their message counts, ordered by total messages
+    let order_clause = if ascending { "ASC" } else { "DESC" };
+    let query = format!(
+        "SELECT sender, COUNT(*) as total_messages \
+         FROM messages \
+         GROUP BY sender \
+         ORDER BY total_messages {} \
+         LIMIT $1 OFFSET $2",
+        order_clause
+    );
+    
+    let addresses: Vec<(String, i64)> = sqlx::query_as(&query)
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default();
+    
+    if addresses.is_empty() {
+        return Json(json!({
+            "data": {},
+            "pagination_total": total.0,
+            "pagination_page": page,
+            "pagination_per_page": per_page,
+            "pagination_item": "addresses"
+        }));
+    }
+    
+    // Get address list for detailed stats query
+    let addr_list: Vec<String> = addresses.iter().map(|(a, _)| a.clone()).collect();
+    
+    // Query message counts by type for these addresses
+    let stats: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT sender, message_type, COUNT(*) as count \
+         FROM messages \
+         WHERE sender = ANY($1) \
+         GROUP BY sender, message_type"
+    )
+    .bind(&addr_list)
+    .fetch_all(state.db())
+    .await
+    .unwrap_or_default();
+    
+    // Aggregate stats by address
+    let mut data: HashMap<String, AddressStatsItem> = HashMap::new();
+    
+    // Initialize all addresses with zero counts
+    for (sender, total) in &addresses {
+        data.insert(sender.clone(), AddressStatsItem {
+            messages: *total,
+            aggregate: 0,
+            forget: 0,
+            instance: 0,
+            post: 0,
+            program: 0,
+            store: 0,
+        });
+    }
+    
+    // Fill in the type-specific counts
+    for (sender, msg_type, count) in stats {
+        if let Some(entry) = data.get_mut(&sender) {
+            match msg_type.to_uppercase().as_str() {
+                "AGGREGATE" => entry.aggregate = count,
+                "FORGET" => entry.forget = count,
+                "INSTANCE" => entry.instance = count,
+                "POST" => entry.post = count,
+                "PROGRAM" => entry.program = count,
+                "STORE" => entry.store = count,
+                _ => {}
+            }
+        }
+    }
+    
+    Json(json!({
+        "data": data,
+        "pagination_total": total.0,
+        "pagination_page": page,
+        "pagination_per_page": per_page,
+        "pagination_item": "addresses"
+    }))
+}
