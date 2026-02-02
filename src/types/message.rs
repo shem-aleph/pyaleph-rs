@@ -109,29 +109,14 @@ impl Message {
     /// * `Ok(false)` if the signature is invalid
     /// * `Err(String)` if verification could not be performed
     pub fn verify_signature(&self, crypto: &crate::services::crypto::CryptoService) -> Result<bool, String> {
-        // Get the message content to verify (no allocation needed)
-        let content = self.get_verification_content()
-            .map_err(|e| e.to_string())?;
-        
-        crypto.verify_signature(&self.chain, content, &self.signature, &self.sender)
-            .map_err(|e| e.to_string())
-    }
-    
-    /// Get the content that was signed
-    /// 
-    /// For inline messages, this is the serialized item_content.
-    /// For IPFS/storage messages, this is typically the item_hash.
-    fn get_verification_content(&self) -> Result<&str, &'static str> {
-        match self.item_type {
-            ItemType::Inline => {
-                self.item_content.as_deref()
-                    .ok_or("Inline message missing item_content")
-            }
-            ItemType::Ipfs | ItemType::Storage => {
-                // For external content, the signature is over the item_hash
-                Ok(&self.item_hash)
-            }
-        }
+        // Use the correct verification buffer format: {chain}\n{sender}\n{type}\n{item_hash}
+        crypto.verify_message_signature(
+            &self.chain,
+            &self.sender,
+            &self.message_type,
+            &self.item_hash,
+            &self.signature,
+        ).map_err(|e| e.to_string())
     }
     
     /// Get the item hash as bytes

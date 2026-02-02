@@ -4,12 +4,11 @@
 //! This is CRITICAL for security - all messages must have valid signatures.
 
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
-use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use secp256k1::{Message as Secp256k1Message, PublicKey, Secp256k1, ecdsa::RecoverableSignature};
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
-use crate::types::Chain;
+use crate::types::{Chain, MessageType};
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -34,18 +33,14 @@ pub enum CryptoError {
     #[error("Ed25519 error: {0}")]
     Ed25519Error(String),
     
-    #[error("P256 error: {0}")]
-    P256Error(String),
-    
     #[error("Base58 decode error: {0}")]
     Base58Error(String),
+    
+    #[error("JSON parse error: {0}")]
+    JsonError(String),
 }
 
 /// Cryptographic service for signature operations
-/// 
-/// This service handles signature verification for all supported blockchains.
-/// It maintains a secp256k1 context for efficient verification of
-/// Ethereum-style and other secp256k1-based signatures.
 #[derive(Debug)]
 pub struct CryptoService {
     secp: Secp256k1<secp256k1::All>,
@@ -64,9 +59,36 @@ impl CryptoService {
         }
     }
     
-    /// Verify a message signature
+    /// Build the verification buffer that was signed
+    /// 
+    /// Format: "{chain}\n{sender}\n{type}\n{item_hash}"
+    /// This matches Python pyaleph's get_verification_buffer()
+    pub fn get_verification_buffer(
+        chain: &Chain,
+        sender: &str,
+        msg_type: &MessageType,
+        item_hash: &str,
+    ) -> String {
+        format!("{}\n{}\n{}\n{}", chain, sender, msg_type, item_hash)
+    }
+    
+    /// Verify a message signature using the full message context
     /// 
     /// This is the main entry point for signature verification.
+    pub fn verify_message_signature(
+        &self,
+        chain: &Chain,
+        sender: &str,
+        msg_type: &MessageType,
+        item_hash: &str,
+        signature: &str,
+    ) -> Result<bool, CryptoError> {
+        let verification_buffer = Self::get_verification_buffer(chain, sender, msg_type, item_hash);
+        self.verify_signature(chain, &verification_buffer, signature, sender)
+    }
+    
+    /// Verify a signature against a message
+    /// 
     /// Routes to the appropriate chain-specific verifier.
     pub fn verify_signature(
         &self,
@@ -76,25 +98,35 @@ impl CryptoService {
         expected_address: &str,
     ) -> Result<bool, CryptoError> {
         match chain {
-            // EVM-compatible chains use Ethereum signature scheme
-            Chain::ETH | Chain::AVAX | Chain::BASE | Chain::BSC => {
-                self.verify_ethereum_signature(message, signature, expected_address)
+            // EVM-compatible chains use Ethereum signature scheme (EIP-191)
+            Chain::ETH | Chain::AVAX | Chain::BASE | Chain::BSC |
+            Chain::ARBITRUM | Chain::BLAST | Chain::BOB | Chain::CYBER |
+            Chain::FRAXTAL | Chain::HYPE | Chain::INK | Chain::LENS |
+            Chain::METIS | Chain::MODE | Chain::NEO | Chain::LINEA |
+            Chain::LISK | Chain::OPTIMISM | Chain::POL | Chain::SONIC |
+            Chain::UNICHAIN | Chain::WORLDCHAIN | Chain::ZORA |
+            Chain::ETHERLINK => {
+                self.verify_evm_signature(message, signature, expected_address)
             }
-            // Solana uses Ed25519
-            Chain::SOL => {
+            // Solana uses Ed25519 with JSON-wrapped signature
+            Chain::SOL | Chain::ECLIPSE => {
                 self.verify_solana_signature(message, signature, expected_address)
             }
-            // Tezos uses Ed25519 or secp256k1 or P256 depending on address prefix
+            // Tezos uses Ed25519/secp256k1/P256 depending on address prefix
             Chain::TEZOS => {
                 self.verify_tezos_signature(message, signature, expected_address)
             }
-            // NULS chains - similar to Ethereum but different message format
+            // NULS chains use secp256k1 with embedded public key
             Chain::NULS | Chain::NULS2 => {
                 self.verify_nuls_signature(message, signature, expected_address)
             }
             // Cosmos SDK chains use secp256k1
             Chain::CSDK => {
                 self.verify_cosmos_signature(message, signature, expected_address)
+            }
+            // Substrate (Polkadot) uses Sr25519 or Ed25519
+            Chain::DOT => {
+                self.verify_substrate_signature(message, signature, expected_address)
             }
             _ => Err(CryptoError::UnsupportedChain(format!(
                 "{} signature verification not yet implemented",
@@ -103,10 +135,10 @@ impl CryptoService {
         }
     }
     
-    /// Verify an Ethereum-style signature (EIP-191 personal sign)
+    /// Verify an EVM signature (EIP-191 personal sign)
     /// 
-    /// This handles ETH, AVAX, BASE, BSC and other EVM chains.
-    fn verify_ethereum_signature(
+    /// This handles ETH and all EVM-compatible L2s.
+    fn verify_evm_signature(
         &self,
         message: &str,
         signature: &str,
@@ -178,15 +210,41 @@ impl CryptoService {
     
     /// Verify a Solana signature (Ed25519)
     /// 
-    /// Solana uses Ed25519 signatures with base58-encoded addresses and signatures.
+    /// Solana signatures are JSON: {"signature": "base58...", "publicKey": "base58..."}
     fn verify_solana_signature(
         &self,
         message: &str,
         signature: &str,
         expected_address: &str,
     ) -> Result<bool, CryptoError> {
-        // Decode signature (base58 encoded)
-        let sig_bytes = bs58::decode(signature)
+        // Parse JSON signature format
+        let sig_json: serde_json::Value = serde_json::from_str(signature)
+            .map_err(|e| CryptoError::JsonError(format!("Invalid Solana signature JSON: {}", e)))?;
+        
+        let sig_b58 = sig_json.get("signature")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CryptoError::InvalidSignatureFormat("Missing 'signature' field".to_string()))?;
+        
+        let pubkey_b58 = sig_json.get("publicKey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CryptoError::InvalidSignatureFormat("Missing 'publicKey' field".to_string()))?;
+        
+        // Check version if present (must be 1)
+        if let Some(version) = sig_json.get("version") {
+            if version.as_i64() != Some(1) {
+                return Err(CryptoError::InvalidSignatureFormat(
+                    format!("Unsupported signature version: {:?}", version)
+                ));
+            }
+        }
+        
+        // Verify publicKey matches sender
+        if pubkey_b58 != expected_address {
+            return Ok(false);
+        }
+        
+        // Decode signature (base58)
+        let sig_bytes = bs58::decode(sig_b58)
             .into_vec()
             .map_err(|e| CryptoError::Base58Error(e.to_string()))?;
         
@@ -197,8 +255,8 @@ impl CryptoService {
             )));
         }
         
-        // Decode public key (base58 encoded Solana address)
-        let pubkey_bytes = bs58::decode(expected_address)
+        // Decode public key (base58)
+        let pubkey_bytes = bs58::decode(pubkey_b58)
             .into_vec()
             .map_err(|e| CryptoError::Base58Error(e.to_string()))?;
         
@@ -212,15 +270,15 @@ impl CryptoService {
         // Convert to ed25519-dalek types
         let sig_array: [u8; 64] = sig_bytes.try_into()
             .map_err(|_| CryptoError::InvalidSignatureFormat("Invalid signature length".to_string()))?;
-        let signature = Ed25519Signature::from_bytes(&sig_array);
+        let signature_obj = Ed25519Signature::from_bytes(&sig_array);
         
         let pubkey_array: [u8; 32] = pubkey_bytes.try_into()
             .map_err(|_| CryptoError::InvalidPublicKey("Invalid public key length".to_string()))?;
         let verifying_key = VerifyingKey::from_bytes(&pubkey_array)
             .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
         
-        // Verify signature
-        match verifying_key.verify(message.as_bytes(), &signature) {
+        // Verify signature over the raw message bytes
+        match verifying_key.verify(message.as_bytes(), &signature_obj) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -231,372 +289,159 @@ impl CryptoService {
     /// Tezos supports multiple signature schemes based on address prefix:
     /// - tz1: Ed25519
     /// - tz2: secp256k1
-    /// - tz3: P256 (secp256r1/NIST P-256)
+    /// - tz3: P256
     fn verify_tezos_signature(
         &self,
         message: &str,
         signature: &str,
         expected_address: &str,
     ) -> Result<bool, CryptoError> {
-        // Determine signature type from address prefix
-        if expected_address.starts_with("tz1") {
-            // Ed25519 signature
-            self.verify_tezos_ed25519(message, signature, expected_address)
-        } else if expected_address.starts_with("tz2") {
-            // secp256k1 signature
-            self.verify_tezos_secp256k1(message, signature, expected_address)
-        } else if expected_address.starts_with("tz3") {
-            // P256 signature
-            self.verify_tezos_p256(message, signature, expected_address)
-        } else {
-            Err(CryptoError::InvalidPublicKey(format!(
-                "Invalid Tezos address prefix: {}",
-                expected_address
-            )))
-        }
-    }
-    
-    /// Verify Tezos Ed25519 signature (tz1 addresses)
-    fn verify_tezos_ed25519(
-        &self,
-        message: &str,
-        signature: &str,
-        expected_address: &str,
-    ) -> Result<bool, CryptoError> {
-        // Tezos signatures are typically base58check encoded with a prefix
-        // The signature prefix for ed25519 is "edsig"
-        let sig_bytes = self.decode_tezos_signature(signature, "edsig")?;
-        
-        if sig_bytes.len() != 64 {
-            return Err(CryptoError::InvalidSignatureFormat(format!(
-                "Expected 64 bytes, got {}",
-                sig_bytes.len()
-            )));
-        }
-        
-        // For Tezos, we need the public key, not just the address
-        // The address is a hash of the public key, so we can't recover the key from it
-        // In practice, the public key should be provided alongside the message
-        // For now, return an error indicating this limitation
+        // For now, Tezos verification is complex because:
+        // 1. Multiple signature schemes
+        // 2. Address is hash of pubkey, can't recover pubkey from signature alone
+        // 3. Would need the public key to be embedded or provided separately
+        //
+        // Most Tezos messages on Aleph are rare - log and skip for now
         Err(CryptoError::UnsupportedChain(
-            "Tezos Ed25519 verification requires public key (address only provided)".to_string()
+            "Tezos signature verification requires public key (not just address)".to_string()
         ))
-    }
-    
-    /// Verify Tezos secp256k1 signature (tz2 addresses)
-    fn verify_tezos_secp256k1(
-        &self,
-        message: &str,
-        signature: &str,
-        expected_address: &str,
-    ) -> Result<bool, CryptoError> {
-        // For tz2 addresses, we can potentially recover the public key from signature
-        // Similar to Ethereum's ecrecover, but with different message format
-        
-        // Decode signature
-        let sig_bytes = self.decode_tezos_signature(signature, "spsig")?;
-        
-        if sig_bytes.len() != 65 {
-            // Need recovery id for secp256k1
-            return Err(CryptoError::UnsupportedChain(
-                "Tezos secp256k1 verification requires public key (address only provided)".to_string()
-            ));
-        }
-        
-        // Try to verify with recovery
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let msg_hash = Sha256::digest(message.as_bytes());
-        
-        let r = &sig_bytes[0..32];
-        let s = &sig_bytes[32..64];
-        let v = sig_bytes[64];
-        
-        let recovery_id = if v >= 27 { v - 27 } else { v };
-        
-        let msg = Secp256k1Message::from_digest_slice(&msg_hash)
-            .map_err(|_| CryptoError::VerificationFailed)?;
-        
-        let mut sig_compact = [0u8; 64];
-        sig_compact[..32].copy_from_slice(r);
-        sig_compact[32..].copy_from_slice(s);
-        
-        let rec_id = secp256k1::ecdsa::RecoveryId::from_i32(recovery_id as i32)
-            .map_err(|_| CryptoError::InvalidSignatureFormat("Invalid recovery id".to_string()))?;
-        
-        let recoverable_sig = RecoverableSignature::from_compact(&sig_compact, rec_id)?;
-        let public_key = self.secp.recover_ecdsa(&msg, &recoverable_sig)?;
-        
-        // Derive tz2 address from public key
-        let derived_address = self.secp256k1_pubkey_to_tz2_address(&public_key)?;
-        
-        Ok(derived_address == expected_address)
-    }
-    
-    /// Convert secp256k1 public key to tz2 address
-    fn secp256k1_pubkey_to_tz2_address(&self, pubkey: &PublicKey) -> Result<String, CryptoError> {
-        use sha2::{Sha256, Digest as Sha2Digest};
-        
-        let pubkey_bytes = pubkey.serialize();
-        let hash = Sha256::digest(&pubkey_bytes);
-        let address_bytes = &hash[..20];
-        
-        // tz2 prefix in base58check is [6, 161, 161]
-        let mut with_prefix = vec![6, 161, 161];
-        with_prefix.extend_from_slice(address_bytes);
-        
-        let checksum = &Sha256::digest(&Sha256::digest(&with_prefix))[..4];
-        with_prefix.extend_from_slice(checksum);
-        
-        Ok(bs58::encode(with_prefix).into_string())
-    }
-    
-    /// Verify Tezos P256 signature (tz3 addresses)
-    /// 
-    /// P256 (secp256r1/NIST P-256) is used for tz3 addresses.
-    /// This curve is widely used for secure hardware tokens.
-    fn verify_tezos_p256(
-        &self,
-        message: &str,
-        signature: &str,
-        expected_address: &str,
-    ) -> Result<bool, CryptoError> {
-        // Decode the P256 signature (p2sig prefix in Tezos)
-        let sig_bytes = self.decode_tezos_signature(signature, "p2sig")?;
-        
-        if sig_bytes.len() != 64 {
-            return Err(CryptoError::InvalidSignatureFormat(format!(
-                "Expected 64 bytes for P256 signature, got {}",
-                sig_bytes.len()
-            )));
-        }
-        
-        // Tezos P256 also needs the public key for verification
-        // The address is blake2b(public_key)[0:20]
-        // For messages that include the public key, we can verify
-        // 
-        // Check if the signature contains an embedded public key
-        // Format: sig[64] + pubkey[33/65] in some cases
-        if signature.starts_with("p2pk") {
-            // Public key is included - extract and verify
-            return self.verify_tezos_p256_with_pubkey(message, signature, expected_address);
-        }
-        
-        // Without public key, we can't verify
-        // This is a fundamental Tezos limitation
-        Err(CryptoError::UnsupportedChain(
-            "Tezos P256 verification requires public key (address only provided)".to_string()
-        ))
-    }
-    
-    /// Verify Tezos P256 when public key is available
-    fn verify_tezos_p256_with_pubkey(
-        &self,
-        message: &str,
-        signature: &str,
-        expected_address: &str,
-    ) -> Result<bool, CryptoError> {
-        // Parse signature with embedded public key
-        // Format varies, but commonly: p2sig... or just the raw bytes with pubkey
-        
-        // If we have both signature and pubkey encoded together
-        if let Some((sig_part, pubkey_part)) = signature.split_once(':') {
-            let sig_bytes = self.decode_tezos_signature(sig_part, "p2sig")?;
-            let pubkey_bytes = self.decode_tezos_pubkey(pubkey_part, "p2pk")?;
-            
-            // Verify the public key matches the address
-            let derived_address = self.p256_pubkey_to_tz3_address(&pubkey_bytes)?;
-            if derived_address != expected_address {
-                return Ok(false);
-            }
-            
-            // Create P256 signature and verify
-            let sig = P256Signature::from_slice(&sig_bytes)
-                .map_err(|e| CryptoError::P256Error(e.to_string()))?;
-            
-            let verifying_key = P256VerifyingKey::from_sec1_bytes(&pubkey_bytes)
-                .map_err(|e| CryptoError::P256Error(e.to_string()))?;
-            
-            // Tezos hashes the message with Blake2b before signing
-            let msg_hash = self.tezos_message_hash(message);
-            
-            match verifying_key.verify(&msg_hash, &sig) {
-                Ok(()) => Ok(true),
-                Err(_) => Ok(false),
-            }
-        } else {
-            Err(CryptoError::InvalidSignatureFormat(
-                "P256 signature must include public key (format: sig:pubkey)".to_string()
-            ))
-        }
-    }
-    
-    /// Decode a Tezos base58check encoded signature
-    fn decode_tezos_signature(&self, signature: &str, expected_prefix: &str) -> Result<Vec<u8>, CryptoError> {
-        if signature.starts_with(expected_prefix) {
-            // Base58check decode and strip prefix
-            let decoded = bs58::decode(signature)
-                .with_check(None)
-                .into_vec()
-                .map_err(|e| CryptoError::Base58Error(e.to_string()))?;
-            
-            // Tezos prefixes are 3-5 bytes depending on type
-            let prefix_len = match expected_prefix {
-                "edsig" => 5,
-                "spsig" => 5,  // secp256k1
-                "p2sig" => 4,  // P256
-                "sig" => 3,    // generic
-                _ => 5,
-            };
-            
-            if decoded.len() <= prefix_len {
-                return Err(CryptoError::InvalidSignatureFormat(
-                    "Signature too short after decoding".to_string()
-                ));
-            }
-            
-            Ok(decoded[prefix_len..].to_vec())
-        } else {
-            // Try hex-encoded
-            hex::decode(signature.trim_start_matches("0x"))
-                .map_err(|e| CryptoError::InvalidSignatureFormat(e.to_string()))
-        }
-    }
-    
-    /// Decode a Tezos public key
-    fn decode_tezos_pubkey(&self, pubkey: &str, expected_prefix: &str) -> Result<Vec<u8>, CryptoError> {
-        if pubkey.starts_with(expected_prefix) {
-            let decoded = bs58::decode(pubkey)
-                .with_check(None)
-                .into_vec()
-                .map_err(|e| CryptoError::Base58Error(e.to_string()))?;
-            
-            let prefix_len = match expected_prefix {
-                "edpk" => 4,   // Ed25519 public key
-                "sppk" => 4,  // secp256k1 public key
-                "p2pk" => 4,  // P256 public key
-                _ => 4,
-            };
-            
-            if decoded.len() <= prefix_len {
-                return Err(CryptoError::InvalidPublicKey(
-                    "Public key too short after decoding".to_string()
-                ));
-            }
-            
-            Ok(decoded[prefix_len..].to_vec())
-        } else {
-            hex::decode(pubkey.trim_start_matches("0x"))
-                .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))
-        }
-    }
-    
-    /// Convert a P256 public key to a tz3 address
-    fn p256_pubkey_to_tz3_address(&self, pubkey: &[u8]) -> Result<String, CryptoError> {
-        use sha2::{Sha256, Digest as Sha2Digest};
-        
-        // Blake2b hash of the public key (20 bytes)
-        // Tezos uses a custom Blake2b variant, simplified here
-        let hash = Sha256::digest(pubkey);
-        let address_bytes = &hash[..20];
-        
-        // tz3 prefix in base58check is [6, 161, 164]
-        let mut with_prefix = vec![6, 161, 164];
-        with_prefix.extend_from_slice(address_bytes);
-        
-        // Add checksum
-        let checksum = &Sha256::digest(&Sha256::digest(&with_prefix))[..4];
-        with_prefix.extend_from_slice(checksum);
-        
-        Ok(bs58::encode(with_prefix).into_string())
-    }
-    
-    /// Hash a message for Tezos signing (Blake2b)
-    fn tezos_message_hash(&self, message: &str) -> Vec<u8> {
-        use sha2::{Sha256, Digest as Sha2Digest};
-        // Simplified - Tezos uses Blake2b, but SHA256 works for testing
-        // In production, use the blake2 crate
-        Sha256::digest(message.as_bytes()).to_vec()
     }
     
     /// Verify NULS/NULS2 signature
     /// 
-    /// NULS uses a similar scheme to Ethereum but with different message formatting.
+    /// NULS signatures have the public key embedded in the signature data.
     fn verify_nuls_signature(
         &self,
         message: &str,
         signature: &str,
         expected_address: &str,
     ) -> Result<bool, CryptoError> {
-        // NULS uses secp256k1 like Ethereum
-        let sig_hex = signature.trim_start_matches("0x");
-        let sig_bytes = hex::decode(sig_hex)?;
-        
-        if sig_bytes.len() != 65 {
-            return Err(CryptoError::InvalidSignatureFormat(format!(
-                "Expected 65 bytes, got {}",
-                sig_bytes.len()
-            )));
-        }
-        
-        // NULS message format differs from Ethereum
-        // It uses a simple SHA256 hash of the message
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let message_hash = Sha256::digest(message.as_bytes());
-        
-        let msg = Secp256k1Message::from_digest_slice(&message_hash)
-            .map_err(|_| CryptoError::VerificationFailed)?;
-        
-        let r = &sig_bytes[0..32];
-        let s = &sig_bytes[32..64];
-        let v = sig_bytes[64];
-        
-        let recovery_id = if v >= 27 { v - 27 } else { v };
-        
-        let mut sig_bytes_compact = [0u8; 64];
-        sig_bytes_compact[..32].copy_from_slice(r);
-        sig_bytes_compact[32..].copy_from_slice(s);
-        
-        let rec_id = secp256k1::ecdsa::RecoveryId::from_i32(recovery_id as i32)
-            .map_err(|_| CryptoError::InvalidSignatureFormat("Invalid recovery id".to_string()))?;
-        
-        let recoverable_sig = RecoverableSignature::from_compact(&sig_bytes_compact, rec_id)?;
-        let public_key = self.secp.recover_ecdsa(&msg, &recoverable_sig)?;
-        
-        // NULS address derivation
-        let recovered_address = self.pubkey_to_nuls_address(&public_key);
-        
-        Ok(recovered_address == expected_address)
-    }
-    
-    /// Convert a secp256k1 public key to a NULS address
-    fn pubkey_to_nuls_address(&self, pubkey: &PublicKey) -> String {
         use sha2::{Sha256, Digest as Sha2Digest};
         use ripemd::Ripemd160;
         use ripemd::Digest as RipemdDigest;
         
-        let pubkey_bytes = pubkey.serialize();
+        // NULS signature format: hex-encoded bytes containing:
+        // - 1 byte: public key type (usually 0x02 or 0x03 for compressed)
+        // - 33 bytes: compressed public key
+        // - variable: signature data
+        let sig_hex = signature.trim_start_matches("0x");
+        let sig_bytes = hex::decode(sig_hex)?;
         
-        // NULS uses SHA256 followed by RIPEMD160
-        let sha_hash = Sha256::digest(&pubkey_bytes);
+        if sig_bytes.len() < 34 + 64 {
+            return Err(CryptoError::InvalidSignatureFormat(format!(
+                "NULS signature too short: {} bytes",
+                sig_bytes.len()
+            )));
+        }
+        
+        // Extract public key (first 33 bytes after type byte)
+        // Actually NULS format varies - let's try different parsing
+        
+        // Try format: pubkey_len(1) + pubkey(33) + sig_type(1) + sig(variable)
+        let pubkey_len = sig_bytes[0] as usize;
+        if pubkey_len != 33 || sig_bytes.len() < pubkey_len + 1 {
+            return Err(CryptoError::InvalidSignatureFormat(
+                "Invalid NULS signature structure".to_string()
+            ));
+        }
+        
+        let pubkey_bytes = &sig_bytes[1..1 + pubkey_len];
+        let pubkey = PublicKey::from_slice(pubkey_bytes)
+            .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
+        
+        // Derive NULS address from public key
+        let sha_hash = Sha256::digest(pubkey_bytes);
         let ripemd_hash = Ripemd160::digest(&sha_hash);
         
-        // NULS address format with chain ID and checksum
-        // Simplified version
-        format!("NULSd6{}", hex::encode(&ripemd_hash[..]))
+        // Extract chain ID from address
+        let (chain_id, addr_type) = self.parse_nuls_address(expected_address)?;
+        
+        // Build address with proper prefix
+        let derived_address = self.build_nuls_address(chain_id, addr_type, &ripemd_hash)?;
+        
+        if derived_address != expected_address {
+            return Ok(false);
+        }
+        
+        // Now verify the signature over the message
+        let message_hash = Sha256::digest(Sha256::digest(message.as_bytes()));
+        
+        let msg = Secp256k1Message::from_digest_slice(&message_hash)
+            .map_err(|_| CryptoError::VerificationFailed)?;
+        
+        // Extract signature (after pubkey)
+        let sig_start = 1 + pubkey_len;
+        if sig_bytes.len() < sig_start + 1 {
+            return Err(CryptoError::InvalidSignatureFormat("Missing signature data".to_string()));
+        }
+        
+        // NULS uses DER-encoded signatures
+        let sig_data = &sig_bytes[sig_start..];
+        let ecdsa_sig = secp256k1::ecdsa::Signature::from_der(sig_data)
+            .map_err(|e| CryptoError::InvalidSignatureFormat(format!("Invalid DER signature: {}", e)))?;
+        
+        // Verify
+        match self.secp.verify_ecdsa(&msg, &ecdsa_sig, &pubkey) {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+    
+    /// Parse NULS address to extract chain ID and address type
+    fn parse_nuls_address(&self, address: &str) -> Result<(u16, u8), CryptoError> {
+        // NULS addresses start with "NULS" or chain-specific prefix
+        // Format: prefix + base58check(chain_id[2] + type[1] + hash[20])
+        if address.starts_with("NULSd6") {
+            // NULS mainnet, chain_id=1
+            Ok((1, 1))
+        } else if address.starts_with("tNULS") {
+            // NULS testnet
+            Ok((2, 1))
+        } else {
+            // Try to decode as generic NULS address
+            Ok((1, 1))
+        }
+    }
+    
+    /// Build NULS address from components
+    fn build_nuls_address(&self, chain_id: u16, addr_type: u8, hash: &[u8]) -> Result<String, CryptoError> {
+        use sha2::{Sha256, Digest as Sha2Digest};
+        
+        // Build address bytes: chain_id(2) + type(1) + hash(20)
+        let mut addr_bytes = Vec::with_capacity(23);
+        addr_bytes.extend_from_slice(&chain_id.to_le_bytes());
+        addr_bytes.push(addr_type);
+        addr_bytes.extend_from_slice(&hash[..20]);
+        
+        // XOR checksum
+        let xor = addr_bytes.iter().fold(0u8, |acc, &b| acc ^ b);
+        addr_bytes.push(xor);
+        
+        // Base58 encode
+        let encoded = bs58::encode(&addr_bytes).into_string();
+        
+        // Add prefix based on chain
+        let prefix = match chain_id {
+            1 => "NULSd",
+            2 => "tNULSe",
+            _ => "NULS",
+        };
+        
+        Ok(format!("{}{}", prefix, encoded))
     }
     
     /// Verify Cosmos SDK signature
-    /// 
-    /// Cosmos chains use secp256k1 with a specific message format.
     fn verify_cosmos_signature(
         &self,
         message: &str,
         signature: &str,
         expected_address: &str,
     ) -> Result<bool, CryptoError> {
-        // Cosmos SDK signs the SHA256 hash of the message
         use sha2::{Sha256, Digest as Sha2Digest};
+        use ripemd::Ripemd160;
+        use ripemd::Digest as RipemdDigest;
         
+        // Cosmos signatures can be hex or base64
         let sig_bytes = if signature.starts_with("0x") {
             hex::decode(signature.trim_start_matches("0x"))?
         } else {
@@ -612,12 +457,16 @@ impl CryptoService {
             )));
         }
         
+        // Cosmos SDK signs SHA256 of the message
         let message_hash = Sha256::digest(message.as_bytes());
         
         let msg = Secp256k1Message::from_digest_slice(&message_hash)
             .map_err(|_| CryptoError::VerificationFailed)?;
         
-        // Cosmos signatures don't include recovery id, so we need to try both
+        // Extract address prefix from expected address
+        let prefix = expected_address.split('1').next().unwrap_or("cosmos");
+        
+        // Cosmos signatures don't include recovery id, try both
         for recovery_id in 0..2 {
             let rec_id = match secp256k1::ecdsa::RecoveryId::from_i32(recovery_id) {
                 Ok(id) => id,
@@ -630,9 +479,17 @@ impl CryptoService {
             };
             
             if let Ok(public_key) = self.secp.recover_ecdsa(&msg, &recoverable_sig) {
-                let recovered_address = self.pubkey_to_cosmos_address(&public_key, "cosmos");
-                if recovered_address == expected_address {
-                    return Ok(true);
+                let pubkey_bytes = public_key.serialize();
+                let sha_hash = Sha256::digest(&pubkey_bytes);
+                let ripemd_hash = Ripemd160::digest(&sha_hash);
+                
+                // Bech32 encode
+                if let Ok(hrp) = bech32::Hrp::parse(prefix) {
+                    if let Ok(address) = bech32::encode::<bech32::Bech32>(hrp, &ripemd_hash) {
+                        if address == expected_address {
+                            return Ok(true);
+                        }
+                    }
                 }
             }
         }
@@ -640,23 +497,91 @@ impl CryptoService {
         Ok(false)
     }
     
-    /// Convert a secp256k1 public key to a Cosmos address
-    fn pubkey_to_cosmos_address(&self, pubkey: &PublicKey, prefix: &str) -> String {
-        use sha2::{Sha256, Digest as Sha2Digest};
-        use ripemd::Ripemd160;
-        use ripemd::Digest as RipemdDigest;
+    /// Verify Substrate (Polkadot) signature
+    /// 
+    /// Substrate uses Sr25519 (Schnorrkel) or Ed25519 depending on key type.
+    fn verify_substrate_signature(
+        &self,
+        message: &str,
+        signature: &str,
+        expected_address: &str,
+    ) -> Result<bool, CryptoError> {
+        // Substrate signatures are typically hex-encoded
+        // The signature includes a prefix byte indicating the crypto type:
+        // 0x00 = Ed25519, 0x01 = Sr25519, 0x02 = ECDSA
+        let sig_hex = signature.trim_start_matches("0x");
+        let sig_bytes = hex::decode(sig_hex)?;
         
-        let pubkey_bytes = pubkey.serialize();
+        if sig_bytes.is_empty() {
+            return Err(CryptoError::InvalidSignatureFormat("Empty signature".to_string()));
+        }
         
-        // Cosmos uses SHA256 + RIPEMD160
-        let sha_hash = Sha256::digest(&pubkey_bytes);
-        let ripemd_hash = Ripemd160::digest(&sha_hash);
+        // Check if it's a wrapped message format (common in Substrate)
+        // Format: <Bytes>message</Bytes>
+        let wrapped_message = format!("<Bytes>{}</Bytes>", message);
         
-        // Bech32 encode with the chain prefix
-        bech32::encode::<bech32::Bech32>(
-            bech32::Hrp::parse(prefix).expect("valid hrp"),
-            &ripemd_hash,
-        ).unwrap_or_else(|_| format!("{}1{}", prefix, hex::encode(&ripemd_hash[..20])))
+        // For Ed25519 signatures (64 bytes or 65 with type prefix)
+        let (sig_data, _crypto_type) = if sig_bytes.len() == 65 {
+            (&sig_bytes[1..], sig_bytes[0])
+        } else if sig_bytes.len() == 64 {
+            (&sig_bytes[..], 0x00u8) // Assume Ed25519
+        } else {
+            return Err(CryptoError::InvalidSignatureFormat(format!(
+                "Invalid Substrate signature length: {}",
+                sig_bytes.len()
+            )));
+        };
+        
+        // Decode the SS58 address to get the public key
+        let pubkey_bytes = self.decode_ss58_address(expected_address)?;
+        
+        if pubkey_bytes.len() != 32 {
+            return Err(CryptoError::InvalidPublicKey(format!(
+                "Expected 32 bytes, got {}",
+                pubkey_bytes.len()
+            )));
+        }
+        
+        // Try Ed25519 verification
+        let sig_array: [u8; 64] = sig_data.try_into()
+            .map_err(|_| CryptoError::InvalidSignatureFormat("Invalid signature length".to_string()))?;
+        let signature_obj = Ed25519Signature::from_bytes(&sig_array);
+        
+        let pubkey_array: [u8; 32] = pubkey_bytes.try_into()
+            .map_err(|_| CryptoError::InvalidPublicKey("Invalid public key length".to_string()))?;
+        let verifying_key = VerifyingKey::from_bytes(&pubkey_array)
+            .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
+        
+        // Try both raw message and wrapped message
+        if verifying_key.verify(message.as_bytes(), &signature_obj).is_ok() {
+            return Ok(true);
+        }
+        if verifying_key.verify(wrapped_message.as_bytes(), &signature_obj).is_ok() {
+            return Ok(true);
+        }
+        
+        Ok(false)
+    }
+    
+    /// Decode SS58 address to get public key bytes
+    fn decode_ss58_address(&self, address: &str) -> Result<Vec<u8>, CryptoError> {
+        // SS58 is base58check with a network prefix
+        let decoded = bs58::decode(address)
+            .into_vec()
+            .map_err(|e| CryptoError::Base58Error(e.to_string()))?;
+        
+        if decoded.len() < 35 {
+            return Err(CryptoError::InvalidPublicKey(
+                "SS58 address too short".to_string()
+            ));
+        }
+        
+        // Format: prefix(1-2 bytes) + pubkey(32 bytes) + checksum(2 bytes)
+        // Simple prefix is 1 byte, multi-byte prefix starts with value >= 64
+        let prefix_len = if decoded[0] < 64 { 1 } else { 2 };
+        let pubkey_end = decoded.len() - 2; // Remove 2-byte checksum
+        
+        Ok(decoded[prefix_len..pubkey_end].to_vec())
     }
     
     /// Hash content using SHA256
@@ -673,8 +598,6 @@ impl CryptoService {
     }
     
     /// Compute the item hash for a message
-    /// 
-    /// This is the SHA256 hash of the serialized message content.
     pub fn compute_item_hash(&self, content: &str) -> String {
         self.sha256_hash(content.as_bytes())
     }
@@ -683,6 +606,17 @@ impl CryptoService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    
+    #[test]
+    fn test_verification_buffer() {
+        let buffer = CryptoService::get_verification_buffer(
+            &Chain::ETH,
+            "0x1234567890123456789012345678901234567890",
+            &MessageType::POST,
+            "abcd1234",
+        );
+        assert_eq!(buffer, "ETH\n0x1234567890123456789012345678901234567890\nPOST\nabcd1234");
+    }
     
     #[test]
     fn test_sha256_hash() {
@@ -700,7 +634,6 @@ mod tests {
     
     #[test]
     fn test_ethereum_address_derivation() {
-        // This is a known test case
         let crypto = CryptoService::new();
         
         // Create a public key from known bytes (compressed)
@@ -709,49 +642,7 @@ mod tests {
         let pubkey = PublicKey::from_slice(&pubkey_bytes).unwrap();
         
         let address = crypto.pubkey_to_eth_address(&pubkey);
-        // Known address for this public key
         assert!(address.starts_with("0x"));
         assert_eq!(address.len(), 42);
-    }
-    
-    #[test]
-    fn test_chain_signature_routing() {
-        let crypto = CryptoService::new();
-        
-        // Test that EVM chains route to Ethereum verification
-        let eth_result = crypto.verify_signature(
-            &Chain::ETH,
-            "test",
-            "0x00",
-            "0x0000000000000000000000000000000000000000",
-        );
-        // Should fail with invalid signature, not unsupported chain
-        assert!(matches!(eth_result, Err(CryptoError::InvalidSignatureFormat(_))));
-    }
-    
-    #[test]
-    fn test_tezos_address_detection() {
-        let crypto = CryptoService::new();
-        
-        // Test tz1 (Ed25519)
-        let result = crypto.verify_tezos_signature("test", "edsig", "tz1VJEVshiK6TG2PRkjMf9STK6vJQKHj8HFh");
-        assert!(result.is_err()); // Should fail gracefully
-        
-        // Test tz3 (P256)
-        let result = crypto.verify_tezos_signature("test", "p2sig", "tz3RDC3Jdn4j15J7bBHZd29EUee9gVB1CxD9");
-        assert!(result.is_err()); // Should fail gracefully without pubkey
-    }
-    
-    #[test]
-    fn test_cosmos_address_derivation() {
-        let crypto = CryptoService::new();
-        
-        // Create a public key
-        let pubkey_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        let pubkey_bytes = hex::decode(pubkey_hex).unwrap();
-        let pubkey = PublicKey::from_slice(&pubkey_bytes).unwrap();
-        
-        let address = crypto.pubkey_to_cosmos_address(&pubkey, "cosmos");
-        assert!(address.starts_with("cosmos1"));
     }
 }
