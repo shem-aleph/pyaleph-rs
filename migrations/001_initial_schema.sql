@@ -6,11 +6,11 @@ CREATE TABLE IF NOT EXISTS messages (
     item_hash VARCHAR(64) PRIMARY KEY,
     message_type VARCHAR(20) NOT NULL,
     chain VARCHAR(10) NOT NULL,
-    sender VARCHAR(128) NOT NULL,
+    sender VARCHAR(255) NOT NULL,
     signature TEXT NOT NULL,
     item_type VARCHAR(20) NOT NULL,
     item_content TEXT,
-    channel VARCHAR(128),
+    channel VARCHAR(255),
     time DOUBLE PRECISION NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -23,7 +23,7 @@ CREATE INDEX idx_messages_time ON messages(time DESC);
 -- Aggregates table (key-value storage)
 CREATE TABLE IF NOT EXISTS aggregates (
     id SERIAL PRIMARY KEY,
-    address VARCHAR(128) NOT NULL,
+    address VARCHAR(255) NOT NULL,
     key VARCHAR(256) NOT NULL,
     content JSONB NOT NULL,
     time DOUBLE PRECISION NOT NULL,
@@ -37,11 +37,11 @@ CREATE INDEX idx_aggregates_address_key ON aggregates(address, key);
 -- Posts table
 CREATE TABLE IF NOT EXISTS posts (
     item_hash VARCHAR(64) PRIMARY KEY,
-    address VARCHAR(128) NOT NULL,
+    address VARCHAR(255) NOT NULL,
     post_type VARCHAR(64) NOT NULL,
     content JSONB NOT NULL,
     ref_ VARCHAR(64),
-    channel VARCHAR(128),
+    channel VARCHAR(255),
     time DOUBLE PRECISION NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -55,7 +55,7 @@ CREATE INDEX idx_posts_time ON posts(time DESC);
 -- Balances table
 CREATE TABLE IF NOT EXISTS balances (
     id SERIAL PRIMARY KEY,
-    address VARCHAR(128) NOT NULL,
+    address VARCHAR(255) NOT NULL,
     chain VARCHAR(10) NOT NULL,
     balance DECIMAL(36, 18) NOT NULL DEFAULT 0,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -67,7 +67,7 @@ CREATE INDEX idx_balances_address ON balances(address);
 -- Credit balances table
 CREATE TABLE IF NOT EXISTS credit_balances (
     id SERIAL PRIMARY KEY,
-    address VARCHAR(128) NOT NULL UNIQUE,
+    address VARCHAR(255) NOT NULL UNIQUE,
     balance DECIMAL(36, 18) NOT NULL DEFAULT 0,
     expiration TIMESTAMP WITH TIME ZONE,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -78,9 +78,9 @@ CREATE INDEX idx_credit_balances_address ON credit_balances(address);
 -- File pins table (storage tracking)
 CREATE TABLE IF NOT EXISTS file_pins (
     item_hash VARCHAR(64) PRIMARY KEY,
-    owner VARCHAR(128) NOT NULL,
+    owner VARCHAR(255) NOT NULL,
     size BIGINT NOT NULL,
-    content_type VARCHAR(128),
+    content_type VARCHAR(255),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -89,7 +89,7 @@ CREATE INDEX idx_file_pins_owner ON file_pins(owner);
 -- Programs table
 CREATE TABLE IF NOT EXISTS programs (
     item_hash VARCHAR(64) PRIMARY KEY,
-    owner VARCHAR(128) NOT NULL,
+    owner VARCHAR(255) NOT NULL,
     code_ref VARCHAR(64) NOT NULL,
     runtime_ref VARCHAR(64) NOT NULL,
     memory INTEGER NOT NULL,
@@ -103,7 +103,7 @@ CREATE INDEX idx_programs_owner ON programs(owner);
 -- Instances table
 CREATE TABLE IF NOT EXISTS instances (
     item_hash VARCHAR(64) PRIMARY KEY,
-    owner VARCHAR(128) NOT NULL,
+    owner VARCHAR(255) NOT NULL,
     rootfs_ref VARCHAR(64) NOT NULL,
     memory INTEGER NOT NULL,
     vcpus INTEGER NOT NULL,
@@ -118,7 +118,7 @@ CREATE INDEX idx_instances_owner ON instances(owner);
 -- Forgotten content table
 CREATE TABLE IF NOT EXISTS forgotten (
     item_hash VARCHAR(64) PRIMARY KEY,
-    forgotten_by VARCHAR(128) NOT NULL,
+    forgotten_by VARCHAR(255) NOT NULL,
     reason TEXT,
     forgotten_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
