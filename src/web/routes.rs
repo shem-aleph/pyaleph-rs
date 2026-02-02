@@ -20,6 +20,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .nest("/api/v0", api_v0())
         // API ws0 routes (WebSocket compatibility with pyaleph)
         .nest("/api/ws0", api_ws0())
+        .nest("/api/v1", api_v1())
         // Legacy routes (backwards compatibility)
         .merge(legacy_routes())
         // Internal/admin routes
@@ -48,6 +49,15 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         // Posts
         .route("/posts.json", get(handlers::get_posts))
         .route("/posts", get(handlers::get_posts))
+        // P3 endpoints
+        .route("/channels/list.json", get(handlers::list_channels))
+        .route("/channels/list", get(handlers::list_channels))
+        .route("/version", get(handlers::get_version))
+        .route("/info/public.json", get(handlers::get_public_info))
+        .route("/messages/page/:page", get(handlers::list_messages_page))
+        
+        .route("/posts/page/:page", get(handlers::list_posts_page))
+        
         
         // Storage
         .route("/storage/:hash", get(handlers::get_storage))
@@ -109,6 +119,13 @@ pub fn api_v0() -> Router<Arc<AppState>> {
 
 /// API ws0 routes (WebSocket compatibility with pyaleph)
 /// Python uses /api/ws0/messages while we have /api/v0/ws
+/// API v1 routes
+fn api_v1() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/posts.json", get(handlers::get_posts_v1))
+        .route("/posts", get(handlers::get_posts_v1))
+}
+
 fn api_ws0() -> Router<Arc<AppState>> {
     Router::new()
         // WebSocket messages endpoint (pyaleph compatibility)

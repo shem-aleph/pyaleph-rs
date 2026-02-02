@@ -3097,3 +3097,97 @@ pub async fn get_storage_by_address_ref(
         }
     }
 }
+
+// ===== P3 HANDLERS =====
+
+/// GET /api/v0/channels/list.json - List all channels
+pub async fn list_channels(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let channels: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT channel FROM messages WHERE channel IS NOT NULL AND channel != '' ORDER BY channel"
+    )
+    .fetch_all(state.db())
+    .await
+    .unwrap_or_default();
+
+    Json(json!({
+        "channels": channels
+    }))
+}
+
+/// GET /api/v0/version - API version info
+pub async fn get_version() -> impl IntoResponse {
+    Json(json!({
+        "version": "0.2.0",
+        "api_version": "v0",
+        "name": "pyaleph-rs"
+    }))
+}
+
+/// GET /api/v0/info/public.json - Public node info
+pub async fn get_public_info() -> impl IntoResponse {
+    Json(json!({
+        "node_id": "pyaleph-rs-node",
+        "version": "0.2.0",
+        "api_version": "v0"
+    }))
+}
+
+/// GET /api/v0/messages/page/{page}.json - Paginated messages
+pub async fn list_messages_page(
+    State(state): State<Arc<AppState>>,
+    Path(page): Path<u32>,
+    Query(mut params): Query<MessageQuery>,
+) -> impl IntoResponse {
+    params.page = Some(page);
+    list_messages(State(state), Query(params)).await
+}
+
+/// GET /api/v0/posts/page/{page}.json - Paginated posts
+pub async fn list_posts_page(
+    State(state): State<Arc<AppState>>,
+    Path(page): Path<u32>,
+    Query(mut params): Query<PostsQuery>,
+) -> impl IntoResponse {
+    params.page = Some(page);
+    get_posts(State(state), Query(params)).await
+}
+
+/// GET /api/v1/posts - V1 posts endpoint (same as v0 for now)
+pub async fn get_posts_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PostsQuery>,
+) -> impl IntoResponse {
+    get_posts(State(state), Query(params)).await
+}
+
+/// GET /metrics - Prometheus metrics
+pub async fn get_metrics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let messages_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(state.db())
+        .await
+        .unwrap_or(0);
+
+    let posts_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
+        .fetch_one(state.db())
+        .await
+        .unwrap_or(0);
+
+    let aggregates_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM aggregates")
+        .fetch_one(state.db())
+        .await
+        .unwrap_or(0);
+
+    let metrics = format!(
+        "# HELP aleph_messages_total Total messages in database\n# TYPE aleph_messages_total gauge\naleph_messages_total {}\n# HELP aleph_posts_total Total posts in database\n# TYPE aleph_posts_total gauge\naleph_posts_total {}\n# HELP aleph_aggregates_total Total aggregates in database\n# TYPE aleph_aggregates_total gauge\naleph_aggregates_total {}\n",
+        messages_count, posts_count, aggregates_count
+    );
+
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        metrics
+    )
+}
