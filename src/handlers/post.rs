@@ -89,8 +89,8 @@ impl MessageHandler for PostHandler {
             return Err(HandlerError::InvalidContent("Post type cannot be empty".to_string()));
         }
         
-        // Verify signature (DISABLED - messages from indexer are pre-verified)
-        // TODO: Re-enable once signature verification format issues are fixed
+        // Signature verification is handled by message_processor based on trusted_source flag
+        // Handler does not need to re-verify - processor already validated untrusted messages
         /*
         if let Some(ref crypto) = ctx.crypto {
             if !message.verify_signature(crypto).map_err(|e| HandlerError::InvalidSignature(e))? {

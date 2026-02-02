@@ -538,7 +538,7 @@ async fn queue_messages_for_processing(
     
     // Build multi-value INSERT for pending_messages
     let mut query = String::from(
-        "INSERT INTO pending_messages (item_hash, message, reception_time, fetched, check_message, retries, next_attempt) VALUES "
+        "INSERT INTO pending_messages (item_hash, message, reception_time, fetched, check_message, retries, next_attempt, trusted_source) VALUES "
     );
     
     let mut param_idx = 1;
@@ -548,7 +548,7 @@ async fn queue_messages_for_processing(
             query.push_str(", ");
         }
         query.push_str(&format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, true)",
             param_idx, param_idx + 1, param_idx + 2, param_idx + 3, 
             param_idx + 4, param_idx + 5, param_idx + 6
         ));

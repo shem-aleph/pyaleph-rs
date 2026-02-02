@@ -173,26 +173,28 @@ async fn process_single_message(
         message
     };
     
-    // Step 4: Verify signature (SKIP for now - messages from indexer are pre-verified)
-    // TODO: Re-enable once signature verification format issues are fixed
-    // Messages from the Aleph indexer have already been validated
-    /*
-    match message.verify_signature(&ctx.crypto) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Ok(ProcessResult::Rejected(
-                ErrorCode::InvalidSignature,
-                "Signature verification failed".to_string(),
-            ));
+    // Step 4: Verify signature
+    // Only verify if message is NOT from a trusted source (indexer)
+    // Messages from indexer are pre-verified by the network
+    if !pending.trusted_source {
+        match message.verify_signature(&ctx.crypto) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(ProcessResult::Rejected(
+                    ErrorCode::InvalidSignature,
+                    "Signature verification failed".to_string(),
+                ));
+            }
+            Err(e) => {
+                return Ok(ProcessResult::Rejected(
+                    ErrorCode::InvalidSignature,
+                    format!("Signature verification error: {}", e),
+                ));
+            }
         }
-        Err(e) => {
-            return Ok(ProcessResult::Rejected(
-                ErrorCode::InvalidSignature,
-                format!("Signature verification error: {}", e),
-            ));
-        }
+    } else {
+        tracing::debug!("Skipping signature verification for trusted source message: {}", pending.item_hash);
     }
-    */
     
     // Step 5: Verify item hash matches content (for inline messages)
     if message.item_type == ItemType::Inline {
