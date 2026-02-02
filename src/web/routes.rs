@@ -58,7 +58,9 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         // Balances
         .route("/addresses/:address/balance", get(handlers::get_balance))
         .route("/balance/:address", get(handlers::get_balance))
+        .route("/balances", get(handlers::get_balances))
         .route("/credits/:address", get(handlers::get_credit_balance))
+        .route("/credit_balances", get(handlers::get_credit_balances))
         
         // Programs & Instances
         .route("/programs/:address", get(handlers::get_programs))

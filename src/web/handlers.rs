@@ -12,6 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use super::state::AppState;
 use crate::types::*;
@@ -69,7 +70,7 @@ pub async fn health_check(
 
 /// Message response format matching pyaleph
 /// Reference: aleph/web/controllers/messages.py:52-66
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageResponse {
     #[serde(rename = "type")]
     pub message_type: String,
@@ -91,7 +92,7 @@ pub struct MessageResponse {
 }
 
 /// Chain confirmation format
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConfirmationResponse {
     pub chain: String,
     pub hash: String,
@@ -117,6 +118,16 @@ impl MessageResponse {
     }
 }
 
+/// Sort by field options for messages
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SortBy {
+    /// Sort by message time (default)
+    Time,
+    /// Sort by transaction/confirmation time (uses created_at)
+    TxTime,
+}
+
 /// Query parameters for message list
 #[derive(Debug, Deserialize)]
 pub struct MessageQuery {
@@ -140,6 +151,12 @@ pub struct MessageQuery {
     pub end_date: Option<f64>,
     /// Sort order: 1 for ascending, -1 for descending (default: -1)
     pub order: Option<i8>,
+    /// Alias for order (pyaleph compatibility)
+    #[serde(rename = "sortOrder")]
+    pub sort_order: Option<i8>,
+    /// Sort field: "time" (default) or "tx-time"
+    #[serde(rename = "sortBy")]
+    pub sort_by: Option<SortBy>,
 }
 
 /// List messages - matches pyaleph /messages.json response format
@@ -199,9 +216,15 @@ pub async fn list_messages(
         builder.and_lte("time", end);
     }
     
-    // Order and pagination
-    let ascending = params.order.map(|o| o == 1).unwrap_or(false);
-    builder.order_by("time", ascending);
+    // Order and pagination - use sortBy to determine column
+    let order_column = match params.sort_by {
+        Some(SortBy::TxTime) => "created_at",
+        Some(SortBy::Time) | None => "time",
+    };
+    // Support both order and sortOrder params (sortOrder takes precedence)
+    let order_value = params.sort_order.or(params.order);
+    let ascending = order_value.map(|o| o == 1).unwrap_or(false);
+    builder.order_by(order_column, ascending);
     builder.limit(per_page as i64);
     builder.offset(offset);
     
@@ -245,11 +268,42 @@ pub async fn list_messages(
         .await
         .unwrap_or_default();
     
+    // Batch fetch confirmations for all messages
+    let item_hashes: Vec<String> = messages.iter().map(|m| m.item_hash.clone()).collect();
+    let mut confirmations_map: HashMap<String, Vec<ConfirmationResponse>> = HashMap::new();
+    
+    if !item_hashes.is_empty() {
+        // Build parameterized IN query for confirmations
+        let placeholders: Vec<String> = (1..=item_hashes.len())
+            .map(|i| format!("${}", i))
+            .collect();
+        let query = format!(
+            "SELECT item_hash, chain, hash, height FROM chain_txs WHERE item_hash IN ({})",
+            placeholders.join(", ")
+        );
+        
+        let mut q = sqlx::query_as::<_, (String, String, String, i64)>(&query);
+        for hash in &item_hashes {
+            q = q.bind(hash);
+        }
+        
+        let confirmations = q.fetch_all(state.db()).await.unwrap_or_default();
+        
+        for (item_hash, chain, hash, height) in confirmations {
+            confirmations_map
+                .entry(item_hash)
+                .or_insert_with(Vec::new)
+                .push(ConfirmationResponse { chain, hash, height: height as u64 });
+        }
+    }
+    
     // Convert to response format with confirmations
     let message_responses: Vec<MessageResponse> = messages.iter()
         .map(|msg| {
-            // TODO: Fetch actual confirmations from chain_txs table
-            let confirmations = Vec::new();
+            let confirmations = confirmations_map
+                .get(&msg.item_hash)
+                .cloned()
+                .unwrap_or_default();
             MessageResponse::from_db(msg, confirmations)
         })
         .collect();
@@ -579,26 +633,56 @@ pub async fn get_aggregates(
 }
 
 /// Query parameters for posts
+/// Reference: aleph/web/controllers/posts.py
 #[derive(Debug, Deserialize)]
 pub struct PostsQuery {
+    /// Filter by sender addresses (comma-separated)
     pub addresses: Option<String>,
+    /// Filter by channel (comma-separated)
     pub channels: Option<String>,
+    /// Filter by post type (comma-separated, e.g. "amend", "chat")
     pub types: Option<String>,
+    /// Filter by content.ref (comma-separated)
     pub refs: Option<String>,
+    /// Filter by tags (comma-separated) - searches in content.tags array
     pub tags: Option<String>,
+    /// Filter by item_hash (comma-separated)
     pub hashes: Option<String>,
+    /// Items per page (alias: limit)
     pub pagination: Option<u32>,
+    /// Alias for pagination (pyaleph compatibility)
+    pub limit: Option<u32>,
+    /// Page number (1-indexed)
     pub page: Option<u32>,
+    /// Start time filter (Unix timestamp)
+    #[serde(rename = "startDate")]
+    pub start_date: Option<f64>,
+    /// End time filter (Unix timestamp)
+    #[serde(rename = "endDate")]
+    pub end_date: Option<f64>,
+    /// Sort field (default: time). Allowed: time, address, post_type, channel
+    #[serde(rename = "sortBy")]
+    pub sort_by: Option<String>,
+    /// Sort order: 1 for ascending, -1 for descending (default: -1)
+    pub order: Option<i8>,
+    /// Alias for order (pyaleph compatibility)
+    #[serde(rename = "sortOrder")]
+    pub sort_order: Option<i8>,
 }
 
 /// Get posts - matches pyaleph format
+/// Reference: aleph/web/controllers/posts.py
 pub async fn get_posts(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PostsQuery>,
 ) -> impl IntoResponse {
     let page = params.page.unwrap_or(1);
-    let per_page = params.pagination.unwrap_or(20).min(1000);
+    // Support both 'limit' and 'pagination' parameters (limit takes precedence)
+    let per_page = params.limit.or(params.pagination).unwrap_or(20).min(1000);
     let offset = ((page - 1) * per_page) as i64;
+    
+    // Merge order and sort_order (order takes precedence)
+    let order_param = params.order.or(params.sort_order);
     
     if !state.has_db() {
         return Json(json!({
@@ -609,19 +693,95 @@ pub async fn get_posts(
         }));
     }
     
-    let posts = sqlx::query_as::<_, crate::db::models::PostDb>(
-        "SELECT * FROM posts ORDER BY time DESC LIMIT $1 OFFSET $2"
-    )
-    .bind(per_page as i64)
-    .bind(offset)
-    .fetch_all(state.db())
-    .await
-    .unwrap_or_default();
+    // Build query with safe parameterized filters
+    let mut builder = crate::db::QueryBuilder::new("SELECT * FROM posts WHERE 1=1");
+    let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM posts WHERE 1=1");
     
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts")
+    // Filter by addresses (sender)
+    if let Some(ref addresses) = params.addresses {
+        let addr_list = crate::db::parse_csv_param(addresses);
+        if !addr_list.is_empty() {
+            builder.and_in("address", &addr_list);
+            count_builder.and_in("address", &addr_list);
+        }
+    }
+    
+    // Filter by channels
+    if let Some(ref channels) = params.channels {
+        let channel_list = crate::db::parse_csv_param(channels);
+        if !channel_list.is_empty() {
+            builder.and_in("channel", &channel_list);
+            count_builder.and_in("channel", &channel_list);
+        }
+    }
+    
+    // Filter by post types
+    if let Some(ref types) = params.types {
+        let type_list = crate::db::parse_csv_param(types);
+        if !type_list.is_empty() {
+            builder.and_in("post_type", &type_list);
+            count_builder.and_in("post_type", &type_list);
+        }
+    }
+    
+    // Filter by refs
+    if let Some(ref refs) = params.refs {
+        let ref_list = crate::db::parse_csv_param(refs);
+        if !ref_list.is_empty() {
+            builder.and_in("ref_", &ref_list);
+            count_builder.and_in("ref_", &ref_list);
+        }
+    }
+    
+    // Filter by item hashes
+    if let Some(ref hashes) = params.hashes {
+        let hash_list = crate::db::parse_csv_param(hashes);
+        if !hash_list.is_empty() {
+            builder.and_in("item_hash", &hash_list);
+            count_builder.and_in("item_hash", &hash_list);
+        }
+    }
+    
+    // Time filters
+    if let Some(start) = params.start_date {
+        builder.and_gte("time", start);
+        count_builder.and_gte("time", start);
+    }
+    if let Some(end) = params.end_date {
+        builder.and_lte("time", end);
+        count_builder.and_lte("time", end);
+    }
+    
+    // NOTE: tags filter requires JSONB containment which QueryBuilder doesn't support yet
+    // Tags are stored in content->'tags' as a JSON array
+    // TODO: Add and_jsonb_contains to QueryBuilder for tags support
+    
+    // Determine sort column (validate against allowed columns)
+    let allowed_sort = &["time", "address", "post_type", "channel"];
+    let sort_column = params.sort_by
+        .as_deref()
+        .and_then(|col| crate::db::validate_sort_column(col, allowed_sort))
+        .unwrap_or("time");
+    
+    // Order: 1 = ascending, -1 = descending (default)
+    let ascending = order_param.map(|o| o == 1).unwrap_or(false);
+    builder.order_by(sort_column, ascending);
+    builder.limit(per_page as i64);
+    builder.offset(offset);
+    
+    // Get total count first
+    let (count_query, count_args) = count_builder.build();
+    let total: (i64,) = sqlx::query_as_with(&count_query, count_args)
         .fetch_one(state.db())
         .await
         .unwrap_or((0,));
+    
+    // Get the posts
+    let (query, args) = builder.build();
+    let posts = sqlx::query_as_with::<_, crate::db::models::PostDb, _>(&query, args)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default();
     
     Json(json!({
         "posts": posts,
@@ -699,6 +859,120 @@ pub async fn get_credit_balance(
             "balance": "0",
         })),
     }
+}
+
+/// Query parameters for credit balances list
+#[derive(Debug, Deserialize)]
+pub struct CreditBalancesQuery {
+    pub addresses: Option<String>,       // Comma-separated addresses filter
+    pub min_balance: Option<i64>,        // Minimum balance filter
+    pub pagination: Option<u32>,
+    pub page: Option<u32>,
+}
+
+/// Credit balance response item
+#[derive(Debug, Serialize)]
+pub struct CreditBalanceItem {
+    pub address: String,
+    pub credits: String,  // String for big numbers
+}
+
+/// Get all credit balances - matches pyaleph /credit_balances format
+pub async fn get_credit_balances(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<CreditBalancesQuery>,
+) -> impl IntoResponse {
+    let page = params.page.unwrap_or(1);
+    let per_page = params.pagination.unwrap_or(100).min(1000);
+    let offset = ((page - 1) * per_page) as i64;
+    let min_balance = params.min_balance.unwrap_or(0);
+    
+    if !state.has_db() {
+        return Json(json!({
+            "credit_balances": [],
+            "pagination_total": 0,
+            "pagination_page": page,
+            "pagination_per_page": per_page,
+            "pagination_item": "credit_balances",
+            "error": "Database not available"
+        }));
+    }
+    
+    // Parse addresses filter
+    let address_list: Option<Vec<String>> = params.addresses.as_ref().map(|addrs| {
+        addrs.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    
+    // Build query based on filters
+    let (credit_balances, total) = if let Some(ref addresses) = address_list {
+        if addresses.is_empty() {
+            (vec![], 0i64)
+        } else {
+            // Query with address filter
+            let balances: Vec<(String, rust_decimal::Decimal)> = sqlx::query_as(
+                "SELECT address, balance FROM credit_balances WHERE address = ANY($1) AND balance >= $2 LIMIT $3 OFFSET $4"
+            )
+            .bind(addresses)
+            .bind(rust_decimal::Decimal::from(min_balance))
+            .bind(per_page as i64)
+            .bind(offset)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default();
+            
+            let count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM credit_balances WHERE address = ANY($1) AND balance >= $2"
+            )
+            .bind(addresses)
+            .bind(rust_decimal::Decimal::from(min_balance))
+            .fetch_one(state.db())
+            .await
+            .unwrap_or((0,));
+            
+            (balances, count.0)
+        }
+    } else {
+        // Query without address filter
+        let balances: Vec<(String, rust_decimal::Decimal)> = sqlx::query_as(
+            "SELECT address, balance FROM credit_balances WHERE balance >= $1 LIMIT $2 OFFSET $3"
+        )
+        .bind(rust_decimal::Decimal::from(min_balance))
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default();
+        
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM credit_balances WHERE balance >= $1"
+        )
+        .bind(rust_decimal::Decimal::from(min_balance))
+        .fetch_one(state.db())
+        .await
+        .unwrap_or((0,));
+        
+        (balances, count.0)
+    };
+    
+    // Format response
+    let formatted_balances: Vec<CreditBalanceItem> = credit_balances
+        .into_iter()
+        .map(|(address, balance)| CreditBalanceItem {
+            address,
+            credits: balance.to_string(),
+        })
+        .collect();
+    
+    Json(json!({
+        "credit_balances": formatted_balances,
+        "pagination_per_page": per_page,
+        "pagination_page": page,
+        "pagination_total": total,
+        "pagination_item": "credit_balances",
+    }))
 }
 
 /// Get storage info
@@ -1497,5 +1771,131 @@ pub async fn get_config_debug(
             "ethereum_enabled": state.config.chains.ethereum.as_ref().map(|c| c.enabled).unwrap_or(false),
             "solana_enabled": state.config.chains.solana.as_ref().map(|c| c.enabled).unwrap_or(false),
         },
+    }))
+}
+
+// ===== Balances List Endpoint =====
+
+/// Query parameters for balances list
+/// Reference: aleph/schemas/api/accounts.py:GetBalancesChainsQueryParams
+#[derive(Debug, Deserialize)]
+pub struct BalancesQuery {
+    /// Comma-separated list of chains to filter by
+    pub chains: Option<String>,
+    /// Minimum balance required (as integer, will be compared to balance)
+    pub min_balance: Option<i64>,
+    /// Page size (default: 100)
+    pub pagination: Option<u32>,
+    /// Page number (default: 1)
+    pub page: Option<u32>,
+}
+
+/// Balance item in response
+/// Reference: aleph/schemas/api/accounts.py:AddressBalanceResponse
+#[derive(Debug, Clone, Serialize)]
+pub struct BalanceItem {
+    pub address: String,
+    pub chain: String,
+    /// Balance as string to preserve precision for large numbers
+    pub balance: String,
+}
+
+/// Get list of balances - matches pyaleph /api/v0/balances format
+///
+/// Returns paginated list of balances with optional chain and min_balance filters.
+/// Reference: aleph/web/controllers/accounts.py:get_chain_balances
+pub async fn get_balances(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<BalancesQuery>,
+) -> impl IntoResponse {
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.pagination.unwrap_or(100).min(1000);
+    let offset = ((page - 1) * per_page) as i64;
+    
+    if !state.has_db() {
+        return Json(json!({
+            "balances": [],
+            "pagination_total": 0,
+            "pagination_page": page,
+            "pagination_per_page": per_page,
+            "pagination_item": "balances",
+            "error": "Database not available"
+        }));
+    }
+    
+    // Build the query with filters
+    let mut builder = crate::db::QueryBuilder::new(
+        "SELECT address, chain, balance FROM balances WHERE 1=1"
+    );
+    
+    // Parse chains filter
+    if let Some(ref chains) = params.chains {
+        let chain_list = crate::db::parse_csv_param(chains);
+        if !chain_list.is_empty() {
+            builder.and_in("chain", &chain_list);
+        }
+    }
+    
+    // Add min_balance filter if specified
+    if let Some(min_bal) = params.min_balance {
+        if min_bal > 0 {
+            builder.and_gte("balance", min_bal as f64);
+        }
+    }
+    
+    // Order by balance descending, then address for consistency
+    builder.order_by("balance", false);
+    builder.limit(per_page as i64);
+    builder.offset(offset);
+    
+    // Build count query with same filters
+    let mut count_builder = crate::db::QueryBuilder::new(
+        "SELECT COUNT(*) FROM balances WHERE 1=1"
+    );
+    
+    if let Some(ref chains) = params.chains {
+        let chain_list = crate::db::parse_csv_param(chains);
+        if !chain_list.is_empty() {
+            count_builder.and_in("chain", &chain_list);
+        }
+    }
+    
+    if let Some(min_bal) = params.min_balance {
+        if min_bal > 0 {
+            count_builder.and_gte("balance", min_bal as f64);
+        }
+    }
+    
+    // Execute count query
+    let (count_query, count_args) = count_builder.build();
+    let total: (i64,) = sqlx::query_as_with(&count_query, count_args)
+        .fetch_one(state.db())
+        .await
+        .unwrap_or((0,));
+    
+    // Execute main query
+    let (query, args) = builder.build();
+    let balances: Vec<crate::db::models::BalanceDb> = 
+        sqlx::query_as_with(&query, args)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default();
+    
+    // Convert to response format
+    let balance_items: Vec<BalanceItem> = balances
+        .into_iter()
+        .map(|b| BalanceItem {
+            address: b.address,
+            chain: b.chain,
+            balance: b.balance.to_string(),
+        })
+        .collect();
+    
+    Json(json!({
+        "balances": balance_items,
+        "pagination_total": total.0,
+        "pagination_page": page,
+        "pagination_per_page": per_page,
+        "pagination_item": "balances",
     }))
 }
