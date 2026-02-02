@@ -208,7 +208,12 @@ pub async fn run_indexer_sync(config: Arc<Config>, pool: PgPool, ipfs_url: &str)
     }
 }
 
-/// Sync a chain using the indexer
+/// Sync a chain using the indexer - FIXED with pagination loop
+/// 
+/// Key fixes applied:
+/// 1. Increased limit from 100 to 1000
+/// 2. Added pagination loop - keeps fetching while events.len() >= limit
+/// 3. Uses last event timestamp + 1ms as next start to avoid re-fetching same events
 async fn sync_chain_from_indexer(
     indexer: &IndexerClient,
     ipfs_client: &reqwest::Client,
@@ -219,74 +224,90 @@ async fn sync_chain_from_indexer(
     let blockchain = IndexerBlockchain::from(chain);
     
     // Get last sync timestamp
-    let last_sync_ts = SyncStateAccessor::get_last_sync_timestamp(pool, chain)
+    let mut start_ts = SyncStateAccessor::get_last_sync_timestamp(pool, chain)
         .await?
         .unwrap_or(0);
     
     // Current time in milliseconds
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
     
-    // Fetch sync events from last sync to now
-    let events = indexer.fetch_sync_events(
-        blockchain,
-        last_sync_ts,
-        now_ms,
-        100,
-    ).await?;
-    
-    if events.is_empty() {
-        return Ok(0);
-    }
-    
-    info!("{}: Found {} sync events to process", chain, events.len());
-    
     let mut total_messages = 0;
+    let limit = 1000; // Increased from 100
     
-    for event in &events {
-        // Parse the sync message to get IPFS hash
-        let sync_content = match IndexerClient::parse_sync_message(&event.message) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to parse sync message: {}", e);
-                continue;
-            }
-        };
+    // Pagination loop - keep fetching until we get less than limit events
+    loop {
+        let events = indexer.fetch_sync_events(
+            blockchain,
+            start_ts,
+            now_ms,
+            limit,
+        ).await?;
         
-        // Fetch IPFS content
-        let ipfs_content = match fetch_ipfs_content(
-            ipfs_client,
-            ipfs_url,
-            &sync_content.content,
-        ).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to fetch IPFS content {}: {}", sync_content.content, e);
-                continue;
-            }
-        };
+        let events_count = events.len();
         
-        // Parse and store messages
-        match parse_and_store_messages(pool, &ipfs_content, chain, event).await {
-            Ok(count) => {
-                total_messages += count;
-                debug!(
-                    "{}: Stored {} messages from IPFS {}",
-                    chain, count, sync_content.content
-                );
-            }
-            Err(e) => {
-                warn!("Failed to store messages from {}: {}", sync_content.content, e);
+        if events.is_empty() {
+            break;
+        }
+        
+        info!("{}: Processing {} sync events (from ts {})", chain, events_count, start_ts);
+        
+        for event in &events {
+            // Parse the sync message to get IPFS hash
+            let sync_content = match IndexerClient::parse_sync_message(&event.message) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to parse sync message: {}", e);
+                    continue;
+                }
+            };
+            
+            // Fetch IPFS content
+            let ipfs_content = match fetch_ipfs_content(
+                ipfs_client,
+                ipfs_url,
+                &sync_content.content,
+            ).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to fetch IPFS content {}: {}", sync_content.content, e);
+                    continue;
+                }
+            };
+            
+            // Parse and store messages
+            match parse_and_store_messages(pool, &ipfs_content, chain, event).await {
+                Ok(count) => {
+                    total_messages += count;
+                    if count > 0 {
+                        debug!(
+                            "{}: Stored {} messages from IPFS {}",
+                            chain, count, sync_content.content
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to store messages from {}: {}", sync_content.content, e);
+                }
             }
         }
-    }
-    
-    // Update sync timestamp
-    if let Some(last_event) = events.last() {
-        SyncStateAccessor::update_last_sync_timestamp(pool, chain, last_event.timestamp).await?;
+        
+        // Update cursor to last event timestamp + 1ms to avoid re-fetching
+        if let Some(last_event) = events.last() {
+            start_ts = last_event.timestamp + 1;
+            SyncStateAccessor::update_last_sync_timestamp(pool, chain, last_event.timestamp).await?;
+        }
+        
+        // If we got less than limit events, we have reached the end
+        if events_count < limit {
+            break;
+        }
+        
+        // Small delay to avoid hammering the indexer
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     
     if total_messages > 0 {
-        info!("{}: Synced {} messages from {} events", chain, total_messages, events.len());
+        info!("{}: Synced {} total messages", chain, total_messages);
     }
     
     Ok(total_messages)

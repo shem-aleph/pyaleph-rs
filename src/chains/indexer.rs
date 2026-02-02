@@ -140,7 +140,7 @@ impl IndexerClient {
         limit: usize,
     ) -> Result<Vec<IndexerSyncEvent>, IndexerError> {
         let query = format!(
-            r#"{{ syncEvents(blockchain: "{}", startDate: {}, endDate: {}, limit: {}) {{ transaction height timestamp address message }} }}"#,
+            r#"{{ syncEvents(blockchain: "{}", startDate: {}, endDate: {}, limit: {}, reverse: false) {{ transaction height timestamp address message }} }}"#,
             blockchain.as_str(),
             start_date_ms,
             end_date_ms,
@@ -169,7 +169,7 @@ impl IndexerClient {
         limit: usize,
     ) -> Result<Vec<IndexerSyncEvent>, IndexerError> {
         let query = format!(
-            r#"{{ syncEvents(blockchain: "{}", startHeight: {}, endHeight: {}, limit: {}) {{ transaction height timestamp address message }} }}"#,
+            r#"{{ syncEvents(blockchain: "{}", startHeight: {}, endHeight: {}, limit: {}, reverse: false) {{ transaction height timestamp address message }} }}"#,
             blockchain.as_str(),
             start_height,
             end_height,
@@ -199,7 +199,7 @@ impl IndexerClient {
         limit: usize,
     ) -> Result<Vec<IndexerMessageEvent>, IndexerError> {
         let query = format!(
-            r#"{{ messageEvents(blockchain: "{}", startDate: {}, endDate: {}, limit: {}) {{ transaction height timestamp address content }} }}"#,
+            r#"{{ messageEvents(blockchain: "{}", startDate: {}, endDate: {}, limit: {}, reverse: false) {{ transaction height timestamp address content }} }}"#,
             blockchain.as_str(),
             start_date_ms,
             end_date_ms,
