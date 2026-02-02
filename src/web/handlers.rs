@@ -2410,14 +2410,6 @@ pub struct AddressStatsItem {
     pub store: i64,
 }
 
-// Helper function to extract addresses from query string (handles addresses[] format)
-fn extract_addresses_from_query(query_str: &str) -> Vec<String> {
-    url::form_urlencoded::parse(query_str.as_bytes())
-        .filter(|(key, _)| key == "addresses[]" || key == "addresses")
-        .map(|(_, value)| value.to_string())
-        .collect()
-}
-
 /// Get address statistics (v0) - matches pyaleph format
 /// Returns message counts by type for specified addresses
 /// Reference: aleph/web/controllers/accounts.py:addresses_stats_view_v0
@@ -2432,9 +2424,22 @@ pub async fn get_addresses_stats_v0(
         }));
     }
     
-    let addresses = raw_query
-        .map(|q| extract_addresses_from_query(&q))
-        .unwrap_or_default();
+    // Parse addresses from query string (handles addresses[] format)
+    let addresses: Vec<String> = raw_query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|param| {
+            let mut parts = param.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+            // Handle both encoded and non-encoded forms
+            if key == "addresses%5B%5D" || key == "addresses[]" || key == "addresses" {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
     
     if addresses.is_empty() {
         return Json(json!({
@@ -2444,10 +2449,7 @@ pub async fn get_addresses_stats_v0(
     
     // Query message counts by type for each address
     let stats: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT sender, message_type, COUNT(*) as count \
-         FROM messages \
-         WHERE sender = ANY($1) \
-         GROUP BY sender, message_type"
+        "SELECT sender, message_type, COUNT(*) as count FROM messages WHERE sender = ANY($1) GROUP BY sender, message_type"
     )
     .bind(&addresses)
     .fetch_all(state.db())
@@ -2455,7 +2457,7 @@ pub async fn get_addresses_stats_v0(
     .unwrap_or_default();
     
     // Aggregate stats by address
-    let mut data: std::collections::HashMap<String, AddressStatsItem> = std::collections::HashMap::new();
+    let mut data: HashMap<String, AddressStatsItem> = HashMap::new();
     
     for (sender, msg_type, count) in stats {
         let entry = data.entry(sender).or_insert_with(|| AddressStatsItem {
@@ -2485,7 +2487,7 @@ pub async fn get_addresses_stats_v0(
     }))
 }
 
-// ===== Address Files Endpoint
+// ===== Address Files Endpoint =====
 
 /// Query parameters for address files
 /// Reference: aleph/web/controllers/accounts.py:get_account_files
