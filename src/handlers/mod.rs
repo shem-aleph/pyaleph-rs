@@ -16,7 +16,6 @@ use thiserror::Error;
 use crate::types::{Message, MessageType, ProcessingStatus, ErrorCode};
 use crate::services::crypto::CryptoService;
 
-pub use aggregate::AggregateElement;
 
 #[derive(Debug, Error)]
 pub enum HandlerError {
@@ -143,8 +142,6 @@ pub trait Database: Send + Sync {
     // Aggregate operations
     async fn get_aggregate(&self, address: &str, key: &str) -> Result<Option<serde_json::Value>, String>;
     async fn store_aggregate(&self, address: &str, key: &str, content: &serde_json::Value, time: f64) -> Result<(), String>;
-    async fn get_aggregate_elements(&self, address: &str, key: &str) -> Result<Vec<AggregateElement>, String>;
-    async fn store_aggregate_element(&self, address: &str, element: &AggregateElement) -> Result<(), String>;
     async fn get_aggregate_time(&self, address: &str, key: &str) -> Result<Option<f64>, String>;
     async fn mark_aggregate_dirty(&self, address: &str, key: &str) -> Result<(), String>;
     async fn mark_aggregate_clean(&self, address: &str, key: &str) -> Result<(), String>;
