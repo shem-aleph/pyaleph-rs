@@ -74,6 +74,8 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         // Pricing & Costs
         .route("/price", get(handlers::get_pricing))
         .route("/pricing", get(handlers::get_pricing))
+        // TODO: handler not implemented yet
+        // .route("/price/:hash", get(handlers::get_message_price))
         .route("/cost/estimate", post(handlers::estimate_cost))
         .route("/cost/:hash", get(handlers::get_resource_cost))
         

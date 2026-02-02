@@ -570,19 +570,11 @@ pub async fn post_message(
 #[derive(Debug, Deserialize)]
 pub struct AggregateQuery {
     pub keys: Option<String>,
-    pub limit: Option<u32>,         // NEW: limit number of aggregates
-    pub with_info: Option<bool>,    // NEW: include metadata (created, last_updated, item_hashes)
-    pub value_only: Option<bool>,   // NEW: return only the value, not the wrapper
 }
 
 /// Get aggregates for an address - matches pyaleph format
 /// 
 /// Uses parameterized queries to prevent SQL injection.
-/// Supports:
-/// - keys: comma-separated list of keys to filter
-/// - limit: limit number of aggregates returned
-/// - with_info: include metadata (created, last_updated, item_hashes)
-/// - value_only: return just the aggregate values (only if single key requested)
 pub async fn get_aggregates(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
@@ -604,152 +596,40 @@ pub async fn get_aggregates(
             .collect()
     });
     
-    let with_info = params.with_info.unwrap_or(false);
-    let value_only = params.value_only.unwrap_or(false);
-    let limit = params.limit;
+    // Query aggregates with parameterized query
+    let aggregates: Vec<(String, serde_json::Value)> = match key_list {
+        Some(ref keys) if !keys.is_empty() => {
+            // Use ANY for safe IN clause
+            sqlx::query_as(
+                "SELECT key, content FROM aggregates WHERE address = $1 AND key = ANY($2)"
+            )
+            .bind(&address)
+            .bind(keys)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default()
+        }
+        _ => {
+            sqlx::query_as(
+                "SELECT key, content FROM aggregates WHERE address = $1"
+            )
+            .bind(&address)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default()
+        }
+    };
     
-    // Build base query - different for with_info vs regular
-    if with_info {
-        // Query with join to get metadata
-        let aggregates: Vec<(String, serde_json::Value, f64, f64, Option<String>, Option<String>)> = match &key_list {
-            Some(keys) if !keys.is_empty() => {
-                let mut query_str = String::from(
-                    "SELECT a.key, a.content, a.time as created, \
-                     COALESCE(ae.time, a.time) as last_updated, \
-                     a.last_revision_hash as last_update_item_hash, \
-                     ae.item_hash as original_item_hash \
-                     FROM aggregates a \
-                     LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
-                     WHERE a.address = $1 AND a.key = ANY($2)"
-                );
-                if let Some(lim) = limit {
-                    query_str.push_str(&format!(" LIMIT {}", lim));
-                }
-                sqlx::query_as(&query_str)
-                    .bind(&address)
-                    .bind(keys)
-                    .fetch_all(state.db())
-                    .await
-                    .unwrap_or_default()
-            }
-            _ => {
-                let mut query_str = String::from(
-                    "SELECT a.key, a.content, a.time as created, \
-                     COALESCE(ae.time, a.time) as last_updated, \
-                     a.last_revision_hash as last_update_item_hash, \
-                     ae.item_hash as original_item_hash \
-                     FROM aggregates a \
-                     LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
-                     WHERE a.address = $1"
-                );
-                if let Some(lim) = limit {
-                    query_str.push_str(&format!(" LIMIT {}", lim));
-                }
-                sqlx::query_as(&query_str)
-                    .bind(&address)
-                    .fetch_all(state.db())
-                    .await
-                    .unwrap_or_default()
-            }
-        };
-        
-        if aggregates.is_empty() {
-            return Json(json!({
-                "error": "No aggregate found for this address"
-            }));
-        }
-        
-        // Build data and info maps
-        let mut data = serde_json::Map::new();
-        let mut info = serde_json::Map::new();
-        
-        for (key, content, created, last_updated, last_update_hash, original_hash) in aggregates {
-            data.insert(key.clone(), content);
-            
-            // Convert timestamps to ISO format
-            let created_dt = chrono::DateTime::from_timestamp(created as i64, 0)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| created.to_string());
-            let last_updated_dt = chrono::DateTime::from_timestamp(last_updated as i64, 0)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| last_updated.to_string());
-            
-            info.insert(key, json!({
-                "created": created_dt,
-                "last_updated": last_updated_dt,
-                "original_item_hash": original_hash.unwrap_or_default(),
-                "last_update_item_hash": last_update_hash.unwrap_or_default(),
-            }));
-        }
-        
-        Json(json!({
-            "address": address,
-            "data": data,
-            "info": info,
-        }))
-    } else {
-        // Regular query without metadata
-        let aggregates: Vec<(String, serde_json::Value)> = match &key_list {
-            Some(keys) if !keys.is_empty() => {
-                let mut query_str = String::from(
-                    "SELECT key, content FROM aggregates WHERE address = $1 AND key = ANY($2)"
-                );
-                if let Some(lim) = limit {
-                    query_str.push_str(&format!(" LIMIT {}", lim));
-                }
-                sqlx::query_as(&query_str)
-                    .bind(&address)
-                    .bind(keys)
-                    .fetch_all(state.db())
-                    .await
-                    .unwrap_or_default()
-            }
-            _ => {
-                let mut query_str = String::from(
-                    "SELECT key, content FROM aggregates WHERE address = $1"
-                );
-                if let Some(lim) = limit {
-                    query_str.push_str(&format!(" LIMIT {}", lim));
-                }
-                sqlx::query_as(&query_str)
-                    .bind(&address)
-                    .fetch_all(state.db())
-                    .await
-                    .unwrap_or_default()
-            }
-        };
-        
-        if aggregates.is_empty() {
-            return Json(json!({
-                "error": "No aggregate found for this address"
-            }));
-        }
-        
-        // Handle value_only - only works for single key
-        if value_only {
-            if let Some(ref keys) = key_list {
-                if keys.len() == 1 {
-                    // Find the matching aggregate and return just its value
-                    for (key, content) in &aggregates {
-                        if key == &keys[0] {
-                            return Json(content.clone());
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Build data map
-        let mut data = serde_json::Map::new();
-        for (key, content) in aggregates {
-            data.insert(key, content);
-        }
-        
-        Json(json!({
-            "address": address,
-            "data": data,
-        }))
+    // Build data map
+    let mut data = serde_json::Map::new();
+    for (key, content) in aggregates {
+        data.insert(key, content);
     }
+    
+    Json(json!({
+        "address": address,
+        "data": data,
+    }))
 }
 
 /// Query parameters for posts
@@ -2017,56 +1897,5 @@ pub async fn get_balances(
         "pagination_page": page,
         "pagination_per_page": per_page,
         "pagination_item": "balances",
-    }))
-}
-
-
-/// List all aggregates with pagination - matches pyaleph format
-pub async fn list_aggregates(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<MessageQuery>,
-) -> impl IntoResponse {
-    if !state.has_db() {
-        return Json(json!({
-            "aggregates": [],
-            "pagination_total": 0,
-        }));
-    }
-    
-    let page = params.page.unwrap_or(1);
-    let per_page = params.pagination.unwrap_or(20).min(100);
-    let offset = ((page - 1) * per_page) as i64;
-    
-    let aggregates = sqlx::query_as::<_, (String, String, serde_json::Value, f64)>(
-        "SELECT address, key, content, time FROM aggregates ORDER BY time DESC LIMIT $1 OFFSET $2"
-    )
-    .bind(per_page as i64)
-    .bind(offset)
-    .fetch_all(state.db())
-    .await
-    .unwrap_or_default();
-    
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM aggregates")
-        .fetch_one(state.db())
-        .await
-        .unwrap_or((0,));
-    
-    let formatted: Vec<serde_json::Value> = aggregates
-        .into_iter()
-        .map(|(address, key, content, time)| {
-            json!({
-                "address": address,
-                "key": key,
-                "content": content,
-                "time": time,
-            })
-        })
-        .collect();
-    
-    Json(json!({
-        "aggregates": formatted,
-        "pagination_total": total.0,
-        "pagination_page": page,
-        "pagination_per_page": per_page,
     }))
 }
