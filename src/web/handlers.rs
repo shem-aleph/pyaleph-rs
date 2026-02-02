@@ -138,6 +138,8 @@ pub struct MessageQuery {
     pub start_date: Option<f64>,
     /// End time filter (Unix timestamp)
     pub end_date: Option<f64>,
+    /// Sort order: 1 for ascending, -1 for descending (default: -1)
+    pub order: Option<i8>,
 }
 
 /// List messages - matches pyaleph /messages.json response format
@@ -198,7 +200,8 @@ pub async fn list_messages(
     }
     
     // Order and pagination
-    builder.order_by("time", false);
+    let ascending = params.order.map(|o| o == 1).unwrap_or(false);
+    builder.order_by("time", ascending);
     builder.limit(per_page as i64);
     builder.offset(offset);
     
