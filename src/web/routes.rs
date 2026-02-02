@@ -54,6 +54,12 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/storage/:hash/raw", get(handlers::get_storage_raw))
         .route("/storage/upload", post(handlers::upload_file))
         
+        // Storage metadata endpoints
+        .route("/storage/add_json", post(handlers::add_json_storage))
+        .route("/storage/by-message-hash/:hash", get(handlers::get_storage_by_message_hash))
+        .route("/storage/by-ref/:address/:ref", get(handlers::get_storage_by_address_ref))
+        .route("/storage/by-ref/:ref", get(handlers::get_storage_by_ref))
+        
         // Hashes endpoint
         .route("/hashes", get(handlers::get_hashes))
         

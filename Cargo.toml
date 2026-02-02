@@ -63,6 +63,7 @@ lapin = "2.3"
 
 # Blockchain specific
 ethers = "2.0"
+url = "2.5.8"
 # web3 = "0.19"
 
 [dev-dependencies]

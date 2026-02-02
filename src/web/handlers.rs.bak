@@ -2398,6 +2398,16 @@ pub async fn get_message_price(
 
 // ===== Address Stats Endpoint =====
 
+/// Query parameters for addresses stats (v0)
+/// Reference: aleph/web/controllers/accounts.py:addresses_stats_view_v0
+#[derive(Debug, Deserialize)]
+pub struct AddressesStatsQuery {
+    /// addresses[] parameter - can be repeated
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::web::handlers::deserialize_addresses")]
+    pub addresses: Option<Vec<String>>,
+}
+
 /// Address stats item
 #[derive(Debug, Clone, Serialize)]
 pub struct AddressStatsItem {
@@ -2410,20 +2420,12 @@ pub struct AddressStatsItem {
     pub store: i64,
 }
 
-// Helper function to extract addresses from query string (handles addresses[] format)
-fn extract_addresses_from_query(query_str: &str) -> Vec<String> {
-    url::form_urlencoded::parse(query_str.as_bytes())
-        .filter(|(key, _)| key == "addresses[]" || key == "addresses")
-        .map(|(_, value)| value.to_string())
-        .collect()
-}
-
 /// Get address statistics (v0) - matches pyaleph format
 /// Returns message counts by type for specified addresses
 /// Reference: aleph/web/controllers/accounts.py:addresses_stats_view_v0
 pub async fn get_addresses_stats_v0(
     State(state): State<Arc<AppState>>,
-    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    Query(params): Query<AddressesStatsQuery>,
 ) -> impl IntoResponse {
     if !state.has_db() {
         return Json(json!({
@@ -2432,9 +2434,7 @@ pub async fn get_addresses_stats_v0(
         }));
     }
     
-    let addresses = raw_query
-        .map(|q| extract_addresses_from_query(&q))
-        .unwrap_or_default();
+    let addresses = params.addresses.unwrap_or_default();
     
     if addresses.is_empty() {
         return Json(json!({
@@ -2485,7 +2485,7 @@ pub async fn get_addresses_stats_v0(
     }))
 }
 
-// ===== Address Files Endpoint
+// ===== Address Files Endpoint =====
 
 /// Query parameters for address files
 /// Reference: aleph/web/controllers/accounts.py:get_account_files
