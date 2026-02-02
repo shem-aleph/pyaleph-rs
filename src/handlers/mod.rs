@@ -88,7 +88,7 @@ impl From<HandlerError> for ProcessingStatus {
 /// 
 /// Contains all services needed by handlers.
 pub struct HandlerContext {
-    /// Database for persistence
+    /// Database for persistence (abstract trait)
     pub db: Option<Arc<dyn Database>>,
     /// Cryptographic service for signature verification
     pub crypto: Option<Arc<CryptoService>>,
@@ -96,6 +96,8 @@ pub struct HandlerContext {
     pub ipfs: Option<Arc<dyn IpfsService>>,
     /// Storage service for cost calculation
     pub storage: Option<Arc<dyn StorageService>>,
+    /// Direct PostgreSQL pool for handlers that need it
+    pub pool: Option<sqlx::PgPool>,
 }
 
 impl HandlerContext {
@@ -105,6 +107,7 @@ impl HandlerContext {
             crypto: None,
             ipfs: None,
             storage: None,
+            pool: None,
         }
     }
     
@@ -118,6 +121,7 @@ impl HandlerContext {
             crypto: Some(crypto),
             ipfs: None,
             storage: None,
+            pool: None,
         }
     }
 }

@@ -4,8 +4,8 @@
 //! 1. Parallel IPFS fetches (up to 20 concurrent)
 //! 2. Batch inserts (multi-value INSERT)
 //! 3. Higher pagination limit (5000)
-//! 4. Reduced sleeps
-//! 5. Better error handling with retries
+//! 4. Fetches individual message content for storage-type messages
+//! 5. Queues messages to pending_messages for handler processing
 
 use std::sync::Arc;
 use std::collections::HashSet;
@@ -14,12 +14,13 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 use sqlx::PgPool;
 use futures::future::join_all;
+use chrono::Utc;
 
 use crate::config::Config;
 use crate::chains::{start_indexers, ChainIndexer};
 use crate::chains::indexer::{IndexerClient, IndexerBlockchain, IndexerSyncEvent};
 use crate::db::SyncStateAccessor;
-use crate::types::{Chain, Message};
+use crate::types::{Chain, Message, ItemType};
 
 /// Sync interval in seconds
 const SYNC_INTERVAL_SECS: u64 = 12;
@@ -190,9 +191,12 @@ pub async fn run_indexer_sync(config: Arc<Config>, pool: PgPool, ipfs_url: &str)
         .build()
         .expect("Failed to build HTTP client");
     
-    info!("Starting OPTIMIZED indexer-based chain sync (max {} concurrent IPFS fetches)", MAX_CONCURRENT_IPFS);
+    // Use gateway for reading content (may not be pinned locally)
+    let gateway_url = config.ipfs.gateway_url.as_str();
     
-    let mut interval = interval(Duration::from_secs(15)); // Reduced from 30s
+    info!("Starting OPTIMIZED indexer-based chain sync (max {} concurrent IPFS fetches, with content resolution via gateway)", MAX_CONCURRENT_IPFS);
+    
+    let mut interval = interval(Duration::from_secs(15));
     
     loop {
         interval.tick().await;
@@ -201,6 +205,7 @@ pub async fn run_indexer_sync(config: Arc<Config>, pool: PgPool, ipfs_url: &str)
             &indexer_client,
             &ipfs_client,
             ipfs_url,
+            gateway_url,
             &pool,
             Chain::ETH,
         ).await {
@@ -209,11 +214,12 @@ pub async fn run_indexer_sync(config: Arc<Config>, pool: PgPool, ipfs_url: &str)
     }
 }
 
-/// OPTIMIZED: Sync with parallel IPFS fetches and batch inserts
+/// OPTIMIZED: Sync with parallel IPFS fetches, content resolution, and batch inserts
 async fn sync_chain_from_indexer_optimized(
     indexer: &IndexerClient,
     ipfs_client: &reqwest::Client,
     ipfs_url: &str,
+    gateway_url: &str,
     pool: &PgPool,
     chain: Chain,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -246,7 +252,7 @@ async fn sync_chain_from_indexer_optimized(
         
         info!("{}: Processing {} sync events in parallel (from ts {})", chain, events_count, start_ts);
         
-        // Collect unique IPFS CIDs to fetch
+        // Collect unique IPFS CIDs to fetch (batch files)
         let mut cids_to_fetch: Vec<(String, u64)> = Vec::new();
         for event in &events {
             if let Ok(sync_content) = IndexerClient::parse_sync_message(&event.message) {
@@ -254,7 +260,7 @@ async fn sync_chain_from_indexer_optimized(
             }
         }
         
-        // Parallel IPFS fetches
+        // Parallel IPFS fetches for batch files
         let fetch_futures: Vec<_> = cids_to_fetch.iter().map(|(cid, _ts)| {
             let sem = Arc::clone(&semaphore);
             let client = ipfs_client.clone();
@@ -273,7 +279,7 @@ async fn sync_chain_from_indexer_optimized(
         let mut all_messages: Vec<Message> = Vec::new();
         let mut successful_fetches = 0;
         
-        for (i, result) in ipfs_results.into_iter().enumerate() {
+        for result in ipfs_results.into_iter() {
             if let Some(content) = result {
                 if let Ok(batch) = serde_json::from_str::<IpfsBatchContent>(&content) {
                     all_messages.extend(batch.content.messages);
@@ -282,14 +288,22 @@ async fn sync_chain_from_indexer_optimized(
             }
         }
         
-        info!("{}: Fetched {} IPFS batches, {} total messages to insert", 
+        info!("{}: Fetched {} IPFS batches, {} total messages", 
               chain, successful_fetches, all_messages.len());
         
-        // Batch insert messages
+        // Resolve content for storage-type messages
         if !all_messages.is_empty() {
-            let inserted = batch_insert_messages(pool, &all_messages).await?;
+            let messages_with_content = resolve_message_contents(
+                ipfs_client,
+                gateway_url,
+                all_messages,
+                &semaphore,
+            ).await;
+            
+            // Batch insert messages AND queue for processing
+            let inserted = batch_insert_messages_and_queue(pool, &messages_with_content).await?;
             total_messages += inserted;
-            info!("{}: Inserted {} new messages", chain, inserted);
+            info!("{}: Inserted {} new messages (with content, queued for processing)", chain, inserted);
         }
         
         // Update cursor
@@ -313,7 +327,99 @@ async fn sync_chain_from_indexer_optimized(
     Ok(total_messages)
 }
 
-/// Fetch IPFS content with retries
+/// Resolve content for messages with item_type storage/ipfs
+async fn resolve_message_contents(
+    client: &reqwest::Client,
+    gateway_url: &str,
+    messages: Vec<Message>,
+    semaphore: &Arc<Semaphore>,
+) -> Vec<Message> {
+    // Separate messages that need content fetch
+    let (need_fetch, have_content): (Vec<_>, Vec<_>) = messages
+        .into_iter()
+        .partition(|m| {
+            (m.item_type == ItemType::Storage || m.item_type == ItemType::Ipfs) 
+                && m.item_content.is_none()
+        });
+    
+    if need_fetch.is_empty() {
+        return have_content;
+    }
+    
+    info!("Fetching content for {} storage-type messages via gateway", need_fetch.len());
+    
+    // Fetch content in parallel using gateway
+    let fetch_futures: Vec<_> = need_fetch.into_iter().map(|msg| {
+        let sem = Arc::clone(semaphore);
+        let client = client.clone();
+        let gateway = gateway_url.to_string();
+        let item_hash = msg.item_hash.clone();
+        
+        async move {
+            let _permit = sem.acquire().await.ok();
+            match fetch_from_gateway(&client, &gateway, &item_hash, 3).await {
+                Ok(content) => {
+                    // Create new message with content
+                    Message {
+                        item_content: Some(content),
+                        ..msg
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to fetch content for {}: {}", item_hash, e);
+                    msg // Return original without content
+                }
+            }
+        }
+    }).collect();
+    
+    let mut resolved: Vec<Message> = join_all(fetch_futures).await;
+    
+    // Count how many got content
+    let with_content = resolved.iter().filter(|m| m.item_content.is_some()).count();
+    info!("Resolved content for {}/{} messages", with_content, resolved.len());
+    
+    // Combine with messages that already had content
+    resolved.extend(have_content);
+    resolved
+}
+
+/// Fetch content from IPFS gateway with retries
+async fn fetch_from_gateway(
+    client: &reqwest::Client,
+    gateway_url: &str,
+    cid: &str,
+    max_retries: usize,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Gateway URL format: https://ipfs.aleph.im/ipfs/{cid}
+    let url = format!("{}/{}", gateway_url.trim_end_matches('/'), cid);
+    
+    for attempt in 0..max_retries {
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                return Ok(response.text().await?);
+            }
+            Ok(response) => {
+                if attempt < max_retries - 1 {
+                    tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+                } else {
+                    return Err(format!("Gateway fetch failed: {}", response.status()).into());
+                }
+            }
+            Err(e) => {
+                if attempt < max_retries - 1 {
+                    tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+    
+    Err("Max retries exceeded".into())
+}
+
+/// Fetch IPFS content with retries (local API)
 async fn fetch_ipfs_with_retry(
     client: &reqwest::Client,
     ipfs_url: &str,
@@ -347,8 +453,8 @@ async fn fetch_ipfs_with_retry(
     Err("Max retries exceeded".into())
 }
 
-/// OPTIMIZED: Batch insert messages using multi-value INSERT
-async fn batch_insert_messages(
+/// OPTIMIZED: Batch insert messages AND queue them to pending_messages for processing
+async fn batch_insert_messages_and_queue(
     pool: &PgPool,
     messages: &[Message],
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -357,15 +463,15 @@ async fn batch_insert_messages(
     }
     
     let mut total_inserted = 0;
+    let now = Utc::now().timestamp() as f64;
     
     // Process in batches
     for chunk in messages.chunks(DB_BATCH_SIZE) {
-        // Build multi-value INSERT
+        // Build multi-value INSERT for messages table
         let mut query = String::from(
             "INSERT INTO messages (item_hash, message_type, chain, sender, signature, item_type, item_content, channel, time, created_at) VALUES "
         );
         
-        let mut params: Vec<String> = Vec::new();
         let mut param_idx = 1;
         
         for (i, _) in chunk.iter().enumerate() {
@@ -380,10 +486,10 @@ async fn batch_insert_messages(
             param_idx += 9;
         }
         
-        query.push_str(" ON CONFLICT (item_hash) DO NOTHING");
+        query.push_str(" ON CONFLICT (item_hash) DO UPDATE SET item_content = EXCLUDED.item_content WHERE messages.item_content IS NULL RETURNING item_hash");
         
         // Build and execute query
-        let mut sqlx_query = sqlx::query(&query);
+        let mut sqlx_query = sqlx::query_scalar::<_, String>(&query);
         
         for msg in chunk {
             sqlx_query = sqlx_query
@@ -398,11 +504,86 @@ async fn batch_insert_messages(
                 .bind(msg.time);
         }
         
-        let result = sqlx_query.execute(pool).await?;
-        total_inserted += result.rows_affected() as usize;
+        // Get list of inserted/updated item_hashes
+        let affected_hashes: Vec<String> = sqlx_query.fetch_all(pool).await?;
+        let affected_count = affected_hashes.len();
+        
+        if affected_count > 0 {
+            // Queue messages that were inserted or had content updated
+            let affected_set: HashSet<&str> = affected_hashes.iter().map(|s| s.as_str()).collect();
+            let messages_to_queue: Vec<&Message> = chunk.iter()
+                .filter(|m| affected_set.contains(m.item_hash.as_str()) && m.item_content.is_some())
+                .collect();
+            
+            if !messages_to_queue.is_empty() {
+                queue_messages_for_processing(pool, &messages_to_queue, now).await?;
+            }
+        }
+        
+        total_inserted += affected_count;
     }
     
     Ok(total_inserted)
+}
+
+/// Queue messages for processing by inserting into pending_messages
+async fn queue_messages_for_processing(
+    pool: &PgPool,
+    messages: &[&Message],
+    now: f64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    
+    // Build multi-value INSERT for pending_messages
+    let mut query = String::from(
+        "INSERT INTO pending_messages (item_hash, message, reception_time, fetched, check_message, retries, next_attempt) VALUES "
+    );
+    
+    let mut param_idx = 1;
+    
+    for (i, _) in messages.iter().enumerate() {
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            param_idx, param_idx + 1, param_idx + 2, param_idx + 3, 
+            param_idx + 4, param_idx + 5, param_idx + 6
+        ));
+        param_idx += 7;
+    }
+    
+    query.push_str(" ON CONFLICT (item_hash) DO NOTHING");
+    
+    let mut sqlx_query = sqlx::query(&query);
+    
+    for msg in messages {
+        let message_json = serde_json::to_value(msg)?;
+        
+        sqlx_query = sqlx_query
+            .bind(&msg.item_hash)
+            .bind(message_json)
+            .bind(now)
+            .bind(true)  // fetched = true (we have content)
+            .bind(true)  // check_message
+            .bind(0i32)  // retries
+            .bind(now);  // next_attempt (process immediately)
+    }
+    
+    sqlx_query.execute(pool).await?;
+    
+    debug!("Queued {} messages for processing", messages.len());
+    Ok(())
+}
+
+/// Legacy function for backwards compatibility
+async fn batch_insert_messages(
+    pool: &PgPool,
+    messages: &[Message],
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    batch_insert_messages_and_queue(pool, messages).await
 }
 
 // Keep original functions for backwards compatibility
@@ -417,9 +598,9 @@ async fn fetch_ipfs_content(
 async fn parse_and_store_messages(
     pool: &PgPool,
     content: &str,
-    chain: Chain,
-    event: &IndexerSyncEvent,
+    _chain: Chain,
+    _event: &IndexerSyncEvent,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let batch: IpfsBatchContent = serde_json::from_str(content)?;
-    batch_insert_messages(pool, &batch.content.messages).await
+    batch_insert_messages_and_queue(pool, &batch.content.messages).await
 }

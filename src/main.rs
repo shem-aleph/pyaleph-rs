@@ -3,6 +3,9 @@
 //! This is the main binary for running an Aleph network node.
 
 use aleph_core::{Config, web, db, jobs};
+use aleph_core::services::CryptoService;
+use aleph_core::services::ipfs::IpfsService;
+use aleph_core::jobs::message_processor::ProcessorContext;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
                     let ipfs_url = config.ipfs.api_url.clone();
                     tokio::spawn(async move {
                         jobs::chain_sync::run_indexer_sync(
-                            config_arc,
+                            config_arc.clone(),
                             pool_clone,
                             &ipfs_url,
                         ).await;
@@ -122,8 +125,29 @@ async fn main() -> anyhow::Result<()> {
                 } else if args.sync {
                     info!("Starting direct RPC chain sync");
                     let pool_clone = pool.clone();
+                    let config_arc_sync = config_arc.clone();
                     tokio::spawn(async move {
-                        jobs::chain_sync::run_with_db(config_arc, pool_clone).await;
+                        jobs::chain_sync::run_with_db(config_arc_sync, pool_clone).await;
+                    });
+                }
+                
+                // Start message processor (processes pending messages into derived tables)
+                {
+                    info!("Starting message processor");
+                    let pool_clone = pool.clone();
+                    let config_arc_proc = Arc::new(config.clone());
+                    let crypto = Arc::new(CryptoService::new());
+                    let ipfs = Arc::new(IpfsService::new(&config.ipfs));
+                    
+                    let processor_ctx = Arc::new(ProcessorContext::new(
+                        pool_clone,
+                        crypto,
+                        ipfs,
+                        config_arc_proc,
+                    ));
+                    
+                    tokio::spawn(async move {
+                        jobs::message_processor::run(processor_ctx).await;
                     });
                 }
                 
