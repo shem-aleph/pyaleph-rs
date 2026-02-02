@@ -22,7 +22,6 @@ pub struct MessageDb {
     pub channel: Option<String>,
     pub time: f64,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// Pending message record
@@ -73,7 +72,6 @@ pub struct AggregateDb {
     /// Hash of the last revision message
     pub last_revision_hash: Option<String>,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// Aggregate element record
@@ -87,7 +85,6 @@ pub struct AggregateElementDb {
     pub content: serde_json::Value,
     pub time: f64,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// Post database record
@@ -108,9 +105,8 @@ pub struct PostDb {
     /// List of all amend hashes
     pub amends: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
-}
 
+}
 /// Balance database record
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct BalanceDb {
@@ -137,7 +133,6 @@ pub struct FilePinDb {
     pub size: i64,
     pub content_type: Option<String>,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// File tag record
@@ -147,7 +142,6 @@ pub struct FileTagDb {
     pub item_hash: String,
     pub tag: String,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// Program database record
@@ -161,7 +155,6 @@ pub struct ProgramDb {
     pub vcpus: i32,
     pub allow_amend: bool,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// Instance database record
@@ -178,7 +171,6 @@ pub struct InstanceDb {
     /// For confidential/trusted execution
     pub trusted_execution: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// VM version record
@@ -190,7 +182,6 @@ pub struct VmVersionDb {
     pub version: i32,
     pub owner: String,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// Chain transaction record
@@ -204,7 +195,6 @@ pub struct ChainTxDb {
     pub publisher: Option<String>,
     pub protocol: String,
     pub created_at: DateTime<Utc>,
-    pub trusted_source: bool,
 }
 
 /// Account cost record

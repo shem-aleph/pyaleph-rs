@@ -939,9 +939,16 @@ pub async fn get_posts(
         count_builder.and_lte("time", end);
     }
     
-    // NOTE: tags filter requires JSONB containment which QueryBuilder doesn't support yet
-    // Tags are stored in content->'tags' as a JSON array
-    // TODO: Add and_jsonb_contains to QueryBuilder for tags support
+    // Filter by tags (searches content->'tags' array)
+    if let Some(ref tags) = params.tags {
+        let tag_list = crate::db::parse_csv_param(tags);
+        // For each tag, add a condition that the content->'tags' array contains it
+        // Using AND logic: all specified tags must be present
+        for tag in tag_list {
+            builder.and_jsonb_array_contains("content", "tags", tag.clone());
+            count_builder.and_jsonb_array_contains("content", "tags", tag);
+        }
+    }
     
     // Determine sort column (validate against allowed columns)
     let allowed_sort = &["time", "address", "post_type", "channel"];
@@ -3190,4 +3197,104 @@ pub async fn get_metrics(
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         metrics
     )
+}
+
+/// Get detailed monitoring stats for dashboard
+pub async fn get_monitor_stats(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return Json(json!({
+            "error": "Database not available",
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }));
+    }
+    
+    let db = state.db();
+    
+    // Core counts
+    let pending: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_messages")
+        .fetch_one(db).await.unwrap_or((0,));
+    
+    let messages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages")
+        .fetch_one(db).await.unwrap_or((0,));
+    
+    let rejected: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rejected_messages")
+        .fetch_one(db).await.unwrap_or((0,));
+    
+    let posts: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts")
+        .fetch_one(db).await.unwrap_or((0,));
+    
+    let aggregates: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM aggregates")
+        .fetch_one(db).await.unwrap_or((0,));
+    
+    let programs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM programs")
+        .fetch_one(db).await.unwrap_or((0,));
+    
+    let instances: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM instances")
+        .fetch_one(db).await.unwrap_or((0,));
+    
+    let files: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM file_pins")
+        .fetch_one(db).await.unwrap_or((0,));
+    
+    // Messages by type for breakdown
+    let by_type: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT message_type, COUNT(*) FROM messages GROUP BY message_type ORDER BY COUNT(*) DESC"
+    ).fetch_all(db).await.unwrap_or_default();
+    
+    // Recent processing rate - messages added in last 5 minutes
+    let recent_rate: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages WHERE created_at > now() - interval '5 minutes'"
+    ).fetch_one(db).await.unwrap_or((0,));
+    
+    let msgs_per_sec = recent_rate.0 as f64 / 300.0;
+    
+    // Estimate time to drain pending queue (in seconds)
+    let eta_seconds = if msgs_per_sec > 0.0 {
+        Some((pending.0 as f64 / msgs_per_sec) as i64)
+    } else {
+        None
+    };
+    
+    // Format ETA as human readable
+    let eta_human = eta_seconds.map(|s| {
+        if s < 60 { format!("{}s", s) }
+        else if s < 3600 { format!("{}m {}s", s / 60, s % 60) }
+        else if s < 86400 { format!("{}h {}m", s / 3600, (s % 3600) / 60) }
+        else { format!("{}d {}h", s / 86400, (s % 86400) / 3600) }
+    });
+    
+    let mut types_map = serde_json::Map::new();
+    for (t, count) in by_type {
+        types_map.insert(t, json!(count));
+    }
+    
+    Json(json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "uptime_secs": state.metrics.uptime_secs(),
+        "counts": {
+            "pending_messages": pending.0,
+            "messages": messages.0,
+            "rejected_messages": rejected.0,
+            "posts": posts.0,
+            "aggregates": aggregates.0,
+            "programs": programs.0,
+            "instances": instances.0,
+            "files": files.0
+        },
+        "messages_by_type": types_map,
+        "processing": {
+            "rate_per_sec": msgs_per_sec,
+            "rate_per_min": msgs_per_sec * 60.0,
+            "recent_5min": recent_rate.0,
+            "eta_seconds": eta_seconds,
+            "eta_human": eta_human
+        }
+    }))
+}
+
+/// Serve the monitor dashboard
+pub async fn monitor_html() -> impl axum::response::IntoResponse {
+    let html = include_str!("../../static/monitor.html");
+    axum::response::Html(html)
 }

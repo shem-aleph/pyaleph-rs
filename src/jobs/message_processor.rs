@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 use sqlx::PgPool;
 use chrono::Utc;
@@ -24,7 +24,7 @@ use futures::stream::{self, StreamExt};
 const PROCESS_INTERVAL_MS: u64 = 50;
 
 /// Maximum messages to process per batch
-const BATCH_SIZE: i64 = 1000;
+const BATCH_SIZE: i64 = 2000;
 
 /// Maximum number of retries before rejecting a message
 const MAX_RETRIES: i32 = 10;
@@ -99,38 +99,62 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
     
     // Group messages by sender address for safe parallel processing
     // Messages from the same address must be processed sequentially
-    // (authorization messages must be processed before delegated writes)
+    const MAX_PER_ADDRESS: usize = 1000;  // Higher cap
+    // Blacklisted addresses (skip processing entirely)
+    const BLACKLISTED_ADDRESSES: &[&str] = &[
+        "0x51A58800b26AA1451aaA803d1746687cB88E0501", // UNSLASHED - 3.2M spam messages
+    ];
     use std::collections::HashMap;
     let mut by_address: HashMap<String, Vec<PendingMessageDb>> = HashMap::new();
+    let mut blacklisted_hashes: Vec<String> = Vec::new();
     for msg in pending_messages {
-        by_address.entry(msg.message.get("sender").and_then(|s| s.as_str()).unwrap_or("").to_string()).or_default().push(msg);
+        let addr = msg.message.get("sender").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        // Skip blacklisted addresses
+        if BLACKLISTED_ADDRESSES.contains(&addr.as_str()) {
+            blacklisted_hashes.push(msg.item_hash.clone());
+            continue;
+        }
+        let entry = by_address.entry(addr).or_default();
+        if entry.len() < MAX_PER_ADDRESS {
+            entry.push(msg);
+        }
+    }
+    // Delete blacklisted messages from pending
+    if !blacklisted_hashes.is_empty() {
+        tracing::info!("Skipping {} blacklisted messages", blacklisted_hashes.len());
+        let _ = batch_delete_pending(&ctx.db, &blacklisted_hashes).await;
     }
     
-    // Process address groups in parallel (up to 50 concurrent addresses)
+    tracing::info!("Processing {} address groups", by_address.len());
+    
+    // Process address groups in parallel (increased to 200 concurrent)
     let results: Vec<_> = stream::iter(by_address.into_values())
         .map(|address_msgs| {
             let ctx = ctx.clone();
             async move {
                 let mut group_results = Vec::new();
-                // Sequential processing within each address
                 for pending in address_msgs {
                     let hash = pending.item_hash.clone();
-                    let result = process_single_message(&ctx, &pending).await;
+                    let result = match timeout(std::time::Duration::from_secs(30), process_single_message(&ctx, &pending)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(ProcessorError::InvalidMessage("Timeout".to_string()))
+                    };
                     group_results.push((hash, pending, result));
                 }
                 group_results
             }
         })
-        .buffer_unordered(50)
+        .buffer_unordered(200)
         .collect::<Vec<_>>()
         .await;
     
     // Flatten results
     let results: Vec<_> = results.into_iter().flatten().collect();
-    
+    tracing::info!("Processed {} messages", results.len());
     // Batch collect successful deletions
     let mut to_delete: Vec<String> = Vec::new();
     let mut processed_count = 0u32;
+    tracing::info!("Results to process: {}", results.len());
     
     for (hash, pending, result) in results {
         match result {
@@ -138,9 +162,10 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
                 processed_count += 1;
                 match status {
                     ProcessResult::Processed => {
-                        to_delete.push(hash);
+                         to_delete.push(hash);
                     }
                     ProcessResult::Rejected(code, msg) => {
+                        tracing::info!("Message {} rejected: {:?} - {}", hash, code, msg);
                         let _ = move_to_rejected(&ctx.db, &pending, code, &msg).await;
                     }
                     ProcessResult::Retry(reason) => {
@@ -156,6 +181,7 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
     }
     
     // Batch delete processed messages
+    tracing::info!("End of batch: to_delete has {} items", to_delete.len());
     if !to_delete.is_empty() {
         batch_delete_pending(&ctx.db, &to_delete).await?;
     }
@@ -255,6 +281,7 @@ async fn process_single_message(
     let status = handlers::process_message(&message, &handler_ctx).await;
     
     // Step 8: Store result based on status
+    tracing::debug!("process_single_message status: {} for {}", status.status.as_str(), message.item_hash);
     match status.status.as_str() {
         "processed" => {
             // Store in messages table
@@ -347,28 +374,39 @@ async fn mark_fetched(db: &PgPool, item_hash: &str) -> Result<(), ProcessorError
 
 /// Delete a pending message after successful processing
 async fn delete_pending(db: &PgPool, item_hash: &str) -> Result<(), ProcessorError> {
-    sqlx::query("DELETE FROM pending_messages WHERE item_hash = $1")
+    let result = sqlx::query("DELETE FROM pending_messages WHERE item_hash = $1")
         .bind(item_hash)
         .execute(db)
-        .await
-        .map_err(|e| ProcessorError::Database(e.to_string()))?;
+        .await;
     
-    Ok(())
+    match &result {
+        Ok(r) => tracing::info!("delete_pending: {} rows affected for {}", r.rows_affected(), item_hash),
+        Err(e) => tracing::error!("delete_pending FAILED for {}: {}", item_hash, e),
+    }
+    
+    result.map(|_| ()).map_err(|e| ProcessorError::Database(e.to_string()))
 }
 
 /// Batch delete pending messages
 async fn batch_delete_pending(pool: &PgPool, hashes: &[String]) -> Result<(), ProcessorError> {
     if hashes.is_empty() {
+        tracing::debug!("batch_delete_pending: empty list, skipping");
         return Ok(());
     }
     
-    sqlx::query("DELETE FROM pending_messages WHERE item_hash = ANY($1)")
+    tracing::info!("batch_delete_pending: deleting {} hashes", hashes.len());
+    
+    let result = sqlx::query("DELETE FROM pending_messages WHERE item_hash = ANY($1)")
         .bind(hashes)
         .execute(pool)
-        .await
-        .map_err(|e| ProcessorError::Database(e.to_string()))?;
+        .await;
     
-    Ok(())
+    match &result {
+        Ok(r) => tracing::info!("batch_delete_pending: {} rows affected", r.rows_affected()),
+        Err(e) => tracing::error!("batch_delete_pending FAILED: {}", e),
+    }
+    
+    result.map(|_| ()).map_err(|e| ProcessorError::Database(e.to_string()))
 }
 
 /// Move a message to the rejected table
@@ -451,7 +489,7 @@ async fn store_processed_message(db: &PgPool, message: &Message) -> Result<(), P
             item_hash, message_type, chain, sender, signature, 
             item_type, item_content, channel, time, created_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-        ON CONFLICT (item_hash) DO NOTHING
+        ON CONFLICT (item_hash) DO UPDATE SET created_at = NOW()
         "#
     )
     .bind(&message.item_hash)

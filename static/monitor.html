@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pyaleph-rs Monitor</title>
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --accent: #58a6ff;
+            --green: #3fb950;
+            --yellow: #d29922;
+            --red: #f85149;
+            --purple: #a371f7;
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text);
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            color: var(--text);
+        }
+        
+        .header h1 span {
+            color: var(--accent);
+        }
+        
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--green);
+            animation: pulse 2s infinite;
+        }
+        
+        .status-dot.error {
+            background: var(--red);
+            animation: none;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+        }
+        
+        .card-title {
+            font-size: 12px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+        
+        .card-value {
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--text);
+            font-variant-numeric: tabular-nums;
+        }
+        
+        .card-value.accent { color: var(--accent); }
+        .card-value.green { color: var(--green); }
+        .card-value.yellow { color: var(--yellow); }
+        .card-value.red { color: var(--red); }
+        .card-value.purple { color: var(--purple); }
+        
+        .card-subtitle {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+        
+        .wide-card {
+            grid-column: 1 / -1;
+        }
+        
+        .progress-container {
+            margin-top: 16px;
+        }
+        
+        .progress-bar {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--green), var(--accent));
+            transition: width 0.5s ease;
+        }
+        
+        .progress-labels {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        
+        .types-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+        }
+        
+        .type-item {
+            background: var(--bg-dark);
+            border-radius: 6px;
+            padding: 12px;
+            text-align: center;
+        }
+        
+        .type-name {
+            font-size: 11px;
+            font-weight: 500;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+        
+        .type-count {
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--text);
+            font-variant-numeric: tabular-nums;
+        }
+        
+        .config-section {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        
+        .config-row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .config-row label {
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+        
+        .config-row input {
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 8px 12px;
+            color: var(--text);
+            font-size: 14px;
+            width: 300px;
+        }
+        
+        .config-row input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .config-row button {
+            background: var(--accent);
+            color: var(--bg-dark);
+            border: none;
+            border-radius: 4px;
+            padding: 8px 16px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        
+        .config-row button:hover {
+            opacity: 0.9;
+        }
+        
+        .refresh-info {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-left: auto;
+        }
+        
+        .error-banner {
+            background: rgba(248, 81, 73, 0.1);
+            border: 1px solid var(--red);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            color: var(--red);
+            display: none;
+        }
+        
+        .history-list {
+            margin-top: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .history-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+        }
+        
+        .history-item:last-child {
+            border-bottom: none;
+        }
+        
+        .history-time {
+            color: var(--text-muted);
+        }
+        
+        .history-delta {
+            font-weight: 500;
+        }
+        
+        .history-delta.positive { color: var(--green); }
+        .history-delta.negative { color: var(--red); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>pyaleph-rs <span>Monitor</span></h1>
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Connecting...</span>
+        </div>
+    </div>
+    
+    <div class="error-banner" id="errorBanner"></div>
+    
+    <div class="config-section">
+        <div class="config-row">
+            <label for="apiUrl">API URL:</label>
+            <input type="text" id="apiUrl" value="http://[2a01:240:ad00:2503:3:d785:ba28:c781]:8080/api/v0/monitor" placeholder="http://[2a01:240:ad00:2503:3:d785:ba28:c781]:8080/api/v0/monitor">
+            <button onclick="connect()">Connect</button>
+            <span class="refresh-info">Auto-refresh: <span id="refreshInterval">5</span>s | Last: <span id="lastUpdate">--</span></span>
+        </div>
+    </div>
+    
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">Pending Messages</div>
+            <div class="card-value yellow" id="pending">--</div>
+            <div class="card-subtitle">Waiting to be processed</div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">Processed Messages</div>
+            <div class="card-value green" id="messages">--</div>
+            <div class="card-subtitle">Successfully stored</div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">Rejected Messages</div>
+            <div class="card-value red" id="rejected">--</div>
+            <div class="card-subtitle">Failed validation</div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">Processing Rate</div>
+            <div class="card-value accent" id="rate">--</div>
+            <div class="card-subtitle" id="rateSubtitle">messages/second</div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">ETA to Drain Queue</div>
+            <div class="card-value purple" id="eta">--</div>
+            <div class="card-subtitle" id="etaSubtitle">estimated time remaining</div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">Uptime</div>
+            <div class="card-value" id="uptime">--</div>
+            <div class="card-subtitle">since last restart</div>
+        </div>
+    </div>
+    
+    <div class="grid">
+        <div class="card wide-card">
+            <div class="card-title">Processing Progress</div>
+            <div class="progress-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+                </div>
+                <div class="progress-labels">
+                    <span id="progressProcessed">0 processed</span>
+                    <span id="progressPercent">0%</span>
+                    <span id="progressPending">0 pending</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">Messages by Type</div>
+            <div class="types-grid" id="typesGrid">
+                <!-- Populated by JS -->
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">Other Counts</div>
+            <div class="types-grid" id="otherCounts">
+                <!-- Populated by JS -->
+            </div>
+        </div>
+    </div>
+    
+    <div class="grid">
+        <div class="card wide-card">
+            <div class="card-title">Processing History (last 10 updates)</div>
+            <div class="history-list" id="historyList">
+                <div class="history-item">
+                    <span>Waiting for data...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Default: works with SSH tunnel (ssh -L 8080:localhost:8080 -p 24007 root@46.247.131.210)
+        let apiUrl = localStorage.getItem('pyaleph-monitor-url') || 'http://[2a01:240:ad00:2503:3:d785:ba28:c781]:8080/api/v0/monitor';
+        let refreshTimer = null;
+        let history = [];
+        let lastData = null;
+        
+        document.getElementById('apiUrl').value = apiUrl;
+        
+        function formatNumber(n) {
+            if (n === null || n === undefined) return '--';
+            return n.toLocaleString();
+        }
+        
+        function formatUptime(secs) {
+            if (!secs) return '--';
+            const days = Math.floor(secs / 86400);
+            const hours = Math.floor((secs % 86400) / 3600);
+            const mins = Math.floor((secs % 3600) / 60);
+            const s = secs % 60;
+            
+            if (days > 0) return `${days}d ${hours}h ${mins}m`;
+            if (hours > 0) return `${hours}h ${mins}m ${s}s`;
+            if (mins > 0) return `${mins}m ${s}s`;
+            return `${s}s`;
+        }
+        
+        function showError(msg) {
+            const banner = document.getElementById('errorBanner');
+            banner.textContent = msg;
+            banner.style.display = 'block';
+            document.getElementById('statusDot').classList.add('error');
+            document.getElementById('statusText').textContent = 'Error';
+        }
+        
+        function hideError() {
+            document.getElementById('errorBanner').style.display = 'none';
+            document.getElementById('statusDot').classList.remove('error');
+        }
+        
+        function updateHistory(newData) {
+            if (lastData && lastData.counts) {
+                const delta = newData.counts.messages - lastData.counts.messages;
+                const time = new Date().toLocaleTimeString();
+                history.unshift({ time, delta, messages: newData.counts.messages });
+                if (history.length > 10) history.pop();
+                
+                const list = document.getElementById('historyList');
+                list.innerHTML = history.map(h => `
+                    <div class="history-item">
+                        <span class="history-time">${h.time}</span>
+                        <span>Messages: ${formatNumber(h.messages)}</span>
+                        <span class="history-delta ${h.delta >= 0 ? 'positive' : 'negative'}">
+                            ${h.delta >= 0 ? '+' : ''}${formatNumber(h.delta)}
+                        </span>
+                    </div>
+                `).join('');
+            }
+            lastData = newData;
+        }
+        
+        async function fetchStats() {
+            try {
+                const response = await fetch(apiUrl);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                
+                const data = await response.json();
+                hideError();
+                
+                document.getElementById('statusText').textContent = 'Connected';
+                document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                
+                // Update main stats
+                const counts = data.counts || {};
+                document.getElementById('pending').textContent = formatNumber(counts.pending_messages);
+                document.getElementById('messages').textContent = formatNumber(counts.messages);
+                document.getElementById('rejected').textContent = formatNumber(counts.rejected_messages);
+                
+                // Processing rate
+                const proc = data.processing || {};
+                const rate = proc.rate_per_sec || 0;
+                document.getElementById('rate').textContent = rate.toFixed(2);
+                document.getElementById('rateSubtitle').textContent = `${formatNumber(Math.round(proc.rate_per_min || 0))}/min`;
+                
+                // ETA
+                document.getElementById('eta').textContent = proc.eta_human || 'N/A';
+                if (proc.eta_seconds) {
+                    document.getElementById('etaSubtitle').textContent = `${formatNumber(proc.eta_seconds)} seconds`;
+                }
+                
+                // Uptime
+                document.getElementById('uptime').textContent = formatUptime(data.uptime_secs);
+                
+                // Progress bar
+                const total = (counts.messages || 0) + (counts.pending_messages || 0);
+                const percent = total > 0 ? ((counts.messages || 0) / total * 100) : 0;
+                document.getElementById('progressFill').style.width = percent + '%';
+                document.getElementById('progressProcessed').textContent = formatNumber(counts.messages) + ' processed';
+                document.getElementById('progressPending').textContent = formatNumber(counts.pending_messages) + ' pending';
+                document.getElementById('progressPercent').textContent = percent.toFixed(1) + '%';
+                
+                // Messages by type
+                const typesGrid = document.getElementById('typesGrid');
+                const types = data.messages_by_type || {};
+                typesGrid.innerHTML = Object.entries(types)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([type, count]) => `
+                        <div class="type-item">
+                            <div class="type-name">${type}</div>
+                            <div class="type-count">${formatNumber(count)}</div>
+                        </div>
+                    `).join('');
+                
+                // Other counts
+                const otherCounts = document.getElementById('otherCounts');
+                const others = [
+                    ['Posts', counts.posts],
+                    ['Aggregates', counts.aggregates],
+                    ['Programs', counts.programs],
+                    ['Instances', counts.instances],
+                    ['Files', counts.files]
+                ];
+                otherCounts.innerHTML = others.map(([name, count]) => `
+                    <div class="type-item">
+                        <div class="type-name">${name}</div>
+                        <div class="type-count">${formatNumber(count)}</div>
+                    </div>
+                `).join('');
+                
+                updateHistory(data);
+                
+            } catch (error) {
+                showError(`Failed to fetch stats: ${error.message}`);
+            }
+        }
+        
+        function connect() {
+            apiUrl = document.getElementById('apiUrl').value.trim();
+            localStorage.setItem('pyaleph-monitor-url', apiUrl);
+            
+            if (refreshTimer) clearInterval(refreshTimer);
+            
+            document.getElementById('statusText').textContent = 'Connecting...';
+            fetchStats();
+            refreshTimer = setInterval(fetchStats, 5000);
+        }
+        
+        // Auto-connect on load
+        connect();
+    </script>
+</body>
+</html>

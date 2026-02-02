@@ -155,6 +155,7 @@ pub fn create_router(config: &Config, state: Arc<AppState>) -> Router {
         // Health check
         .route("/", axum::routing::get(handlers::health_check))
         .route("/health", axum::routing::get(handlers::health_check))
+        .route("/monitor.html", axum::routing::get(handlers::monitor_html))
         
         // WebSocket endpoint
         .route("/ws", axum::routing::get(websocket::ws_handler))

@@ -105,6 +105,7 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         
         // Statistics
         .route("/stats", get(handlers::get_stats))
+        .route("/monitor", get(handlers::get_monitor_stats))
         .route("/stats/:address", get(handlers::get_address_stats))
         
         // Pending messages - matches pyaleph /pending endpoint
