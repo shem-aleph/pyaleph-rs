@@ -162,10 +162,10 @@ impl QueryBuilder {
     /// Casts TEXT to JSONB and extracts the field value
     pub fn and_jsonb_text_eq(&mut self, column: &str, json_path: &str, value: String) -> &mut Self {
         // Validate column and path names
-        if !column.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if !column.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
             panic!("Invalid column name: {}", column);
         }
-        if !json_path.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        if !json_path.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '.') {
             panic!("Invalid json path: {}", json_path);
         }
         
@@ -186,10 +186,10 @@ impl QueryBuilder {
         }
         
         // Validate column and path names
-        if !column.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if !column.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
             panic!("Invalid column name: {}", column);
         }
-        if !json_path.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        if !json_path.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '.') {
             panic!("Invalid json path: {}", json_path);
         }
         
@@ -223,10 +223,10 @@ impl QueryBuilder {
     /// Supports nested paths like "content.tags"
     pub fn and_jsonb_array_contains(&mut self, column: &str, json_path: &str, value: String) -> &mut Self {
         // Validate column and path names
-        if !column.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if !column.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
             panic!("Invalid column name: {}", column);
         }
-        if !json_path.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        if !json_path.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '.') {
             panic!("Invalid json path: {}", json_path);
         }
         
@@ -255,7 +255,7 @@ impl QueryBuilder {
     /// * `ascending` - true for ASC, false for DESC
     pub fn order_by(&mut self, column: &str, ascending: bool) -> &mut Self {
         // Validate column name to prevent injection (alphanumeric and underscore only)
-        if !column.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if !column.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
             panic!("Invalid column name: {}", column);
         }
         
