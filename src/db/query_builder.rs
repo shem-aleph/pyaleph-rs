@@ -145,6 +145,19 @@ impl QueryBuilder {
         self
     }
 
+    
+    /// Add a raw AND condition (use carefully - values in the clause are NOT parameterized)
+    ///
+    /// This is intended for subqueries or complex conditions that cannot be expressed
+    /// with the typed methods. The caller is responsible for ensuring the clause is safe.
+    pub fn and_raw(&mut self, clause: &str) -> &mut Self {
+        self.query.push_str(" AND ");
+        self.query.push_str(clause);
+        self.count_query.push_str(" AND ");
+        self.count_query.push_str(clause);
+        self
+    }
+
     /// Add an AND condition for JSONB text field equality
     /// Casts TEXT to JSONB and extracts the field value
     pub fn and_jsonb_text_eq(&mut self, column: &str, json_path: &str, value: String) -> &mut Self {

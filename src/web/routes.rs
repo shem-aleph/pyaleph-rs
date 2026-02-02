@@ -18,6 +18,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         // API v0 routes (main API)
         .nest("/api/v0", api_v0())
+        // API ws0 routes (WebSocket compatibility with pyaleph)
+        .nest("/api/ws0", api_ws0())
         // Legacy routes (backwards compatibility)
         .merge(legacy_routes())
         // Internal/admin routes
@@ -62,6 +64,11 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/credits/:address", get(handlers::get_credit_balance))
         .route("/credit_balances", get(handlers::get_credit_balances))
         
+        // Address stats, files, credit history
+        .route("/addresses/stats.json", get(handlers::get_addresses_stats_v0))
+        .route("/addresses/:address/files", get(handlers::get_address_files))
+        .route("/addresses/:address/credit_history", get(handlers::get_address_credit_history))
+        
         // Programs & Instances
         .route("/programs/:address", get(handlers::get_programs))
         .route("/programs", get(handlers::list_programs))
@@ -73,6 +80,7 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         
         // Pricing & Costs
         .route("/price", get(handlers::get_pricing))
+        .route("/price/:hash", get(handlers::get_message_price))
         .route("/pricing", get(handlers::get_pricing))
         // TODO: handler not implemented yet
         // .route("/price/:hash", get(handlers::get_message_price))
@@ -91,6 +99,17 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         
         // WebSocket - real-time message streaming
         .route("/ws", get(websocket::ws_handler))
+}
+
+/// API ws0 routes (WebSocket compatibility with pyaleph)
+/// Python uses /api/ws0/messages while we have /api/v0/ws
+fn api_ws0() -> Router<Arc<AppState>> {
+    Router::new()
+        // WebSocket messages endpoint (pyaleph compatibility)
+        // Supports query params: addresses, channels, msgTypes, hashes, history
+        .route("/messages", get(websocket::ws_handler))
+        // WebSocket status endpoint
+        .route("/status", get(handlers::health_check))
 }
 
 /// Legacy routes for backwards compatibility

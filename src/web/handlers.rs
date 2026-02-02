@@ -157,6 +157,16 @@ pub struct MessageQuery {
     /// Sort field: "time" (default) or "tx-time"
     #[serde(rename = "sortBy")]
     pub sort_by: Option<SortBy>,
+    /// Message statuses filter (comma-separated: processed,pending,rejected,forgotten)
+    /// Default: processed,removing (matches pyaleph behavior)
+    #[serde(rename = "msgStatuses")]
+    pub msg_statuses: Option<String>,
+    /// Start block number filter (inclusive) - filters via chain_txs.height
+    #[serde(rename = "startBlock")]
+    pub start_block: Option<i64>,
+    /// End block number filter (inclusive) - filters via chain_txs.height
+    #[serde(rename = "endBlock")]
+    pub end_block: Option<i64>,
 }
 
 /// List messages - matches pyaleph /messages.json response format
@@ -181,6 +191,26 @@ pub async fn list_messages(
             "pagination_page": page,
             "pagination_per_page": per_page,
             "error": "Database not available"
+        }));
+    }
+    
+    // Parse msgStatuses filter - messages table only contains PROCESSED messages
+    // Default: ["processed", "removing"] to match pyaleph behavior
+    let status_list: Vec<String> = params.msg_statuses
+        .as_ref()
+        .map(|s| crate::db::parse_csv_param(s).iter().map(|x| x.to_lowercase()).collect())
+        .unwrap_or_else(|| vec!["processed".to_string(), "removing".to_string()]);
+    
+    // The messages table only contains processed messages
+    // If the filter does not include "processed" or "removing", return empty
+    let include_processed = status_list.iter().any(|s| s == "processed" || s == "removing");
+    if !include_processed {
+        return Json(json!({
+            "messages": [],
+            "pagination_total": 0,
+            "pagination_page": page,
+            "pagination_per_page": per_page,
+            "pagination_item": "messages",
         }));
     }
     
@@ -214,6 +244,27 @@ pub async fn list_messages(
     }
     if let Some(end) = params.end_date {
         builder.and_lte("time", end);
+    }
+    
+    // Block number filters (via chain_txs JOIN)
+    // If startBlock or endBlock specified, filter by chain_txs.height
+    if params.start_block.is_some() || params.end_block.is_some() {
+        // Build subquery to get item_hashes matching block range
+        let mut block_conditions = Vec::new();
+        let mut block_params: Vec<String> = Vec::new();
+        
+        if let Some(start_block) = params.start_block {
+            block_conditions.push(format!("height >= {}", start_block));
+        }
+        if let Some(end_block) = params.end_block {
+            block_conditions.push(format!("height <= {}", end_block));
+        }
+        
+        let block_filter = format!(
+            "item_hash IN (SELECT item_hash FROM chain_txs WHERE {})",
+            block_conditions.join(" AND ")
+        );
+        builder.and_raw(&block_filter);
     }
     
     // Order and pagination - use sortBy to determine column
@@ -253,6 +304,22 @@ pub async fn list_messages(
     }
     if let Some(end) = params.end_date {
         count_builder.and_lte("time", end);
+    }
+    
+    // Block number filters for count query
+    if params.start_block.is_some() || params.end_block.is_some() {
+        let mut block_conditions = Vec::new();
+        if let Some(start_block) = params.start_block {
+            block_conditions.push(format!("height >= {}", start_block));
+        }
+        if let Some(end_block) = params.end_block {
+            block_conditions.push(format!("height <= {}", end_block));
+        }
+        let block_filter = format!(
+            "item_hash IN (SELECT item_hash FROM chain_txs WHERE {})",
+            block_conditions.join(" AND ")
+        );
+        count_builder.and_raw(&block_filter);
     }
     
     let (count_query, count_args) = count_builder.build();
@@ -2069,4 +2136,961 @@ pub async fn list_aggregates(
         "pagination_page": page,
         "pagination_per_page": per_page,
     }))
+}
+
+// ===== Message Price Endpoint =====
+
+/// Cost detail item in price response
+/// Reference: aleph/schemas/api/costs.py:EstimatedCostDetailResponse
+#[derive(Debug, Clone, Serialize)]
+pub struct CostDetailItem {
+    #[serde(rename = "type")]
+    pub cost_type: String,
+    pub name: String,
+    pub cost_hold: String,
+    pub cost_stream: String,
+    pub cost_credit: String,
+}
+
+/// Message price response
+/// Reference: aleph/schemas/api/costs.py:EstimatedCostsResponse
+#[derive(Debug, Clone, Serialize)]
+pub struct MessagePriceResponse {
+    pub required_tokens: f64,
+    pub payment_type: String,
+    pub cost: String,
+    pub detail: Vec<CostDetailItem>,
+    pub charged_address: String,
+}
+
+/// Get price for an executable message (program or instance)
+/// Matches pyaleph /api/v0/price/{item_hash} format
+/// Reference: aleph/web/controllers/prices.py:message_price
+pub async fn get_message_price(
+    State(state): State<Arc<AppState>>,
+    Path(item_hash): Path<String>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+    
+    // First, check if message exists and get its type
+    let message = sqlx::query_as::<_, crate::db::models::MessageDb>(
+        "SELECT * FROM messages WHERE item_hash = $1"
+    )
+    .bind(&item_hash)
+    .fetch_optional(state.db())
+    .await;
+    
+    match message {
+        Ok(Some(msg)) => {
+            let message_type = msg.message_type.to_uppercase();
+            
+            // Only executable messages (PROGRAM, INSTANCE) and STORE have prices
+            match message_type.as_str() {
+                "PROGRAM" => {
+                    // Get program details
+                    let program = sqlx::query_as::<_, crate::db::models::ProgramDb>(
+                        "SELECT * FROM programs WHERE item_hash = $1"
+                    )
+                    .bind(&item_hash)
+                    .fetch_optional(state.db())
+                    .await;
+                    
+                    match program {
+                        Ok(Some(prog)) => {
+                            // Calculate cost for this program
+                            let hours = 24 * 30; // Monthly cost estimate
+                            let storage_mib = 20480u64; // Default 20GB storage
+                            
+                            if let Some(cost) = state.cost.calculate_instance_cost(
+                                prog.memory as u32,
+                                prog.vcpus as u32,
+                                storage_mib,
+                                hours,
+                                ProductPriceType::Program,
+                                false, // internet_enabled - would need to parse content
+                            ).await {
+                                let required_tokens = cost.holding.to_string().parse::<f64>().unwrap_or(0.0);
+                                let compute_units = state.cost.calculate_compute_units(prog.memory as u32, prog.vcpus as u32);
+                                
+                                (StatusCode::OK, Json(json!({
+                                    "required_tokens": required_tokens,
+                                    "payment_type": "hold",
+                                    "cost": format!("{:.6} ALEPH", required_tokens),
+                                    "detail": [
+                                        {
+                                            "type": "compute",
+                                            "name": format!("{} compute units", compute_units),
+                                            "cost_hold": cost.holding.to_string(),
+                                            "cost_stream": cost.payg.to_string(),
+                                            "cost_credit": cost.credit.to_string()
+                                        }
+                                    ],
+                                    "charged_address": prog.owner,
+                                })))
+                            } else {
+                                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                                    "error": "Unable to calculate cost"
+                                })))
+                            }
+                        }
+                        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({
+                            "error": "Program not found in programs table",
+                            "item_hash": item_hash
+                        }))),
+                        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                            "error": e.to_string()
+                        }))),
+                    }
+                }
+                "INSTANCE" => {
+                    // Get instance details
+                    let instance = sqlx::query_as::<_, crate::db::models::InstanceDb>(
+                        "SELECT * FROM instances WHERE item_hash = $1"
+                    )
+                    .bind(&item_hash)
+                    .fetch_optional(state.db())
+                    .await;
+                    
+                    match instance {
+                        Ok(Some(inst)) => {
+                            // Determine product type from payment_type and trusted_execution
+                            let product_type = if inst.trusted_execution.is_some() {
+                                ProductPriceType::InstanceConfidential
+                            } else {
+                                ProductPriceType::Instance
+                            };
+                            
+                            // Determine payment type
+                            let payment_type = inst.payment_type.as_deref().unwrap_or("hold");
+                            
+                            let hours = 24 * 30; // Monthly cost estimate
+                            let storage_mib = 40960u64; // Default 40GB storage for instances
+                            
+                            if let Some(cost) = state.cost.calculate_instance_cost(
+                                inst.memory as u32,
+                                inst.vcpus as u32,
+                                storage_mib,
+                                hours,
+                                product_type,
+                                false, // internet_enabled
+                            ).await {
+                                let required_tokens = match payment_type {
+                                    "credit" => cost.credit.to_string().parse::<f64>().unwrap_or(0.0),
+                                    "superfluid" | "stream" => cost.payg.to_string().parse::<f64>().unwrap_or(0.0),
+                                    _ => cost.holding.to_string().parse::<f64>().unwrap_or(0.0),
+                                };
+                                let compute_units = state.cost.calculate_compute_units(inst.memory as u32, inst.vcpus as u32);
+                                
+                                (StatusCode::OK, Json(json!({
+                                    "required_tokens": required_tokens,
+                                    "payment_type": payment_type,
+                                    "cost": format!("{:.6} ALEPH", required_tokens),
+                                    "detail": [
+                                        {
+                                            "type": "compute",
+                                            "name": format!("{} compute units", compute_units),
+                                            "cost_hold": cost.holding.to_string(),
+                                            "cost_stream": cost.payg.to_string(),
+                                            "cost_credit": cost.credit.to_string()
+                                        }
+                                    ],
+                                    "charged_address": inst.owner,
+                                })))
+                            } else {
+                                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                                    "error": "Unable to calculate cost"
+                                })))
+                            }
+                        }
+                        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({
+                            "error": "Instance not found in instances table",
+                            "item_hash": item_hash
+                        }))),
+                        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                            "error": e.to_string()
+                        }))),
+                    }
+                }
+                "STORE" => {
+                    // For STORE messages, return storage cost
+                    // Need to get file size from file_pins or content
+                    let file_pin = sqlx::query_as::<_, (i64,)>(
+                        "SELECT size FROM file_pins WHERE item_hash = $1"
+                    )
+                    .bind(&item_hash)
+                    .fetch_optional(state.db())
+                    .await;
+                    
+                    let size_bytes = match file_pin {
+                        Ok(Some((size,))) => size as u64,
+                        _ => 0u64,
+                    };
+                    
+                    let size_mib = size_bytes / (1024 * 1024);
+                    let hours = 24 * 30; // Monthly
+                    
+                    if let Some(cost) = state.cost.calculate_storage_cost(size_mib.max(1), hours, ProductPriceType::Storage).await {
+                        let required_tokens = cost.holding.to_string().parse::<f64>().unwrap_or(0.0);
+                        
+                        (StatusCode::OK, Json(json!({
+                            "required_tokens": required_tokens,
+                            "payment_type": "hold",
+                            "cost": format!("{:.6} ALEPH", required_tokens),
+                            "detail": [
+                                {
+                                    "type": "storage",
+                                    "name": format!("{} MiB", size_mib),
+                                    "cost_hold": cost.holding.to_string(),
+                                    "cost_stream": cost.payg.to_string(),
+                                    "cost_credit": cost.credit.to_string()
+                                }
+                            ],
+                            "charged_address": msg.sender,
+                        })))
+                    } else {
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                            "error": "Unable to calculate storage cost"
+                        })))
+                    }
+                }
+                _ => {
+                    // Not a priced message type
+                    (StatusCode::BAD_REQUEST, Json(json!({
+                        "error": format!("Message type '{}' does not have pricing. Only PROGRAM, INSTANCE, and STORE messages have prices.", message_type),
+                        "item_hash": item_hash,
+                        "message_type": message_type
+                    })))
+                }
+            }
+        }
+        Ok(None) => {
+            // Check if pending
+            let pending = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM pending_messages WHERE item_hash = $1)"
+            )
+            .bind(&item_hash)
+            .fetch_one(state.db())
+            .await
+            .unwrap_or(false);
+            
+            if pending {
+                (StatusCode::ACCEPTED, Json(json!({
+                    "error": "Message still pending",
+                    "item_hash": item_hash,
+                    "status": "pending"
+                })))
+            } else {
+                (StatusCode::NOT_FOUND, Json(json!({
+                    "error": "Message not found",
+                    "item_hash": item_hash
+                })))
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+            "error": e.to_string()
+        }))),
+    }
+}
+
+// ===== Address Stats Endpoint =====
+
+/// Query parameters for addresses stats (v0)
+/// Reference: aleph/web/controllers/accounts.py:addresses_stats_view_v0
+#[derive(Debug, Deserialize)]
+pub struct AddressesStatsQuery {
+    /// addresses[] parameter - can be repeated
+    #[serde(rename = "addresses[]")]
+    pub addresses: Option<Vec<String>>,
+}
+
+/// Address stats item
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressStatsItem {
+    pub messages: i64,
+    pub aggregate: i64,
+    pub forget: i64,
+    pub instance: i64,
+    pub post: i64,
+    pub program: i64,
+    pub store: i64,
+}
+
+/// Get address statistics (v0) - matches pyaleph format
+/// Returns message counts by type for specified addresses
+/// Reference: aleph/web/controllers/accounts.py:addresses_stats_view_v0
+pub async fn get_addresses_stats_v0(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AddressesStatsQuery>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return Json(json!({
+            "data": {},
+            "error": "Database not available"
+        }));
+    }
+    
+    let addresses = params.addresses.unwrap_or_default();
+    
+    if addresses.is_empty() {
+        return Json(json!({
+            "data": {}
+        }));
+    }
+    
+    // Query message counts by type for each address
+    let stats: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT sender, message_type, COUNT(*) as count \
+         FROM messages \
+         WHERE sender = ANY($1) \
+         GROUP BY sender, message_type"
+    )
+    .bind(&addresses)
+    .fetch_all(state.db())
+    .await
+    .unwrap_or_default();
+    
+    // Aggregate stats by address
+    let mut data: std::collections::HashMap<String, AddressStatsItem> = std::collections::HashMap::new();
+    
+    for (sender, msg_type, count) in stats {
+        let entry = data.entry(sender).or_insert_with(|| AddressStatsItem {
+            messages: 0,
+            aggregate: 0,
+            forget: 0,
+            instance: 0,
+            post: 0,
+            program: 0,
+            store: 0,
+        });
+        
+        match msg_type.to_uppercase().as_str() {
+            "AGGREGATE" => entry.aggregate = count,
+            "FORGET" => entry.forget = count,
+            "INSTANCE" => entry.instance = count,
+            "POST" => entry.post = count,
+            "PROGRAM" => entry.program = count,
+            "STORE" => entry.store = count,
+            _ => {}
+        }
+        entry.messages += count;
+    }
+    
+    Json(json!({
+        "data": data
+    }))
+}
+
+// ===== Address Files Endpoint =====
+
+/// Query parameters for address files
+/// Reference: aleph/web/controllers/accounts.py:get_account_files
+#[derive(Debug, Deserialize)]
+pub struct AddressFilesQuery {
+    pub pagination: Option<u32>,
+    pub page: Option<u32>,
+    /// Sort order: 1 for ascending, -1 for descending (default: -1)
+    #[serde(rename = "sortOrder")]
+    pub sort_order: Option<i8>,
+}
+
+/// File item in response
+#[derive(Debug, Clone, Serialize)]
+pub struct FileItem {
+    pub file_hash: String,
+    pub created: String,
+    pub item_hash: String,
+    pub size: i64,
+    #[serde(rename = "type")]
+    pub file_type: Option<String>,
+}
+
+/// Get files for an address - matches pyaleph format
+/// Reference: aleph/web/controllers/accounts.py:get_account_files
+pub async fn get_address_files(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+    Query(params): Query<AddressFilesQuery>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+    
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.pagination.unwrap_or(20).min(1000);
+    let offset = ((page - 1) * per_page) as i64;
+    let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
+    
+    // Get files from file_pins table
+    let order_clause = if ascending { "ASC" } else { "DESC" };
+    let query = format!(
+        "SELECT item_hash, owner, size, content_type, created_at \
+         FROM file_pins \
+         WHERE owner = $1 \
+         ORDER BY created_at {} \
+         LIMIT $2 OFFSET $3",
+        order_clause
+    );
+    
+    let files: Vec<crate::db::models::FilePinDb> = sqlx::query_as(&query)
+        .bind(&address)
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default();
+    
+    if files.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(json!({
+            "error": "No files found for this address"
+        })));
+    }
+    
+    // Get total count and size
+    let stats: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*), SUM(size) FROM file_pins WHERE owner = $1"
+    )
+    .bind(&address)
+    .fetch_one(state.db())
+    .await
+    .unwrap_or((0, None));
+    
+    let total_files = stats.0;
+    let total_size = stats.1.unwrap_or(0);
+    
+    // Format response
+    let file_items: Vec<FileItem> = files.into_iter().map(|f| FileItem {
+        file_hash: f.item_hash.clone(),
+        created: f.created_at.to_rfc3339(),
+        item_hash: f.item_hash,
+        size: f.size,
+        file_type: f.content_type,
+    }).collect();
+    
+    (StatusCode::OK, Json(json!({
+        "address": address,
+        "total_size": total_size,
+        "files": file_items,
+        "pagination_page": page,
+        "pagination_total": total_files,
+        "pagination_per_page": per_page,
+    })))
+}
+
+// ===== Address Credit History Endpoint =====
+
+/// Query parameters for credit history
+/// Reference: aleph/web/controllers/accounts.py:get_account_credit_history
+#[derive(Debug, Deserialize)]
+pub struct CreditHistoryQuery {
+    pub pagination: Option<u32>,
+    pub page: Option<u32>,
+    pub tx_hash: Option<String>,
+    pub token: Option<String>,
+    pub chain: Option<String>,
+    pub provider: Option<String>,
+    pub origin: Option<String>,
+    pub origin_ref: Option<String>,
+    pub payment_method: Option<String>,
+}
+
+/// Credit history item
+#[derive(Debug, Clone, Serialize)]
+pub struct CreditHistoryItem {
+    pub amount: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bonus_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiration_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_timestamp: Option<String>,
+}
+
+/// Get credit history for an address - matches pyaleph format
+/// Reference: aleph/web/controllers/accounts.py:get_account_credit_history
+/// Note: Returns 404 if credit_history table does not exist
+pub async fn get_address_credit_history(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+    Query(params): Query<CreditHistoryQuery>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+    
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.pagination.unwrap_or(20).min(1000);
+    let offset = ((page - 1) * per_page) as i64;
+    
+    // Check if credit_history table exists
+    let table_exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'credit_history')"
+    )
+    .fetch_one(state.db())
+    .await
+    .unwrap_or((false,));
+    
+    if !table_exists.0 {
+        return (StatusCode::NOT_FOUND, Json(json!({
+            "error": "Credit history not available (table does not exist)",
+            "address": address
+        })));
+    }
+    
+    // Query credit history (simplified - without dynamic filters for now)
+    let history: Vec<(i64, Option<rust_decimal::Decimal>, Option<i64>, Option<String>, Option<String>, 
+                      Option<String>, Option<String>, Option<String>, Option<String>, Option<String>,
+                      Option<String>, Option<i32>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>)> = 
+        sqlx::query_as(
+            "SELECT amount, price, bonus_amount, tx_hash, token, chain, provider, origin, origin_ref, \
+             payment_method, credit_ref, credit_index, expiration_date, message_timestamp \
+             FROM credit_history WHERE address = $1 ORDER BY message_timestamp DESC LIMIT $2 OFFSET $3"
+        )
+        .bind(&address)
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default();
+    
+    if history.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(json!({
+            "error": "No credit history found for this address",
+            "address": address
+        })));
+    }
+    
+    // Get total count
+    let total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM credit_history WHERE address = $1"
+    )
+    .bind(&address)
+    .fetch_one(state.db())
+    .await
+    .unwrap_or((0,));
+    
+    // Format response
+    let history_items: Vec<CreditHistoryItem> = history.into_iter().map(|h| CreditHistoryItem {
+        amount: h.0,
+        price: h.1.map(|p| p.to_string()),
+        bonus_amount: h.2,
+        tx_hash: h.3,
+        token: h.4,
+        chain: h.5,
+        provider: h.6,
+        origin: h.7,
+        origin_ref: h.8,
+        payment_method: h.9,
+        credit_ref: h.10,
+        credit_index: h.11,
+        expiration_date: h.12.map(|d| d.to_rfc3339()),
+        message_timestamp: h.13.map(|d| d.to_rfc3339()),
+    }).collect();
+    
+    (StatusCode::OK, Json(json!({
+        "address": address,
+        "credit_history": history_items,
+        "pagination_page": page,
+        "pagination_total": total.0,
+        "pagination_per_page": per_page,
+    })))
+}
+
+// ===== Storage Endpoints (File metadata by message hash and ref) =====
+
+/// Store content from STORE message
+#[derive(Debug, Deserialize)]
+struct StoreContent {
+    address: String,
+    item_type: String,
+    item_hash: String,
+    time: f64,
+    #[serde(default)]
+    ref_: Option<String>,
+    #[serde(rename = "ref")]
+    #[serde(default)]
+    ref_field: Option<String>,
+}
+
+impl StoreContent {
+    fn get_ref(&self) -> Option<&str> {
+        self.ref_field.as_deref().or(self.ref_.as_deref())
+    }
+}
+
+/// File metadata response - matches pyaleph format
+/// Reference: aleph/web/controllers/storage.py:FileMetadataResponse
+#[derive(Debug, Serialize)]
+pub struct FileMetadataResponse {
+    #[serde(rename = "ref")]
+    pub ref_: String,
+    pub owner: String,
+    pub file_hash: String,
+    pub download_url: String,
+    pub size: i64,
+}
+
+/// Add JSON to storage - matches pyaleph /api/v0/storage/add_json
+/// Reference: aleph/web/controllers/storage.py:add_storage_json_controller
+///
+/// Accepts JSON body, hashes it with SHA256, stores to IPFS, returns hash.
+pub async fn add_json_storage(
+    State(state): State<Arc<AppState>>,
+    Json(data): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Serialize JSON canonically
+    let json_bytes = match serde_json::to_vec(&data) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "status": "error",
+                "message": format!("Invalid JSON: {}", e)
+            })));
+        }
+    };
+    
+    // Upload to IPFS
+    match state.ipfs.add(json_bytes.clone()).await {
+        Ok(hash) => {
+            let size = json_bytes.len();
+            
+            // Store file pin if we have DB
+            if state.has_db() {
+                let _ = sqlx::query(
+                    "INSERT INTO file_pins (item_hash, owner, size, content_type, created_at) \
+                     VALUES ($1, 'anonymous', $2, 'application/json', NOW()) \
+                     ON CONFLICT DO NOTHING"
+                )
+                .bind(&hash)
+                .bind(size as i64)
+                .execute(state.db())
+                .await;
+            }
+            
+            (StatusCode::OK, Json(json!({
+                "status": "success",
+                "hash": hash,
+            })))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                "status": "error",
+                "message": format!("Failed to store content: {}", e)
+            })))
+        }
+    }
+}
+
+/// Get storage metadata by message hash - matches pyaleph /api/v0/storage/by-message-hash/{hash}
+/// Reference: aleph/web/controllers/storage.py:get_file_metadata_by_message_hash
+///
+/// Returns the file metadata for a specific STORE message.
+/// Avoids fetching the full message from the client to determine the file hash.
+pub async fn get_storage_by_message_hash(
+    State(state): State<Arc<AppState>>,
+    Path(message_hash): Path<String>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+    
+    // Get the STORE message
+    let message = sqlx::query_as::<_, crate::db::models::MessageDb>(
+        "SELECT * FROM messages WHERE item_hash = $1 AND message_type = 'STORE'"
+    )
+    .bind(&message_hash)
+    .fetch_optional(state.db())
+    .await;
+    
+    match message {
+        Ok(Some(msg)) => {
+            // Parse the item_content to get file hash
+            let content: StoreContent = match msg.item_content {
+                Some(ref content_str) => {
+                    match serde_json::from_str(content_str) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                                "error": format!("Failed to parse message content: {}", e)
+                            })));
+                        }
+                    }
+                }
+                None => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                        "error": "Message has no inline content"
+                    })));
+                }
+            };
+            
+            let file_hash = content.item_hash.clone();
+            let owner = content.address.clone();
+            let ref_ = content.get_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| message_hash.clone());
+            
+            // Try to get file size from file_pins or IPFS
+            let size = sqlx::query_scalar::<_, i64>(
+                "SELECT size FROM file_pins WHERE item_hash = $1 LIMIT 1"
+            )
+            .bind(&file_hash)
+            .fetch_optional(state.db())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+            
+            (StatusCode::OK, Json(json!(FileMetadataResponse {
+                ref_: ref_,
+                owner,
+                file_hash: file_hash.clone(),
+                download_url: format!("/api/v0/storage/raw/{}", file_hash),
+                size,
+            })))
+        }
+        Ok(None) => {
+            // Check if it exists but isn't a STORE message
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE item_hash = $1)"
+            )
+            .bind(&message_hash)
+            .fetch_one(state.db())
+            .await
+            .unwrap_or(false);
+            
+            if exists {
+                (StatusCode::BAD_REQUEST, Json(json!({
+                    "error": "Message exists but is not a STORE message"
+                })))
+            } else {
+                (StatusCode::NOT_FOUND, Json(json!({
+                    "error": format!("No file found for message {}", message_hash)
+                })))
+            }
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                "error": e.to_string()
+            })))
+        }
+    }
+}
+
+/// Get storage metadata by ref - matches pyaleph /api/v0/storage/by-ref/{ref}
+/// Reference: aleph/web/controllers/storage.py:get_file_metadata_by_ref
+///
+/// Returns the latest version of a file using its ref.
+/// Handles both /storage/by-ref/{address}/{ref} and /storage/by-ref/{item_hash}
+pub async fn get_storage_by_ref(
+    State(state): State<Arc<AppState>>,
+    Path(ref_): Path<String>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+    
+    // First, try to interpret ref as an item_hash (direct lookup)
+    // Check if it looks like a hash (64 hex chars or starts with Qm for IPFS)
+    let is_hash = (ref_.len() == 64 && ref_.chars().all(|c| c.is_ascii_hexdigit()))
+        || ref_.starts_with("Qm");
+    
+    if is_hash {
+        // Try direct file_tags lookup
+        let file_tag = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT item_hash, tag FROM file_tags WHERE tag = $1 OR item_hash = $1 LIMIT 1"
+        )
+        .bind(&ref_)
+        .fetch_optional(state.db())
+        .await;
+        
+        match file_tag {
+            Ok(Some((item_hash, _tag))) => {
+                // Get file info
+                let file_pin = sqlx::query_as::<_, (String, i64)>(
+                    "SELECT owner, size FROM file_pins WHERE item_hash = $1 LIMIT 1"
+                )
+                .bind(&item_hash)
+                .fetch_optional(state.db())
+                .await
+                .ok()
+                .flatten();
+                
+                let (owner, size) = file_pin.unwrap_or(("unknown".to_string(), 0));
+                
+                return (StatusCode::OK, Json(json!(FileMetadataResponse {
+                    ref_: ref_.clone(),
+                    owner,
+                    file_hash: item_hash.clone(),
+                    download_url: format!("/api/v0/storage/raw/{}", item_hash),
+                    size,
+                })));
+            }
+            Ok(None) => {
+                // Not found in file_tags, try finding a STORE message with this ref
+                let store_msg = sqlx::query_as::<_, crate::db::models::MessageDb>(
+                    "SELECT * FROM messages WHERE message_type = 'STORE' AND item_hash = $1"
+                )
+                .bind(&ref_)
+                .fetch_optional(state.db())
+                .await;
+                
+                if let Ok(Some(msg)) = store_msg {
+                    if let Some(ref content_str) = msg.item_content {
+                        if let Ok(content) = serde_json::from_str::<StoreContent>(content_str) {
+                            let file_hash = content.item_hash;
+                            let size = sqlx::query_scalar::<_, i64>(
+                                "SELECT size FROM file_pins WHERE item_hash = $1"
+                            )
+                            .bind(&file_hash)
+                            .fetch_optional(state.db())
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0);
+                            
+                            return (StatusCode::OK, Json(json!(FileMetadataResponse {
+                                ref_: ref_.clone(),
+                                owner: content.address,
+                                file_hash: file_hash.clone(),
+                                download_url: format!("/api/v0/storage/raw/{}", file_hash),
+                                size,
+                            })));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                    "error": e.to_string()
+                })));
+            }
+        }
+    }
+    
+    // ref doesn't look like a hash - might be a custom ref, need address
+    // For now, search in file_tags by tag
+    let file_tag = sqlx::query_as::<_, (String,)>(
+        "SELECT item_hash FROM file_tags WHERE tag = $1 LIMIT 1"
+    )
+    .bind(&ref_)
+    .fetch_optional(state.db())
+    .await;
+    
+    match file_tag {
+        Ok(Some((item_hash,))) => {
+            let file_pin = sqlx::query_as::<_, (String, i64)>(
+                "SELECT owner, size FROM file_pins WHERE item_hash = $1 LIMIT 1"
+            )
+            .bind(&item_hash)
+            .fetch_optional(state.db())
+            .await
+            .ok()
+            .flatten();
+            
+            let (owner, size) = file_pin.unwrap_or(("unknown".to_string(), 0));
+            
+            (StatusCode::OK, Json(json!(FileMetadataResponse {
+                ref_: ref_.clone(),
+                owner,
+                file_hash: item_hash.clone(),
+                download_url: format!("/api/v0/storage/raw/{}", item_hash),
+                size,
+            })))
+        }
+        Ok(None) => {
+            (StatusCode::NOT_FOUND, Json(json!({
+                "error": format!("No file found for tag {}", ref_)
+            })))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                "error": e.to_string()
+            })))
+        }
+    }
+}
+
+/// Get storage metadata by ref with address - matches pyaleph /api/v0/storage/by-ref/{address}/{ref}
+pub async fn get_storage_by_address_ref(
+    State(state): State<Arc<AppState>>,
+    Path((address, ref_)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+    
+    // Build the tag as {address}/{ref}
+    let tag = format!("{}/{}", address, ref_);
+    
+    let file_tag = sqlx::query_as::<_, (String,)>(
+        "SELECT item_hash FROM file_tags WHERE tag = $1 LIMIT 1"
+    )
+    .bind(&tag)
+    .fetch_optional(state.db())
+    .await;
+    
+    match file_tag {
+        Ok(Some((item_hash,))) => {
+            let size = sqlx::query_scalar::<_, i64>(
+                "SELECT size FROM file_pins WHERE item_hash = $1"
+            )
+            .bind(&item_hash)
+            .fetch_optional(state.db())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+            
+            (StatusCode::OK, Json(json!(FileMetadataResponse {
+                ref_: ref_.clone(),
+                owner: address,
+                file_hash: item_hash.clone(),
+                download_url: format!("/api/v0/storage/raw/{}", item_hash),
+                size,
+            })))
+        }
+        Ok(None) => {
+            (StatusCode::NOT_FOUND, Json(json!({
+                "error": format!("No file found for tag {}", tag)
+            })))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                "error": e.to_string()
+            })))
+        }
+    }
 }
