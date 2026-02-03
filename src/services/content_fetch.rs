@@ -144,7 +144,11 @@ pub async fn run(ctx: Arc<ContentFetchContext>) {
                         failure_counts.remove(item_hash);
                     }
                 }
-                Err(_e) => {
+                Err(e) => {
+                    if fetched_count == 0 && failed_count == 0 {
+                        // Log first failure reason per batch for debugging
+                        info!("First failure in batch: {} - {}", item_hash, e);
+                    }
                     let count = failure_counts.entry(item_hash.clone()).or_insert(0);
                     *count += 1;
                     if *count >= MAX_RETRIES {
@@ -159,12 +163,10 @@ pub async fn run(ctx: Arc<ContentFetchContext>) {
             }
         }
 
-        if fetched_count > 0 || marked_unfetchable > 0 {
-            info!(
-                "Content fetch: {} fetched, {} failed, {} marked unfetchable (batch {})",
-                fetched_count, failed_count, marked_unfetchable, unfetched.len()
-            );
-        }
+        info!(
+            "Content fetch: {} fetched, {} failed, {} marked unfetchable (batch {}, {} peers)",
+            fetched_count, failed_count, marked_unfetchable, unfetched.len(), servers.len()
+        );
 
         // Prevent unbounded memory growth — prune old entries periodically
         if failure_counts.len() > 100_000 {
