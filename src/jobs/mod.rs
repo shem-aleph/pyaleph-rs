@@ -166,25 +166,8 @@ impl JobManager {
             info!("Started P2P consumer job");
         }
         
-        // Start content fetch service (downloads content for storage/ipfs messages)
-        if config.rabbitmq.enabled {
-            let db_clone = db.clone();
-            let config_clone = config.clone();
-            let ipfs_clone = ipfs.clone();
-            
-            let handle = tokio::spawn(async move {
-                let ctx = Arc::new(
-                    crate::services::content_fetch::ContentFetchContext::new(
-                        db_clone,
-                        config_clone,
-                        ipfs_clone,
-                    ).await,
-                );
-                crate::services::content_fetch::run(ctx).await;
-            });
-            handles.push(handle);
-            info!("Started content fetch service");
-        }
+        // Content fetch + peer monitoring are started in main.rs now
+        // (not gated on RabbitMQ — they always run)
         
         Self { handles }
     }
