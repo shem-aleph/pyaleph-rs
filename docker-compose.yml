@@ -1,0 +1,145 @@
+# Aleph Core (pyaleph-rs) Docker Compose
+#
+# Full deployment stack matching the pyaleph CCN pattern:
+#   rabbitmq  ← p2p-service ← libp2p GossipSub network
+#   pyaleph-rs → postgres, redis, ipfs
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f pyaleph-rs
+
+version: "3.8"
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aleph
+      POSTGRES_USER: aleph
+      POSTGRES_PASSWORD: aleph-changeme
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aleph"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ───────────────────────────────────────────────────
+  redis:
+    image: redis:8.4.0-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── RabbitMQ ────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: aleph-p2p
+      RABBITMQ_DEFAULT_PASS: change-me!
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ── IPFS (Kubo) ────────────────────────────────────────────
+  ipfs:
+    image: ipfs/kubo:v0.37.0
+    restart: unless-stopped
+    environment:
+      IPFS_PROFILE: server
+    ports:
+      - "4001:4001"    # Swarm
+      - "5001:5001"    # API
+      - "8081:8080"    # Gateway
+    volumes:
+      - ipfsdata:/data/ipfs
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ── P2P Service (libp2p ↔ RabbitMQ bridge) ─────────────────
+  p2p-service:
+    image: alephim/p2p-service:0.1.4
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      ipfs:
+        condition: service_healthy
+    environment:
+      # P2P service configuration (env vars)
+      RUST_LOG: info
+      P2P_SERVICE__RABBITMQ__HOST: rabbitmq
+      P2P_SERVICE__RABBITMQ__PORT: "5672"
+      P2P_SERVICE__RABBITMQ__USERNAME: aleph-p2p
+      P2P_SERVICE__RABBITMQ__PASSWORD: change-me!
+      P2P_SERVICE__P2P__TOPICS: "ALEPH-TEST,ALIVE"
+      P2P_SERVICE__P2P__LISTEN_ADDR: /ip4/0.0.0.0/tcp/4025
+      P2P_SERVICE__P2P__PEERS: >-
+        /dns/api2.aleph.im/tcp/4025/p2p/QmZkurbY2G2hWay59yiTgQNaQxHSNzKZFt2jbnwJhQcKgV,
+        /dns/api3.aleph.im/tcp/4025/p2p/Qmb5b2ZwJm9pVWrppf3D3iMF1bXbjZhbJTwGvKEBMZNxa2
+      P2P_SERVICE__CONTROL__PORT: "4030"
+    ports:
+      - "4025:4025"    # libp2p swarm
+      - "4030:4030"    # control port
+
+  # ── pyaleph-rs (Aleph Core Node) ───────────────────────────
+  pyaleph-rs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      ipfs:
+        condition: service_healthy
+    environment:
+      # Override config via environment variables
+      ALEPH__DATABASE__URL: "postgres://aleph:aleph-changeme@postgres:5432/aleph"
+      ALEPH__RABBITMQ__URL: "amqp://aleph-p2p:change-me!@rabbitmq:5672"
+      ALEPH__RABBITMQ__ENABLED: "true"
+      ALEPH__REDIS__URL: "redis://redis:6379"
+      ALEPH__IPFS__API_URL: "http://ipfs:5001"
+      ALEPH__IPFS__GATEWAY_URL: "https://ipfs.io/ipfs"
+      ALEPH__API__HOST: "::"
+      ALEPH__API__PORT: "8080"
+      RUST_LOG: info,aleph_core=debug
+    ports:
+      - "8080:8080"    # API
+    volumes:
+      - nodedata:/data
+    command: ["aleph-core", "--config", "/etc/aleph/config.toml", "--indexer-sync"]
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitmqdata:
+  ipfsdata:
+  nodedata:

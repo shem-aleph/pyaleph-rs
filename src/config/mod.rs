@@ -640,9 +640,21 @@ pub struct P2pConfig {
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
     
-    /// Topic for message exchange
+    /// Topic for message exchange (GossipSub queue topic)
     #[serde(default = "default_topic")]
     pub topic: String,
+    
+    /// Topic for alive/peer discovery messages
+    #[serde(default = "default_alive_topic")]
+    pub alive_topic: String,
+    
+    /// p2p-service daemon host
+    #[serde(default = "default_daemon_host")]
+    pub daemon_host: String,
+    
+    /// p2p-service control port
+    #[serde(default = "default_control_port")]
+    pub control_port: u16,
     
     /// Maximum peer connections
     #[serde(default = "default_max_peers")]
@@ -658,7 +670,10 @@ pub struct P2pConfig {
 }
 
 fn default_listen_addrs() -> Vec<String> { vec!["/ip4/0.0.0.0/tcp/4025".to_string()] }
-fn default_topic() -> String { "aleph-messages".to_string() }
+fn default_topic() -> String { "ALEPH-TEST".to_string() }
+fn default_alive_topic() -> String { "ALIVE".to_string() }
+fn default_daemon_host() -> String { "p2p-service".to_string() }
+fn default_control_port() -> u16 { 4030 }
 fn default_max_peers() -> u32 { 50 }
 fn default_discovery_interval() -> u64 { 300 }
 fn default_reconnect_delay() -> u64 { 60 }
@@ -670,6 +685,9 @@ impl Default for P2pConfig {
             listen_addrs: default_listen_addrs(),
             bootstrap_peers: vec![],
             topic: default_topic(),
+            alive_topic: default_alive_topic(),
+            daemon_host: default_daemon_host(),
+            control_port: default_control_port(),
             max_peers: default_max_peers(),
             discovery_interval: default_discovery_interval(),
             reconnect_delay: default_reconnect_delay(),

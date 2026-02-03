@@ -15,6 +15,7 @@ pub mod balance_tracker;
 pub mod cleanup;
 pub mod cron;
 pub mod backfill;
+pub mod p2p_consumer;
 
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -148,6 +149,41 @@ impl JobManager {
             });
             handles.push(handle);
             info!("Started cron scheduler");
+        }
+        
+        // Start P2P consumer (RabbitMQ → pending_messages)
+        if config.rabbitmq.enabled {
+            let db_clone = db.clone();
+            let config_clone = config.clone();
+            
+            let handle = tokio::spawn(async move {
+                let ctx = Arc::new(
+                    p2p_consumer::P2pConsumerContext::new(db_clone, config_clone).await,
+                );
+                p2p_consumer::run(ctx).await;
+            });
+            handles.push(handle);
+            info!("Started P2P consumer job");
+        }
+        
+        // Start content fetch service (downloads content for storage/ipfs messages)
+        if config.rabbitmq.enabled {
+            let db_clone = db.clone();
+            let config_clone = config.clone();
+            let ipfs_clone = ipfs.clone();
+            
+            let handle = tokio::spawn(async move {
+                let ctx = Arc::new(
+                    crate::services::content_fetch::ContentFetchContext::new(
+                        db_clone,
+                        config_clone,
+                        ipfs_clone,
+                    ).await,
+                );
+                crate::services::content_fetch::run(ctx).await;
+            });
+            handles.push(handle);
+            info!("Started content fetch service");
         }
         
         Self { handles }

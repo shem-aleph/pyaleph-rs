@@ -61,6 +61,18 @@ ipfs-api-backend-hyper = "0.6"
 # Message Queue (for p2p-service integration)
 lapin = "2.3"
 
+# Redis client (for peer discovery / api_servers)
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# LRU cache (for message deduplication)
+lru = "0.12"
+
+# URL decoding (p2p messages are URL-encoded)
+urlencoding = "2.1"
+
+# Random selection (peer picking)
+rand = "0.8"
+
 # Blockchain specific
 ethers = "2.0"
 url = "2.5.8"

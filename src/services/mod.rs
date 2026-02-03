@@ -2,6 +2,7 @@
 //!
 //! Core services for the Aleph node.
 
+pub mod content_fetch;
 pub mod cost;
 pub mod crypto;
 pub mod ipfs;

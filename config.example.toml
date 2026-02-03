@@ -45,10 +45,27 @@ start_block = 10000000
 [p2p]
 enabled = true
 listen_addrs = ["/ip4/0.0.0.0/tcp/4025"]
-bootstrap_peers = []
-topic = "aleph-messages"
+bootstrap_peers = [
+  "/dns/api2.aleph.im/tcp/4025/p2p/QmZkurbY2G2hWay59yiTgQNaQxHSNzKZFt2jbnwJhQcKgV",
+  "/dns/api3.aleph.im/tcp/4025/p2p/Qmb5b2ZwJm9pVWrppf3D3iMF1bXbjZhbJTwGvKEBMZNxa2",
+]
+topic = "ALEPH-TEST"
 
 [ipfs]
-api_url = "http://localhost:5001"
+api_url = "http://ipfs:5001"
 gateway_url = "https://ipfs.io/ipfs"
 pin_content = true
+
+[rabbitmq]
+url = "amqp://aleph-p2p:change-me!@rabbitmq:5672"
+pub_exchange = "p2p-publish"
+sub_exchange = "p2p-subscribe"
+enabled = true
+prefetch_count = 100
+
+[redis]
+url = "redis://redis:6379"
+enabled = true
+pool_size = 10
+default_ttl = 300
+key_prefix = "aleph:"

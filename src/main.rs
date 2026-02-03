@@ -2,7 +2,7 @@
 //!
 //! This is the main binary for running an Aleph network node.
 
-use aleph_core::{Config, web, db, jobs};
+use aleph_core::{Config, web, db, jobs, services};
 use aleph_core::services::CryptoService;
 use aleph_core::services::ipfs::IpfsService;
 use aleph_core::jobs::message_processor::ProcessorContext;
@@ -132,22 +132,56 @@ async fn main() -> anyhow::Result<()> {
                 }
                 
                 // Start message processor (processes pending messages into derived tables)
+                let crypto = Arc::new(CryptoService::new());
+                let ipfs = Arc::new(IpfsService::new(&config.ipfs));
                 {
                     info!("Starting message processor");
                     let pool_clone = pool.clone();
                     let config_arc_proc = Arc::new(config.clone());
-                    let crypto = Arc::new(CryptoService::new());
-                    let ipfs = Arc::new(IpfsService::new(&config.ipfs));
                     
                     let processor_ctx = Arc::new(ProcessorContext::new(
                         pool_clone,
-                        crypto,
-                        ipfs,
+                        crypto.clone(),
+                        ipfs.clone(),
                         config_arc_proc,
                     ));
                     
                     tokio::spawn(async move {
                         jobs::message_processor::run(processor_ctx).await;
+                    });
+                }
+                
+                // Start P2P consumer (RabbitMQ → pending_messages)
+                if config.rabbitmq.enabled {
+                    info!("Starting P2P consumer (RabbitMQ)");
+                    let pool_clone = pool.clone();
+                    let config_arc_p2p = Arc::new(config.clone());
+                    tokio::spawn(async move {
+                        let ctx = Arc::new(
+                            jobs::p2p_consumer::P2pConsumerContext::new(
+                                pool_clone,
+                                config_arc_p2p,
+                            ).await,
+                        );
+                        jobs::p2p_consumer::run(ctx).await;
+                    });
+                }
+                
+                // Start content fetch service (fetch storage/ipfs content from peers)
+                if config.rabbitmq.enabled {
+                    info!("Starting content fetch service");
+                    let pool_clone = pool.clone();
+                    let config_arc_cf = Arc::new(config.clone());
+                    let ipfs_clone = ipfs.clone();
+                    tokio::spawn(async move {
+                        let ctx = Arc::new(
+                            services::content_fetch::ContentFetchContext::new(
+                                pool_clone,
+                                config_arc_cf,
+                                ipfs_clone,
+                            ).await,
+                        );
+                        services::content_fetch::run(ctx).await;
                     });
                 }
                 
