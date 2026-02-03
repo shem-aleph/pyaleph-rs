@@ -5,6 +5,7 @@
 use aleph_core::{Config, web, db, jobs, services};
 use aleph_core::services::CryptoService;
 use aleph_core::services::ipfs::IpfsService;
+use aleph_core::services::peers;
 use aleph_core::jobs::message_processor::ProcessorContext;
 use clap::Parser;
 use std::path::PathBuf;
@@ -167,19 +168,40 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
                 
-                // Start content fetch service (fetch storage/ipfs content from peers)
-                if config.rabbitmq.enabled {
-                    info!("Starting content fetch service");
+                // Start peer monitoring and content fetch services
+                // These always run — not gated on RabbitMQ
+                let api_servers = peers::new_api_servers();
+                
+                {
+                    info!("Starting peer tidy job (HTTP peer health checking)");
+                    let pool_clone = pool.clone();
+                    let api_servers_clone = api_servers.clone();
+                    let config_arc_peers = Arc::new(config.clone());
+                    tokio::spawn(async move {
+                        peers::tidy_http_peers_job(
+                            pool_clone,
+                            api_servers_clone,
+                            config_arc_peers,
+                        ).await;
+                    });
+                }
+
+                {
+                    info!("Starting content fetch service (peer-based)");
                     let pool_clone = pool.clone();
                     let config_arc_cf = Arc::new(config.clone());
                     let ipfs_clone = ipfs.clone();
+                    let api_servers_clone = api_servers.clone();
                     tokio::spawn(async move {
+                        // Small delay to let peer tidy job populate api_servers first
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         let ctx = Arc::new(
                             services::content_fetch::ContentFetchContext::new(
                                 pool_clone,
                                 config_arc_cf,
                                 ipfs_clone,
-                            ).await,
+                                api_servers_clone,
+                            ),
                         );
                         services::content_fetch::run(ctx).await;
                     });

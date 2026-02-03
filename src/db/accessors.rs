@@ -106,3 +106,83 @@ impl BalanceAccessor {
         .await
     }
 }
+
+/// Peer accessor functions
+/// Matches: aleph/db/accessors/peers.py
+pub struct PeerAccessor;
+
+impl PeerAccessor {
+    /// Get all peer addresses of a given type, optionally filtered by last_seen
+    pub async fn get_addresses_by_type(
+        pool: &PgPool,
+        peer_type: &str,
+        min_last_seen: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        if let Some(last_seen) = min_last_seen {
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT address FROM peers WHERE peer_type = $1 AND last_seen >= $2"
+            )
+            .bind(peer_type)
+            .bind(last_seen)
+            .fetch_all(pool)
+            .await?;
+            Ok(rows.into_iter().map(|r| r.0).collect())
+        } else {
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT address FROM peers WHERE peer_type = $1"
+            )
+            .bind(peer_type)
+            .fetch_all(pool)
+            .await?;
+            Ok(rows.into_iter().map(|r| r.0).collect())
+        }
+    }
+
+    /// Upsert a peer (insert or update last_seen)
+    pub async fn upsert(
+        pool: &PgPool,
+        peer_id: &str,
+        peer_type: &str,
+        address: &str,
+        source: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(r#"
+            INSERT INTO peers (peer_id, peer_type, address, source, last_seen)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (peer_id, peer_type)
+            DO UPDATE SET address = $3, source = $4, last_seen = NOW()
+        "#)
+        .bind(peer_id)
+        .bind(peer_type)
+        .bind(address)
+        .bind(source)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get all HTTP peers
+    pub async fn get_http_peers(pool: &PgPool) -> Result<Vec<PeerDb>, sqlx::Error> {
+        sqlx::query_as::<_, PeerDb>(
+            "SELECT * FROM peers WHERE peer_type = 'HTTP'"
+        )
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Remove stale peers not seen since cutoff
+    pub async fn remove_stale(
+        pool: &PgPool,
+        peer_type: &str,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM peers WHERE peer_type = $1 AND last_seen < $2"
+        )
+        .bind(peer_type)
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}

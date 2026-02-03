@@ -29,6 +29,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Error> {
     create_account_costs_table(pool).await?;
     create_chain_sync_state_table(pool).await?;
     create_pending_txs_table(pool).await?;
+    create_peers_table(pool).await?;
     create_indexes(pool).await?;
     
     info!("Database migrations completed");
@@ -399,7 +400,33 @@ async fn create_indexes(pool: &PgPool) -> Result<(), Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_forgotten_forget_hash ON forgotten_messages(forget_hash)")
         .execute(pool).await?;
     
+    // Peers indexes
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_peers_type ON peers(peer_type)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen)")
+        .execute(pool).await?;
+    
     info!("Created database indexes");
+    Ok(())
+}
+
+/// Create peers table
+/// Matches: aleph/db/models/peers.py PeerDb
+async fn create_peers_table(pool: &PgPool) -> Result<(), Error> {
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS peers (
+            peer_id TEXT NOT NULL,
+            peer_type TEXT NOT NULL,
+            address TEXT NOT NULL,
+            source TEXT NOT NULL,
+            last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (peer_id, peer_type)
+        )
+    "#)
+    .execute(pool)
+    .await?;
+    
+    info!("Created peers table");
     Ok(())
 }
 

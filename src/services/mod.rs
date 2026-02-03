@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod ipfs;
 pub mod message;
 pub mod metrics;
+pub mod peers;
 pub mod redis;
 pub mod storage;
 

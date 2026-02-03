@@ -217,3 +217,45 @@ pub struct ChainSyncStateDb {
     pub last_height: i64,
     pub last_sync: DateTime<Utc>,
 }
+
+/// Peer type enum
+/// Matches: aleph/db/models/peers.py PeerType
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerType {
+    HTTP,
+    IPFS,
+    P2P,
+}
+
+impl std::fmt::Display for PeerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerType::HTTP => write!(f, "HTTP"),
+            PeerType::IPFS => write!(f, "IPFS"),
+            PeerType::P2P => write!(f, "P2P"),
+        }
+    }
+}
+
+impl std::str::FromStr for PeerType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "HTTP" => Ok(PeerType::HTTP),
+            "IPFS" => Ok(PeerType::IPFS),
+            "P2P" => Ok(PeerType::P2P),
+            _ => Err(format!("Unknown peer type: {}", s)),
+        }
+    }
+}
+
+/// Peer database record
+/// Matches: aleph/db/models/peers.py PeerDb
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct PeerDb {
+    pub peer_id: String,
+    pub peer_type: String,
+    pub address: String,
+    pub source: String,
+    pub last_seen: DateTime<Utc>,
+}
