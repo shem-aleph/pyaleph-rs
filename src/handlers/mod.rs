@@ -216,6 +216,33 @@ pub trait MessageHandler: Send + Sync {
     /// Validate the message before processing
     async fn validate(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError>;
     
+    /// Check if the message sender is authorized.
+    ///
+    /// Default implementation checks the security aggregate for delegated authorization.
+    /// Handlers can override this for custom permission logic (e.g. PostHandler for amends).
+    async fn check_permissions(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        // Parse content to get address field
+        if let Some(ref content_str) = message.item_content {
+            if let Ok(content) = serde_json::from_str::<serde_json::Value>(content_str) {
+                if let Some(address) = content.get("address").and_then(|a| a.as_str()) {
+                    if message.sender.to_lowercase() != address.to_lowercase() {
+                        // Need to check security aggregate
+                        let db = ctx.db.as_ref()
+                            .ok_or_else(|| HandlerError::Database("No database configured".to_string()))?;
+                        let authorized = crate::permissions::check_sender_authorization(db.as_ref(), message).await
+                            .map_err(|e| HandlerError::Database(e.to_string()))?;
+                        if !authorized {
+                            return Err(HandlerError::PermissionDenied(
+                                format!("Sender {} is not authorized to post on behalf of {}", message.sender, address)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    
     /// Process the message
     async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError>;
 }
@@ -235,6 +262,12 @@ pub async fn process_message(message: &Message, ctx: &HandlerContext) -> Process
     // Validate
     if let Err(e) = handler.validate(message, ctx).await {
         tracing::warn!("Message validation failed: {}", e);
+        return e.into();
+    }
+    
+    // Check permissions (security aggregate delegation)
+    if let Err(e) = handler.check_permissions(message, ctx).await {
+        tracing::warn!("Message permission check failed: {}", e);
         return e.into();
     }
     

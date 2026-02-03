@@ -37,9 +37,8 @@ impl MessageHandler for AggregateHandler {
         let content: AggregateContent = serde_json::from_str(content_str)
             .map_err(|e| HandlerError::InvalidContent(format!("Invalid aggregate content: {}", e)))?;
         
-        if message.sender.to_lowercase() != content.address.to_lowercase() {
-            return Err(HandlerError::Unauthorized);
-        }
+        // Note: sender != content.address is allowed for delegated authorization.
+        // The permission check happens in check_permissions() via the security aggregate system.
         
         if content.key.is_empty() {
             return Err(HandlerError::InvalidContent("Aggregate key cannot be empty".to_string()));

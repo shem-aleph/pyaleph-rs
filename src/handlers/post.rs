@@ -23,7 +23,7 @@ impl PostHandler {
     /// Validate an amend post against its target
     async fn validate_amend(
         &self,
-        message: &Message,
+        _message: &Message,
         content: &PostContent,
         ctx: &HandlerContext,
     ) -> Result<(), HandlerError> {
@@ -44,12 +44,9 @@ impl PostHandler {
                 target_ref
             )))?;
         
-        // Verify ownership - only the original poster can amend
-        if target_post.address.to_lowercase() != message.sender.to_lowercase() {
-            return Err(HandlerError::PermissionDenied(
-                "Only the original poster can amend a post".to_string()
-            ));
-        }
+        // Note: ownership check (sender vs original poster) is now handled by
+        // check_permissions() which supports delegated authorization via the
+        // security aggregate system.
         
         // Cannot amend an amend (must amend the original)
         if Self::is_amend(&target_post.post_type) {
@@ -72,6 +69,54 @@ impl MessageHandler for PostHandler {
         MessageType::Post
     }
     
+    /// Custom permission check for POST messages.
+    ///
+    /// In addition to the standard security aggregate check, this verifies that
+    /// for amend messages, the amend's `content.address` matches the original
+    /// post's `address` — preventing address hijacking via delegation.
+    async fn check_permissions(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        // Standard security aggregate check first
+        if let Some(ref content_str) = message.item_content {
+            if let Ok(content) = serde_json::from_str::<serde_json::Value>(content_str) {
+                if let Some(address) = content.get("address").and_then(|a| a.as_str()) {
+                    if message.sender.to_lowercase() != address.to_lowercase() {
+                        let db = ctx.db.as_ref()
+                            .ok_or_else(|| HandlerError::Database("No database configured".to_string()))?;
+                        let authorized = crate::permissions::check_sender_authorization(db.as_ref(), message).await
+                            .map_err(|e| HandlerError::Database(e.to_string()))?;
+                        if !authorized {
+                            return Err(HandlerError::PermissionDenied(
+                                format!("Sender {} is not authorized to post on behalf of {}", message.sender, address)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Additional amend-specific check: verify content.address matches original post's address
+        if let Some(ref content_str) = message.item_content {
+            if let Ok(content) = serde_json::from_str::<PostContent>(content_str) {
+                if Self::is_amend(&content.post_type) {
+                    if let Some(ref target_ref) = content.ref_ {
+                        if let Some(ref db) = ctx.db {
+                            if let Ok(Some(original_post)) = db.get_post(target_ref).await {
+                                if original_post.address.to_lowercase() != content.address.to_lowercase() {
+                                    return Err(HandlerError::PermissionDenied(format!(
+                                        "Cannot amend post {}: amend address {} does not match original post owner {}",
+                                        target_ref, content.address, original_post.address
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
     async fn validate(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
         let content_str = message.item_content.as_deref()
             .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
@@ -79,10 +124,8 @@ impl MessageHandler for PostHandler {
         let content: PostContent = serde_json::from_str(content_str)
             .map_err(|e| HandlerError::InvalidContent(format!("Invalid post content: {}", e)))?;
         
-        // Verify sender matches content address
-        if message.sender.to_lowercase() != content.address.to_lowercase() {
-            return Err(HandlerError::Unauthorized);
-        }
+        // Note: sender != content.address is allowed for delegated authorization.
+        // The permission check happens in check_permissions() via the security aggregate system.
         
         // Validate post type is not empty
         if content.post_type.is_empty() {

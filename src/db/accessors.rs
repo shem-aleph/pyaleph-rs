@@ -73,6 +73,24 @@ impl AggregateAccessor {
         .fetch_all(pool)
         .await
     }
+
+    /// Get a specific aggregate by owner address and key.
+    ///
+    /// Used by the security permission system to look up the "security" aggregate.
+    /// Returns the aggregate content as a JSON value if found.
+    pub async fn get_by_key(
+        pool: &PgPool,
+        owner: &str,
+        key: &str,
+    ) -> Result<Option<AggregateDb>, sqlx::Error> {
+        sqlx::query_as::<_, AggregateDb>(
+            "SELECT * FROM aggregates WHERE address = $1 AND key = $2"
+        )
+        .bind(owner)
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+    }
 }
 
 /// Balance accessor functions

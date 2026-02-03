@@ -36,6 +36,7 @@ pub mod db;
 pub mod handlers;
 pub mod jobs;
 pub mod network;
+pub mod permissions;
 pub mod schemas;
 pub mod services;
 pub mod storage;

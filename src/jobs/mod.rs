@@ -6,6 +6,7 @@
 //! - Garbage collector: cleans up orphaned files
 //! - Balance tracker: tracks ALEPH token balances
 //! - Cron scheduler: runs scheduled tasks
+//! - Backfill: populates derived tables from messages on startup
 
 pub mod message_processor;
 pub mod chain_sync;
@@ -13,6 +14,7 @@ pub mod garbage_collector;
 pub mod balance_tracker;
 pub mod cleanup;
 pub mod cron;
+pub mod backfill;
 
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -38,6 +40,23 @@ impl JobManager {
         metrics: Arc<Metrics>,
     ) -> Self {
         let mut handles = Vec::new();
+        
+        // Run backfill before starting other jobs
+        // This ensures derived tables (posts, aggregates) are populated
+        // from any messages that were synced but not processed
+        {
+            info!("Checking if backfill is needed...");
+            match backfill::run_startup_backfill(&db).await {
+                Ok(result) => {
+                    if result.posts_inserted > 0 || result.aggregates_inserted > 0 {
+                        info!("Startup backfill completed: {}", result);
+                    }
+                }
+                Err(e) => {
+                    error!("Startup backfill failed (continuing anyway): {}", e);
+                }
+            }
+        }
         
         // Start message processor
         {

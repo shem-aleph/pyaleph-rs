@@ -35,9 +35,8 @@ impl MessageHandler for StoreHandler {
         let content: StoreContent = serde_json::from_str(content_str)
             .map_err(|e| HandlerError::InvalidContent(format!("Invalid store content: {}", e)))?;
         
-        if message.sender.to_lowercase() != content.address.to_lowercase() {
-            return Err(HandlerError::Unauthorized);
-        }
+        // Note: sender != content.address is allowed for delegated authorization.
+        // The permission check happens in check_permissions() via the security aggregate system.
         
         if content.item_hash.is_empty() {
             return Err(HandlerError::InvalidContent("Empty item_hash".to_string()));

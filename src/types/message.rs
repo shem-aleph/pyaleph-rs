@@ -163,7 +163,7 @@ pub struct PostContent {
     #[serde(rename = "type")]
     pub post_type: String,
     pub content: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "ref")]
     pub ref_: Option<String>,
     pub time: Timestamp,
 }

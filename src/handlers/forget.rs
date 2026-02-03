@@ -107,10 +107,8 @@ impl MessageHandler for ForgetHandler {
             ));
         }
         
-        // Verify sender matches content address
-        if message.sender.to_lowercase() != content.address.to_lowercase() {
-            return Err(HandlerError::Unauthorized);
-        }
+        // Note: sender != content.address is allowed for delegated authorization.
+        // The permission check happens in check_permissions() via the security aggregate system.
         
         // Verify signature
         if let Some(ref crypto) = ctx.crypto {
