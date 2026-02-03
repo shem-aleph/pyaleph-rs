@@ -972,22 +972,27 @@ pub struct PostsQuery {
 
 /// Post response format for v0 API - includes message-level fields
 /// Reference: aleph/web/controllers/posts.py
+///
+/// The v0 API merges original posts with their latest amends:
+/// - Only returns original posts (amends IS NULL)
+/// - Content comes from latest amend if one exists (COALESCE)
+/// - type field = post_type (e.g. "staking-rewards-distribution"), NOT "POST"
+/// - original_type = original post's type
 #[derive(Debug, Clone, Serialize)]
 pub struct PostResponseV0 {
-    // From posts table
+    // From posts table (merged original + amend)
     pub item_hash: String,
     #[serde(rename = "ref")]
     pub ref_: Option<String>,
     pub address: String,
     #[serde(rename = "type")]
-    pub message_type: String,  // Always "POST"
-    pub post_type: String,
+    pub post_type: String,  // The post type (e.g. "staking-rewards-distribution")
     pub content: serde_json::Value,
     pub channel: Option<String>,
     pub time: f64,
-    pub original_item_hash: Option<String>,
+    pub original_item_hash: String,
     #[serde(rename = "hash")]
-    pub hash: Option<String>,  // Alias for original_item_hash
+    pub hash: String,
     // From messages table (joined)
     pub chain: String,
     pub sender: String,
@@ -1027,16 +1032,36 @@ pub async fn get_posts(
         }));
     }
     
-    // Build query with JOIN to messages table for message-level fields
+    // Build merged post query matching Python pyaleph's make_select_merged_post_with_message_info_stmt()
+    // - Only return originals (p.amends IS NULL)
+    // - LEFT JOIN latest amend for content/type coalescing
+    // - LEFT JOIN messages for both original and amend message-level fields
     let mut builder = crate::db::QueryBuilder::new(
-        "SELECT p.item_hash, p.address, p.post_type, p.content, p.ref_, p.channel, p.time, \
-         p.original_item_hash, p.latest_amend, p.amends, \
-         m.chain, m.sender, m.signature, m.item_type, m.item_content \
+        "SELECT p.item_hash AS original_item_hash, \
+         COALESCE(a.item_hash, p.item_hash) AS item_hash, \
+         p.address, \
+         COALESCE(a.post_type, p.post_type) AS post_type, \
+         COALESCE(a.content, p.content) AS content, \
+         p.ref_, p.channel, \
+         COALESCE(a.time, p.time) AS time, \
+         om.chain, om.sender, \
+         COALESCE(am.signature, om.signature) AS signature, \
+         COALESCE(am.item_type, om.item_type) AS item_type, \
+         CASE WHEN am.item_content IS NOT NULL THEN am.item_content ELSE om.item_content END AS item_content, \
+         COALESCE(am.size, om.size) AS size, \
+         om.signature AS original_signature, \
+         p.post_type AS original_type \
          FROM posts p \
-         LEFT JOIN messages m ON p.item_hash = m.item_hash \
-         WHERE 1=1"
+         LEFT JOIN posts a ON p.latest_amend = a.item_hash \
+         LEFT JOIN messages om ON p.item_hash = om.item_hash \
+         LEFT JOIN messages am ON a.item_hash = am.item_hash \
+         WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
     );
-    let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM posts p WHERE 1=1");
+    let mut count_builder = crate::db::QueryBuilder::new(
+        "SELECT COUNT(*) FROM posts p \
+         LEFT JOIN posts a ON p.latest_amend = a.item_hash \
+         WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
+    );
     
     // Filter by addresses (sender)
     if let Some(ref addresses) = params.addresses {
@@ -1056,7 +1081,7 @@ pub async fn get_posts(
         }
     }
     
-    // Filter by post types
+    // Filter by post types (filter on original's post_type, matching Python's original_type filter)
     if let Some(ref types) = params.types {
         let type_list = crate::db::parse_csv_param(types);
         if !type_list.is_empty() {
@@ -1093,22 +1118,24 @@ pub async fn get_posts(
         count_builder.and_lte("p.time", end);
     }
     
-    // Filter by tags (searches content->tags array)
+    // Filter by tags (searches coalesced content->tags array, matching Python pyaleph)
     if let Some(ref tags) = params.tags {
         let tag_list = crate::db::parse_csv_param(tags);
         for tag in tag_list {
-            builder.and_jsonb_array_contains("p.content", "tags", tag.clone());
-            count_builder.and_jsonb_array_contains("p.content", "tags", tag);
+            builder.and_jsonb_array_contains("COALESCE(a.content, p.content)", "tags", tag.clone());
+            count_builder.and_jsonb_array_contains("COALESCE(a.content, p.content)", "tags", tag);
         }
     }
     
     // Determine sort column (validate against allowed columns)
     let allowed_sort = &["time", "address", "post_type", "channel"];
-    let sort_column = params.sort_by
-        .as_deref()
-        .and_then(|col| crate::db::validate_sort_column(col, allowed_sort))
-        .map(|c| format!("p.{}", c))
-        .unwrap_or_else(|| "p.time".to_string());
+    let sort_column = match params.sort_by.as_deref() {
+        Some("time") | None => "COALESCE(a.time, p.time)".to_string(),
+        Some("address") => "p.address".to_string(),
+        Some("post_type") => "p.post_type".to_string(),
+        Some("channel") => "p.channel".to_string(),
+        _ => "COALESCE(a.created_at, p.created_at)".to_string(),
+    };
     
     // Order: 1 = ascending, -1 = descending (default)
     let ascending = order_param.map(|o| o == 1).unwrap_or(false);
@@ -1124,23 +1151,24 @@ pub async fn get_posts(
         .await
         .unwrap_or((0,));
     
-    // Define row type for the joined query
+    // Define row type for the merged post query
     type PostJoinRow = (
-        String,                    // item_hash
-        String,                    // address
-        String,                    // post_type
-        serde_json::Value,         // content
-        Option<String>,            // ref_
-        Option<String>,            // channel
-        f64,                       // time
-        Option<String>,            // original_item_hash
-        Option<String>,            // latest_amend
-        Option<serde_json::Value>, // amends
-        Option<String>,            // chain
-        Option<String>,            // sender
-        Option<String>,            // signature
-        Option<String>,            // item_type
-        Option<String>,            // item_content
+        String,                    // 0: original_item_hash
+        String,                    // 1: item_hash (coalesced)
+        String,                    // 2: address
+        String,                    // 3: post_type (coalesced)
+        serde_json::Value,         // 4: content (coalesced)
+        Option<String>,            // 5: ref_
+        Option<String>,            // 6: channel
+        Option<f64>,               // 7: time (epoch)
+        Option<String>,            // 8: chain
+        Option<String>,            // 9: sender
+        Option<String>,            // 10: signature (coalesced)
+        Option<String>,            // 11: item_type (coalesced)
+        Option<String>,            // 12: item_content
+        Option<i64>,               // 13: size (coalesced)
+        Option<String>,            // 14: original_signature
+        Option<String>,            // 15: original_type
     );
     
     // Get the posts with joined message data
@@ -1150,7 +1178,7 @@ pub async fn get_posts(
         .await
         .unwrap_or_default();
     
-    // Get item_hashes for confirmation lookup
+    // Get original item_hashes for confirmation lookup
     let item_hashes: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
     let mut confirmations_map: HashMap<String, Vec<ConfirmationResponse>> = HashMap::new();
     
@@ -1178,7 +1206,7 @@ pub async fn get_posts(
         }
     }
     
-    // Build response
+    // Build response — merged post format matching Python pyaleph
     let posts: Vec<PostResponseV0> = rows.iter().map(|row| {
         let confirmations = confirmations_map
             .get(&row.0)
@@ -1186,30 +1214,28 @@ pub async fn get_posts(
             .unwrap_or_default();
         let confirmed = !confirmations.is_empty();
         
-        // Calculate size from item_content if available
-        let size = row.14.as_ref().map(|c| c.len() as i64).unwrap_or(0);
+        let size = row.13.unwrap_or_else(|| row.12.as_ref().map(|c| c.len() as i64).unwrap_or(0));
         
         PostResponseV0 {
-            item_hash: row.0.clone(),
-            ref_: row.4.clone(),
-            address: row.1.clone(),
-            message_type: "POST".to_string(),
-            post_type: row.2.clone(),
-            content: row.3.clone(),
-            channel: row.5.clone(),
-            time: row.6,
-            original_item_hash: row.7.clone(),
-            hash: row.7.clone(),  // Alias
-            chain: row.10.clone().unwrap_or_else(|| "ETH".to_string()),
-            sender: row.11.clone().unwrap_or_else(|| row.1.clone()),
-            signature: row.12.clone().unwrap_or_default(),
-            item_type: row.13.clone().unwrap_or_else(|| "inline".to_string()),
-            item_content: row.14.clone(),
+            item_hash: row.1.clone(),          // coalesced (amend or original)
+            ref_: row.5.clone(),
+            address: row.2.clone(),
+            post_type: row.3.clone(),          // coalesced post_type (NOT "POST")
+            content: row.4.clone(),            // coalesced content
+            channel: row.6.clone(),
+            time: row.7.unwrap_or(0.0),
+            original_item_hash: row.0.clone(), // always the original
+            hash: row.0.clone(),               // pyaleph returns original_item_hash as hash
+            chain: row.8.clone().unwrap_or_else(|| "ETH".to_string()),
+            sender: row.9.clone().unwrap_or_else(|| row.2.clone()),
+            signature: row.10.clone().unwrap_or_default(),
+            item_type: row.11.clone().unwrap_or_else(|| "inline".to_string()),
+            item_content: row.12.clone(),
             size,
             confirmed,
             confirmations,
-            original_signature: None,  // Would need additional join for amends
-            original_type: if row.7.is_some() { Some("amend".to_string()) } else { None },
+            original_signature: row.14.clone(),
+            original_type: row.15.clone(),
         }
     }).collect();
     
