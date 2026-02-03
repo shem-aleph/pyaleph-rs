@@ -17,6 +17,7 @@
 //!
 //! Reference: aleph/storage.py, aleph/services/p2p/http.py
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,8 +46,8 @@ const FETCH_INTERVAL_MS: u64 = 2000;
 /// Batch size of messages to process per tick
 const FETCH_BATCH_SIZE: i64 = 50;
 
-/// Max retries before giving up on a message
-const MAX_RETRIES: i32 = 20;
+/// Max retries before marking a message as unfetchable
+const MAX_RETRIES: usize = 3;
 
 /// Peer storage API response
 /// Matches: aleph/services/p2p/http.py get_peer_hash_content
@@ -97,6 +98,9 @@ impl ContentFetchContext {
 pub async fn run(ctx: Arc<ContentFetchContext>) {
     let mut ticker = tokio::time::interval(Duration::from_millis(FETCH_INTERVAL_MS));
 
+    // Track per-hash failure counts — after MAX_RETRIES, mark as unfetchable
+    let mut failure_counts: HashMap<String, usize> = HashMap::new();
+
     info!("Content fetch service started");
 
     loop {
@@ -115,16 +119,20 @@ pub async fn run(ctx: Arc<ContentFetchContext>) {
             continue;
         }
 
-        debug!("Processing {} unfetched messages", unfetched.len());
-
         // Get current api_servers snapshot
         let servers: Vec<String> = {
             let set = ctx.api_servers.read().await;
             set.iter().cloned().collect()
         };
 
+        if servers.is_empty() {
+            debug!("No API servers available yet, skipping content fetch");
+            continue;
+        }
+
         let mut fetched_count = 0;
         let mut failed_count = 0;
+        let mut marked_unfetchable = 0;
 
         for (item_hash, item_type) in &unfetched {
             match fetch_and_verify(&ctx, item_hash, item_type, &servers).await {
@@ -133,22 +141,34 @@ pub async fn run(ctx: Arc<ContentFetchContext>) {
                         warn!("Failed to store fetched content for {}: {}", item_hash, e);
                     } else {
                         fetched_count += 1;
+                        failure_counts.remove(item_hash);
                     }
                 }
-                Err(e) => {
-                    debug!("Failed to fetch content for {}: {}", item_hash, e);
-                    // Mark as unfetchable after too many retries by storing empty JSON
-                    // This prevents infinite retries on legitimately unavailable content
-                    failed_count += 1;
+                Err(_e) => {
+                    let count = failure_counts.entry(item_hash.clone()).or_insert(0);
+                    *count += 1;
+                    if *count >= MAX_RETRIES {
+                        // Mark as unfetchable — all peers tried, content not available
+                        let _ = mark_unfetchable(&ctx.db, item_hash).await;
+                        failure_counts.remove(item_hash);
+                        marked_unfetchable += 1;
+                    } else {
+                        failed_count += 1;
+                    }
                 }
             }
         }
 
-        if fetched_count > 0 || failed_count > 0 {
+        if fetched_count > 0 || marked_unfetchable > 0 {
             info!(
-                "Content fetch batch: {} fetched, {} failed (from {} total)",
-                fetched_count, failed_count, unfetched.len()
+                "Content fetch: {} fetched, {} failed, {} marked unfetchable (batch {})",
+                fetched_count, failed_count, marked_unfetchable, unfetched.len()
             );
+        }
+
+        // Prevent unbounded memory growth — prune old entries periodically
+        if failure_counts.len() > 100_000 {
+            failure_counts.clear();
         }
     }
 }
@@ -237,9 +257,16 @@ async fn fetch_from_peer(
 
     // Decode base64 content
     let b64_content = body.content.unwrap();
+    if b64_content.is_empty() {
+        return Err(anyhow::anyhow!("Peer returned empty content"));
+    }
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&b64_content)
         .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
+
+    if decoded.is_empty() {
+        return Err(anyhow::anyhow!("Decoded content is empty"));
+    }
 
     Ok(decoded)
 }
@@ -280,8 +307,9 @@ fn verify_hash(expected_hash: &str, item_type: &str, content: &[u8]) -> bool {
     }
 }
 
-/// Query messages with NULL item_content that need fetching
-/// Targets messages table directly (not pending_messages)
+/// Query messages with NULL item_content that need fetching.
+/// Uses random ordering to avoid getting stuck on the same failing messages.
+/// Skips messages where item_content = '' (marked as unfetchable).
 async fn get_unfetched_messages(
     pool: &PgPool,
     limit: i64,
@@ -292,7 +320,7 @@ async fn get_unfetched_messages(
         FROM messages
         WHERE item_content IS NULL
           AND item_type IN ('storage', 'ipfs')
-        ORDER BY time DESC
+        ORDER BY RANDOM()
         LIMIT $1
         "#,
     )
@@ -313,6 +341,22 @@ async fn store_fetched_content(
         "UPDATE messages SET item_content = $1 WHERE item_hash = $2 AND item_content IS NULL"
     )
     .bind(content)
+    .bind(item_hash)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Mark a message as unfetchable by setting item_content to empty string.
+/// This prevents the content fetch loop from retrying it forever.
+async fn mark_unfetchable(
+    pool: &PgPool,
+    item_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE messages SET item_content = '' WHERE item_hash = $1 AND item_content IS NULL"
+    )
     .bind(item_hash)
     .execute(pool)
     .await?;
