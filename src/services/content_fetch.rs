@@ -22,12 +22,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
+use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -41,10 +43,13 @@ const PEER_FETCH_TIMEOUT_SECS: u64 = 10;
 const MAX_PEER_ATTEMPTS: usize = 5;
 
 /// Interval between content-fetch runs
-const FETCH_INTERVAL_MS: u64 = 2000;
+const FETCH_INTERVAL_MS: u64 = 500;
 
 /// Batch size of messages to process per tick
-const FETCH_BATCH_SIZE: i64 = 50;
+const FETCH_BATCH_SIZE: i64 = 200;
+
+/// Max concurrent fetch requests
+const MAX_CONCURRENT_FETCHES: usize = 50;
 
 /// Max retries before marking a message as unfetchable
 const MAX_RETRIES: usize = 3;
@@ -130,31 +135,44 @@ pub async fn run(ctx: Arc<ContentFetchContext>) {
             continue;
         }
 
-        let mut fetched_count = 0;
-        let mut failed_count = 0;
-        let mut marked_unfetchable = 0;
+        // Fetch all items concurrently with a semaphore
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+        let batch_size = unfetched.len();
 
-        for (item_hash, item_type) in &unfetched {
-            match fetch_and_verify(&ctx, item_hash, item_type, &servers).await {
+        let fetch_futures: Vec<_> = unfetched.into_iter().map(|(item_hash, item_type)| {
+            let ctx = ctx.clone();
+            let servers = servers.clone();
+            let sem = semaphore.clone();
+
+            async move {
+                let _permit = sem.acquire().await.ok();
+                let result = fetch_and_verify(&ctx, &item_hash, &item_type, &servers).await;
+                (item_hash, result)
+            }
+        }).collect();
+
+        let results = join_all(fetch_futures).await;
+
+        let mut fetched_count = 0u64;
+        let mut failed_count = 0u64;
+        let mut marked_unfetchable = 0u64;
+
+        for (item_hash, result) in results {
+            match result {
                 Ok(content) => {
-                    if let Err(e) = store_fetched_content(&ctx.db, item_hash, &content).await {
-                        warn!("Failed to store fetched content for {}: {}", item_hash, e);
+                    if let Err(e) = store_fetched_content(&ctx.db, &item_hash, &content).await {
+                        warn!("Failed to store content for {}: {}", item_hash, e);
                     } else {
                         fetched_count += 1;
-                        failure_counts.remove(item_hash);
+                        failure_counts.remove(&item_hash);
                     }
                 }
-                Err(e) => {
-                    if fetched_count == 0 && failed_count == 0 {
-                        // Log first failure reason per batch for debugging
-                        info!("First failure in batch: {} - {}", item_hash, e);
-                    }
+                Err(_) => {
                     let count = failure_counts.entry(item_hash.clone()).or_insert(0);
                     *count += 1;
                     if *count >= MAX_RETRIES {
-                        // Mark as unfetchable — all peers tried, content not available
-                        let _ = mark_unfetchable(&ctx.db, item_hash).await;
-                        failure_counts.remove(item_hash);
+                        let _ = mark_unfetchable(&ctx.db, &item_hash).await;
+                        failure_counts.remove(&item_hash);
                         marked_unfetchable += 1;
                     } else {
                         failed_count += 1;
@@ -164,8 +182,8 @@ pub async fn run(ctx: Arc<ContentFetchContext>) {
         }
 
         info!(
-            "Content fetch: {} fetched, {} failed, {} marked unfetchable (batch {}, {} peers)",
-            fetched_count, failed_count, marked_unfetchable, unfetched.len(), servers.len()
+            "Content fetch: {} fetched, {} failed, {} unfetchable (batch {}, {} peers)",
+            fetched_count, failed_count, marked_unfetchable, batch_size, servers.len()
         );
 
         // Prevent unbounded memory growth — prune old entries periodically
