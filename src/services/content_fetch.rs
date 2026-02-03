@@ -191,8 +191,13 @@ async fn fetch_and_verify(
         servers.shuffle(&mut rng);
 
         for (i, server) in servers.iter().take(MAX_PEER_ATTEMPTS).enumerate() {
-            match fetch_from_peer(&ctx.http, server, item_hash).await {
+            let result = fetch_from_peer(&ctx.http, server, item_hash).await;
+            match result {
                 Ok(content_bytes) => {
+                    info!(
+                        "Peer {} returned {} bytes for {} (attempt {})",
+                        server, content_bytes.len(), item_hash, i + 1
+                    );
                     // Verify hash based on item_type
                     if verify_hash(item_hash, item_type, &content_bytes) {
                         // Convert to string for storage
@@ -207,9 +212,7 @@ async fn fetch_and_verify(
                     }
                 }
                 Err(e) => {
-                    if i == 0 {
-                        info!("Peer fetch error from {}: {} (hash={})", server, e, item_hash);
-                    }
+                    info!("Peer {} error for {} (attempt {}): {}", server, item_hash, i + 1, e);
                 }
             }
         }
