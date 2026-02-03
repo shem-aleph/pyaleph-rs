@@ -191,13 +191,8 @@ async fn fetch_and_verify(
         servers.shuffle(&mut rng);
 
         for (i, server) in servers.iter().take(MAX_PEER_ATTEMPTS).enumerate() {
-            let result = fetch_from_peer(&ctx.http, server, item_hash).await;
-            match result {
+            match fetch_from_peer(&ctx.http, server, item_hash).await {
                 Ok(content_bytes) => {
-                    info!(
-                        "Peer {} returned {} bytes for {} (attempt {})",
-                        server, content_bytes.len(), item_hash, i + 1
-                    );
                     // Verify hash based on item_type
                     if verify_hash(item_hash, item_type, &content_bytes) {
                         // Convert to string for storage
@@ -212,7 +207,7 @@ async fn fetch_and_verify(
                     }
                 }
                 Err(e) => {
-                    info!("Peer {} error for {} (attempt {}): {}", server, item_hash, i + 1, e);
+                    debug!("Peer {} failed for {} (attempt {}): {}", server, item_hash, i + 1, e);
                 }
             }
         }
@@ -263,12 +258,14 @@ async fn fetch_from_peer(
     }
 
     // Decode base64 content
+    // Python pyaleph returns base64 with newline wrapping, so strip whitespace first
     let b64_content = body.content.unwrap();
     if b64_content.is_empty() {
         return Err(anyhow::anyhow!("Peer returned empty content"));
     }
+    let b64_clean: String = b64_content.chars().filter(|c| !c.is_whitespace()).collect();
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&b64_content)
+        .decode(&b64_clean)
         .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
 
     if decoded.is_empty() {
