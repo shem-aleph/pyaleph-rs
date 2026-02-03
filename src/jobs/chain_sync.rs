@@ -307,19 +307,46 @@ async fn sync_chain_from_indexer_optimized(
         let all_messages = filter_new_messages(pool, all_messages).await;
         info!("{}: {} truly new messages after DB dedup", chain, all_messages.len());
 
-        // Resolve content for storage-type messages
         if !all_messages.is_empty() {
-            let messages_with_content = resolve_message_contents(
-                ipfs_client,
-                gateway_url,
-                all_messages,
-                &semaphore,
-            ).await;
-            
-            // Batch insert messages AND queue for processing
-            let inserted = batch_insert_messages_and_queue(pool, &messages_with_content).await?;
-            total_messages += inserted;
-            info!("{}: Inserted {} new messages (with content, queued for processing)", chain, inserted);
+            // Split: inline messages can be inserted immediately, storage-type need content
+            let (have_content, need_content): (Vec<_>, Vec<_>) = all_messages
+                .into_iter()
+                .partition(|m| m.item_content.is_some());
+
+            // Insert inline messages immediately (fast path)
+            if !have_content.is_empty() {
+                let inline_count = have_content.len();
+                let inserted = batch_insert_messages_and_queue(pool, &have_content).await?;
+                total_messages += inserted;
+                info!("{}: Inserted {} inline messages immediately", chain, inserted);
+            }
+
+            // Queue storage-type messages for background content resolution
+            // Insert them WITHOUT content first (so cursor can advance), then resolve async
+            if !need_content.is_empty() {
+                let storage_count = need_content.len();
+                info!("{}: {} storage-type messages need content — inserting shells and queuing", chain, storage_count);
+
+                // Insert message shells (without content) so they exist in DB
+                let inserted = batch_insert_messages_and_queue(pool, &need_content).await?;
+                total_messages += inserted;
+
+                // Resolve content in background (don't block cursor advancement)
+                let pool_clone = pool.clone();
+                let client_clone = ipfs_client.clone();
+                let gateway = gateway_url.to_string();
+                let sem = Arc::clone(&semaphore);
+                tokio::spawn(async move {
+                    resolve_and_update_content(
+                        &client_clone,
+                        &gateway,
+                        &pool_clone,
+                        need_content,
+                        &sem,
+                    ).await;
+                });
+                info!("{}: Spawned background content resolution for {} messages", chain, storage_count);
+            }
         }
         
         // Update cursor
@@ -387,6 +414,68 @@ async fn filter_new_messages(pool: &PgPool, messages: Vec<Message>) -> Vec<Messa
     }
 
     filtered
+}
+
+/// Background task: resolve content for storage-type messages and update them in DB
+async fn resolve_and_update_content(
+    client: &reqwest::Client,
+    gateway_url: &str,
+    pool: &PgPool,
+    messages: Vec<Message>,
+    semaphore: &Arc<Semaphore>,
+) {
+    let total = messages.len();
+    let mut resolved = 0;
+    let mut failed = 0;
+
+    // Process in chunks to avoid holding too much in memory
+    for (chunk_idx, chunk) in messages.chunks(1000).enumerate() {
+        let fetch_futures: Vec<_> = chunk.iter().map(|msg| {
+            let sem = Arc::clone(semaphore);
+            let client = client.clone();
+            let gateway = gateway_url.to_string();
+            let item_hash = msg.item_hash.clone();
+
+            async move {
+                let _permit = sem.acquire().await.ok();
+                match fetch_from_gateway(&client, &gateway, &item_hash, 3).await {
+                    Ok(content) => Some((item_hash, content)),
+                    Err(_) => None,
+                }
+            }
+        }).collect();
+
+        let results: Vec<Option<(String, String)>> = join_all(fetch_futures).await;
+
+        for result in results {
+            if let Some((hash, content)) = result {
+                // Update the message in the DB with the fetched content
+                match sqlx::query(
+                    "UPDATE messages SET item_content = $1 WHERE item_hash = $2 AND item_content IS NULL"
+                )
+                .bind(&content)
+                .bind(&hash)
+                .execute(pool)
+                .await
+                {
+                    Ok(_) => resolved += 1,
+                    Err(e) => {
+                        debug!("Failed to update content for {}: {}", hash, e);
+                        failed += 1;
+                    }
+                }
+            } else {
+                failed += 1;
+            }
+        }
+
+        if (chunk_idx + 1) % 10 == 0 || chunk_idx == 0 {
+            info!("Content resolution progress: {}/{} resolved, {} failed, {}/{} total",
+                  resolved, resolved + failed, failed, (chunk_idx + 1) * 1000, total);
+        }
+    }
+
+    info!("Content resolution complete: {}/{} resolved, {} failed", resolved, total, failed);
 }
 
 /// Resolve content for messages with item_type storage/ipfs
