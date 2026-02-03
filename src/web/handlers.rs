@@ -3552,11 +3552,14 @@ pub async fn get_monitor_stats(
     let pending: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_messages")
         .fetch_one(db).await.unwrap_or((0,));
     
-    let messages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages")
-        .fetch_one(db).await.unwrap_or((0,));
+    // Use pg_class for fast approximate counts on large tables
+    let messages: (i64,) = sqlx::query_as(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'messages'"
+    ).fetch_one(db).await.unwrap_or((0,));
     
-    let rejected: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rejected_messages")
-        .fetch_one(db).await.unwrap_or((0,));
+    let rejected: (i64,) = sqlx::query_as(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'rejected_messages'"
+    ).fetch_one(db).await.unwrap_or((0,));
     
     let posts: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts")
         .fetch_one(db).await.unwrap_or((0,));
