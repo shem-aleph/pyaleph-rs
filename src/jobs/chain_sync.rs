@@ -32,7 +32,8 @@ const MAX_BLOCKS_PER_BATCH: u64 = 100;
 const MAX_CONCURRENT_IPFS: usize = 100;
 
 /// Pagination limit for indexer queries
-const INDEXER_LIMIT: usize = 5000;
+/// Each event contains a batch file with ~80-100 messages, so 200 events ≈ ~17K messages
+const INDEXER_LIMIT: usize = 200;
 
 /// Batch size for database inserts
 const DB_BATCH_SIZE: usize = 500;
