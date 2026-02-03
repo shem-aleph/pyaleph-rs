@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -163,8 +164,8 @@ async fn fetch_and_verify(
 ) -> anyhow::Result<String> {
     // Try HTTP peers first (shuffled randomly)
     if !api_servers.is_empty() {
-        let mut rng = rand::thread_rng();
         let mut servers: Vec<&String> = api_servers.iter().collect();
+        let mut rng = rand::rngs::StdRng::from_entropy();
         servers.shuffle(&mut rng);
 
         for server in servers.iter().take(MAX_PEER_ATTEMPTS) {
