@@ -3604,6 +3604,29 @@ pub async fn get_monitor_stats(
     for (t, count) in by_type {
         types_map.insert(t, json!(count));
     }
+
+    // Content fetch stats — messages missing item_content
+    let missing_content: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages WHERE item_content IS NULL AND item_type IN ('storage', 'ipfs')"
+    ).fetch_one(db).await.unwrap_or((0,));
+
+    let total_non_inline: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages WHERE item_type IN ('storage', 'ipfs')"
+    ).fetch_one(db).await.unwrap_or((0,));
+
+    let marked_unfetchable: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages WHERE item_content = '' AND item_type IN ('storage', 'ipfs')"
+    ).fetch_one(db).await.unwrap_or((0,));
+
+    let fetched_content = total_non_inline.0 - missing_content.0 - marked_unfetchable.0;
+    let fetch_pct = if total_non_inline.0 > 0 {
+        (fetched_content as f64 / total_non_inline.0 as f64 * 100.0)
+    } else { 0.0 };
+
+    // Peer stats
+    let online_peers: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM peers WHERE peer_type = 'HTTP' AND last_seen > now() - interval '5 minutes'"
+    ).fetch_one(db).await.unwrap_or((0,));
     
     Json(json!({
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -3625,6 +3648,14 @@ pub async fn get_monitor_stats(
             "recent_5min": recent_rate.0,
             "eta_seconds": eta_seconds,
             "eta_human": eta_human
+        },
+        "content_fetch": {
+            "total_non_inline": total_non_inline.0,
+            "fetched": fetched_content,
+            "missing": missing_content.0,
+            "unfetchable": marked_unfetchable.0,
+            "percent_complete": (fetch_pct * 10.0).round() / 10.0,
+            "online_peers": online_peers.0
         }
     }))
 }

@@ -349,6 +349,27 @@
     </div>
     
     <div class="grid">
+        <div class="card wide-card">
+            <div class="card-title">📥 Content Fetch Progress</div>
+            <div class="progress-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="contentFetchFill" style="width: 0%; background: linear-gradient(90deg, #00d4aa, #00b894)"></div>
+                </div>
+                <div class="progress-labels">
+                    <span id="contentFetched">0 fetched</span>
+                    <span id="contentPercent">0%</span>
+                    <span id="contentMissing">0 missing</span>
+                </div>
+            </div>
+            <div style="margin-top: 8px; display: flex; gap: 20px; font-size: 13px; color: #aaa;">
+                <span>🌐 Peers: <strong id="onlinePeers" style="color: #00d4aa;">0</strong></span>
+                <span>❌ Unfetchable: <strong id="contentUnfetchable" style="color: #e74c3c;">0</strong></span>
+                <span>📊 Total non-inline: <strong id="contentTotal" style="color: #fff;">0</strong></span>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid">
         <div class="card">
             <div class="card-title">Messages by Type</div>
             <div class="types-grid" id="typesGrid">
@@ -475,6 +496,18 @@
                 document.getElementById('progressProcessed').textContent = formatNumber(counts.messages) + ' processed';
                 document.getElementById('progressPending').textContent = formatNumber(counts.pending_messages) + ' pending';
                 document.getElementById('progressPercent').textContent = percent.toFixed(1) + '%';
+                
+                // Content fetch progress
+                const cf = data.content_fetch || {};
+                if (cf.total_non_inline > 0) {
+                    document.getElementById('contentFetchFill').style.width = (cf.percent_complete || 0) + '%';
+                    document.getElementById('contentFetched').textContent = formatNumber(cf.fetched || 0) + ' fetched';
+                    document.getElementById('contentMissing').textContent = formatNumber(cf.missing || 0) + ' missing';
+                    document.getElementById('contentPercent').textContent = (cf.percent_complete || 0) + '%';
+                    document.getElementById('onlinePeers').textContent = cf.online_peers || 0;
+                    document.getElementById('contentUnfetchable').textContent = formatNumber(cf.unfetchable || 0);
+                    document.getElementById('contentTotal').textContent = formatNumber(cf.total_non_inline || 0);
+                }
                 
                 // Messages by type
                 const typesGrid = document.getElementById('typesGrid');
