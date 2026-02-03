@@ -190,7 +190,7 @@ async fn fetch_and_verify(
         let mut rng = rand::rngs::StdRng::from_entropy();
         servers.shuffle(&mut rng);
 
-        for server in servers.iter().take(MAX_PEER_ATTEMPTS) {
+        for (i, server) in servers.iter().take(MAX_PEER_ATTEMPTS).enumerate() {
             match fetch_from_peer(&ctx.http, server, item_hash).await {
                 Ok(content_bytes) => {
                     // Verify hash based on item_type
@@ -207,7 +207,9 @@ async fn fetch_and_verify(
                     }
                 }
                 Err(e) => {
-                    debug!("Peer {} failed for {}: {}", server, item_hash, e);
+                    if i == 0 {
+                        info!("Peer fetch error from {}: {} (hash={})", server, e, item_hash);
+                    }
                 }
             }
         }
