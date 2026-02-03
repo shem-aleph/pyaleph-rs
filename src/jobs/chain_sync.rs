@@ -303,6 +303,10 @@ async fn sync_chain_from_indexer_optimized(
         let all_messages: Vec<Message> = seen.into_values().collect();
         info!("{}: {} unique messages after deduplication", chain, all_messages.len());
 
+        // Filter out messages that already exist in the database (critical optimization)
+        let all_messages = filter_new_messages(pool, all_messages).await;
+        info!("{}: {} truly new messages after DB dedup", chain, all_messages.len());
+
         // Resolve content for storage-type messages
         if !all_messages.is_empty() {
             let messages_with_content = resolve_message_contents(
@@ -337,6 +341,52 @@ async fn sync_chain_from_indexer_optimized(
     }
     
     Ok(total_messages)
+}
+
+/// Filter out messages that already exist in the database
+/// This is critical for performance: avoids re-downloading IPFS content for known messages
+async fn filter_new_messages(pool: &PgPool, messages: Vec<Message>) -> Vec<Message> {
+    if messages.is_empty() {
+        return messages;
+    }
+
+    // Check in batches of 1000 hashes
+    let mut existing_hashes: HashSet<String> = HashSet::new();
+
+    for chunk in messages.chunks(1000) {
+        let hashes: Vec<&str> = chunk.iter().map(|m| m.item_hash.as_str()).collect();
+
+        // Build a query with ANY($1)
+        let result: Vec<(String,)> = match sqlx::query_as(
+            "SELECT item_hash FROM messages WHERE item_hash = ANY($1)"
+        )
+        .bind(&hashes)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("Failed to check existing messages: {}, skipping dedup", e);
+                return messages;
+            }
+        };
+
+        for (hash,) in result {
+            existing_hashes.insert(hash);
+        }
+    }
+
+    let before = messages.len();
+    let filtered: Vec<Message> = messages
+        .into_iter()
+        .filter(|m| !existing_hashes.contains(&m.item_hash))
+        .collect();
+
+    if before != filtered.len() {
+        info!("Filtered {} existing messages, {} new", before - filtered.len(), filtered.len());
+    }
+
+    filtered
 }
 
 /// Resolve content for messages with item_type storage/ipfs
