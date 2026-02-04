@@ -1059,6 +1059,7 @@ pub async fn get_posts(
     let mut count_builder = crate::db::QueryBuilder::new(
         "SELECT COUNT(*) FROM posts p \
          LEFT JOIN posts a ON p.latest_amend = a.item_hash \
+         LEFT JOIN messages om ON p.item_hash = om.item_hash \
          WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
     );
     
@@ -1117,18 +1118,14 @@ pub async fn get_posts(
         count_builder.and_lte("p.time", end);
     }
     
-    // Filter by tags (searches coalesced content->tags array, matching Python pyaleph)
-    // Note: Can't use and_jsonb_array_contains because "COALESCE(a.content, p.content)"
-    // contains parentheses/commas that fail the column name validator and would panic.
-    // Use the @> containment operator via and_raw instead.
+    // Filter by tags - tags are in messages.item_content (POST wrapper), not posts.content (inner data)
+    // Use original message item_content since tags don't change with amends
     if let Some(ref tags) = params.tags {
         let tag_list = crate::db::parse_csv_param(tags);
         for tag in tag_list {
-            // Build a JSON containment check: content @> '{"tags":["value"]}'::jsonb
-            // We construct the JSON object programmatically to avoid escaping issues.
             let check_obj = serde_json::json!({"tags": [&tag]});
             let check_str = check_obj.to_string().replace('\'', "''");
-            let clause = format!("COALESCE(a.content, p.content) @> '{}'::jsonb", check_str);
+            let clause = format!("om.item_content::jsonb @> '{}'::jsonb", check_str);
             builder.and_raw(&clause);
             count_builder.and_raw(&clause);
         }
