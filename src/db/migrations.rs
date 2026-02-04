@@ -42,11 +42,11 @@ async fn create_messages_table(pool: &PgPool) -> Result<(), Error> {
             item_hash VARCHAR(64) PRIMARY KEY,
             message_type VARCHAR(20) NOT NULL,
             chain VARCHAR(10) NOT NULL,
-            sender VARCHAR(100) NOT NULL,
+            sender VARCHAR(256) NOT NULL,
             signature TEXT NOT NULL,
             item_type VARCHAR(20) NOT NULL,
             item_content TEXT,
-            channel VARCHAR(100),
+            channel VARCHAR(256),
             time DOUBLE PRECISION NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
@@ -146,7 +146,7 @@ async fn create_posts_table(pool: &PgPool) -> Result<(), Error> {
             post_type VARCHAR(50) NOT NULL,
             content JSONB NOT NULL,
             ref_ VARCHAR(64),
-            channel VARCHAR(100),
+            channel TEXT,
             time DOUBLE PRECISION NOT NULL,
             original_item_hash VARCHAR(64),
             latest_amend VARCHAR(64),

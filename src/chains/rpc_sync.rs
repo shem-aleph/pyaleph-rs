@@ -94,7 +94,7 @@ impl RpcSyncClient {
             .collect();
 
         // Default max range: 10000 blocks (~1.4 days of Ethereum)
-        let max_block_range = config.batch_size.max(1000).min(50000);
+        let max_block_range = config.batch_size.max(1000).min(200000);
 
         info!(
             "RPC sync client initialized: contract={:?}, max_range={}, rpcs={}",
