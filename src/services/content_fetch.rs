@@ -412,7 +412,11 @@ async fn queue_for_processing(
             true
         FROM messages m
         WHERE m.item_hash = $1
-        ON CONFLICT (item_hash) DO NOTHING
+        ON CONFLICT (item_hash) DO UPDATE SET
+            message = EXCLUDED.message,
+            fetched = true,
+            next_attempt = EXCLUDED.next_attempt,
+            retries = 0
         "#,
     )
     .bind(item_hash)

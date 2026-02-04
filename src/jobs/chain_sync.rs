@@ -681,7 +681,7 @@ async fn batch_insert_messages_and_queue(
             // Queue messages that were inserted or had content updated
             let affected_set: HashSet<&str> = affected_hashes.iter().map(|s| s.as_str()).collect();
             let messages_to_queue: Vec<&Message> = chunk.iter()
-                .filter(|m| affected_set.contains(m.item_hash.as_str()) && m.item_content.is_some())
+                .filter(|m| affected_set.contains(m.item_hash.as_str()))
                 .collect();
             
             if !messages_to_queue.is_empty() {
@@ -735,7 +735,7 @@ async fn queue_messages_for_processing(
             .bind(&msg.item_hash)
             .bind(message_json)
             .bind(now)
-            .bind(true)  // fetched = true (we have content)
+            .bind(msg.item_content.is_some())  // fetched = true only if we have content
             .bind(true)  // check_message
             .bind(0i32)  // retries
             .bind(now);  // next_attempt (process immediately)
