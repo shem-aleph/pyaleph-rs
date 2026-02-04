@@ -187,6 +187,18 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 {
+                    info!("Starting peer discovery job (corechannel aggregate)");
+                    let pool_clone = pool.clone();
+                    let config_arc_disc = Arc::new(config.clone());
+                    tokio::spawn(async move {
+                        peers::peer_discovery_job(
+                            pool_clone,
+                            config_arc_disc,
+                        ).await;
+                    });
+                }
+
+                {
                     info!("Starting content fetch service (peer-based)");
                     let pool_clone = pool.clone();
                     let config_arc_cf = Arc::new(config.clone());
