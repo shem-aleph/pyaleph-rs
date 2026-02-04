@@ -176,6 +176,9 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
                     ProcessResult::Retry(reason) => {
                         let _ = update_retry(&ctx.db, &pending, &reason).await;
                     }
+                    ProcessResult::Deferred => {
+                        // Left in pending_messages — next_attempt already updated
+                    }
                 }
             }
             Err(e) => {
@@ -202,6 +205,9 @@ enum ProcessResult {
     Rejected(ErrorCode, String),
     /// Message needs retry
     Retry(String),
+    /// Message deferred — waiting for external action (e.g. content fetch)
+    /// Left in pending_messages with updated next_attempt, no retry count increment
+    Deferred,
 }
 
 /// Process a single pending message
@@ -222,16 +228,30 @@ async fn process_single_message(
     }
     
     // Step 3: Fetch content if needed
-    let message = if needs_content_fetch(&message) && !pending.fetched {
-        match fetch_message_content(ctx, &message).await {
-            Ok(msg) => {
-                // Mark as fetched
-                mark_fetched(&ctx.db, &pending.item_hash).await?;
-                msg
+    // For storage/IPFS messages without content, defer to content_fetch service
+    // rather than trying to fetch here (avoids race conditions and wasted retries)
+    let message = if needs_content_fetch(&message) {
+        if pending.fetched {
+            // content_fetch has filled the content — reload from messages table
+            match reload_message_content(&ctx.db, &pending.item_hash).await {
+                Ok(Some(content)) => {
+                    let mut msg = message.clone();
+                    msg.item_content = Some(content);
+                    msg
+                }
+                Ok(None) => {
+                    // Content still not in messages table despite fetched=true, defer
+                    return Ok(ProcessResult::Retry("Content marked fetched but not found in messages table".to_string()));
+                }
+                Err(e) => {
+                    return Ok(ProcessResult::Retry(format!("Failed to reload content: {}", e)));
+                }
             }
-            Err(e) => {
-                return Ok(ProcessResult::Retry(format!("Content fetch failed: {}", e)));
-            }
+        } else {
+            // Content not yet fetched by content_fetch — defer without wasting retries
+            defer_pending(&ctx.db, &pending.item_hash, 30.0).await?;
+            debug!("Deferring {} — waiting for content_fetch to provide content", pending.item_hash);
+            return Ok(ProcessResult::Deferred);
         }
     } else {
         message
@@ -341,6 +361,32 @@ async fn fetch_message_content(
     msg.item_content = Some(content_str);
     
     Ok(msg)
+}
+
+
+/// Reload item_content from messages table (after content_fetch has stored it)
+async fn reload_message_content(db: &PgPool, item_hash: &str) -> Result<Option<String>, ProcessorError> {
+    let result: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT item_content FROM messages WHERE item_hash = $1"
+    )
+    .bind(item_hash)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+
+    Ok(result.and_then(|(content,)| content))
+}
+
+/// Defer a pending message by pushing its next_attempt forward without incrementing retries
+async fn defer_pending(db: &PgPool, item_hash: &str, delay_secs: f64) -> Result<(), ProcessorError> {
+    let next_attempt = chrono::Utc::now().timestamp() as f64 + delay_secs;
+    sqlx::query("UPDATE pending_messages SET next_attempt = $1 WHERE item_hash = $2")
+        .bind(next_attempt)
+        .bind(item_hash)
+        .execute(db)
+        .await
+        .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    Ok(())
 }
 
 /// Check if a message has already been processed (duplicate detection)

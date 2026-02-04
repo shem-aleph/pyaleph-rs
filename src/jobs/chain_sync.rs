@@ -476,7 +476,36 @@ async fn resolve_and_update_content(
                 .execute(pool)
                 .await
                 {
-                    Ok(_) => resolved += 1,
+                    Ok(_) => {
+                        resolved += 1;
+                        // Also update pending_messages: set fetched=true and rebuild message JSON
+                        let _ = sqlx::query(
+                            r#"
+                            UPDATE pending_messages SET
+                                fetched = true,
+                                message = (
+                                    SELECT json_build_object(
+                                        'type', m.message_type,
+                                        'chain', m.chain,
+                                        'sender', m.sender,
+                                        'signature', m.signature,
+                                        'item_type', m.item_type,
+                                        'item_hash', m.item_hash,
+                                        'item_content', m.item_content,
+                                        'channel', m.channel,
+                                        'time', m.time
+                                    )::jsonb
+                                    FROM messages m WHERE m.item_hash = $1
+                                ),
+                                next_attempt = EXTRACT(EPOCH FROM NOW()),
+                                retries = 0
+                            WHERE item_hash = $1
+                            "#
+                        )
+                        .bind(&hash)
+                        .execute(pool)
+                        .await;
+                    }
                     Err(e) => {
                         debug!("Failed to update content for {}: {}", hash, e);
                         failed += 1;
