@@ -82,7 +82,6 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
         SELECT * FROM pending_messages 
         WHERE next_attempt <= $1 AND retries < $2
         ORDER BY
-            CASE WHEN message->>'type' = 'AGGREGATE' THEN 0 ELSE 1 END,
             reception_time ASC
         LIMIT $3
         FOR UPDATE SKIP LOCKED
@@ -108,41 +107,18 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
     ];
     use std::collections::HashMap;
     
-    // Split into aggregates and non-aggregates for two-phase processing
-    // Phase 1: Process all AGGREGATE messages first (populates security aggregates)
-    // Phase 2: Process everything else (can now check permissions against populated aggregates)
-    let mut aggregate_msgs: Vec<PendingMessageDb> = Vec::new();
-    let mut other_msgs: Vec<PendingMessageDb> = Vec::new();
+    // Group by address — all message types together, processed sequentially per address.
+    // Within each group, messages are in reception_time order (from SQL ORDER BY).
+    // This means aggregates created before posts get processed first for the same address.
+    // Cross-address dependencies resolve on retry.
+    let mut by_address: HashMap<String, Vec<PendingMessageDb>> = HashMap::new();
     let mut blacklisted_hashes: Vec<String> = Vec::new();
-    
     for msg in pending_messages {
         let addr = msg.message.get("sender").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if BLACKLISTED_ADDRESSES.contains(&addr.as_str()) {
             blacklisted_hashes.push(msg.item_hash.clone());
             continue;
         }
-        let msg_type = msg.message.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if msg_type == "AGGREGATE" {
-            aggregate_msgs.push(msg);
-        } else {
-            other_msgs.push(msg);
-        }
-    }
-    
-    // Two-phase processing: AGGREGATEs first (to populate security aggregates),
-    // then everything else (can now check permissions)
-    let mut agg_by_address: HashMap<String, Vec<PendingMessageDb>> = HashMap::new();
-    for msg in aggregate_msgs {
-        let addr = msg.message.get("sender").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        let entry = agg_by_address.entry(addr).or_default();
-        if entry.len() < MAX_PER_ADDRESS {
-            entry.push(msg);
-        }
-    }
-    
-    let mut by_address: HashMap<String, Vec<PendingMessageDb>> = HashMap::new();
-    for msg in other_msgs {
-        let addr = msg.message.get("sender").and_then(|s| s.as_str()).unwrap_or("").to_string();
         let entry = by_address.entry(addr).or_default();
         if entry.len() < MAX_PER_ADDRESS {
             entry.push(msg);
@@ -154,10 +130,10 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
         let _ = batch_delete_pending(&ctx.db, &blacklisted_hashes).await;
     }
     
-    tracing::info!("Processing {} aggregate groups + {} other groups", agg_by_address.len(), by_address.len());
+    tracing::info!("Processing {} address groups", by_address.len());
     
-    // Phase 1: Process AGGREGATE messages first
-    let agg_results: Vec<_> = stream::iter(agg_by_address.into_values())
+    // Process address groups in parallel — within each group, messages are sequential
+    let results: Vec<_> = stream::iter(by_address.into_values())
         .map(|address_msgs| {
             let ctx = ctx.clone();
             async move {
@@ -177,31 +153,8 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
         .collect::<Vec<_>>()
         .await;
     
-    // Phase 2: Process everything else (security aggregates now available)
-    let other_results: Vec<_> = stream::iter(by_address.into_values())
-        .map(|address_msgs| {
-            let ctx = ctx.clone();
-            async move {
-                let mut group_results = Vec::new();
-                for pending in address_msgs {
-                    let hash = pending.item_hash.clone();
-                    let result = match timeout(std::time::Duration::from_secs(30), process_single_message(&ctx, &pending)).await {
-                        Ok(r) => r,
-                        Err(_) => Err(ProcessorError::InvalidMessage("Timeout".to_string()))
-                    };
-                    group_results.push((hash, pending, result));
-                }
-                group_results
-            }
-        })
-        .buffer_unordered(200)
-        .collect::<Vec<_>>()
-        .await;
-    
-    // Flatten and combine results from both phases
-    let agg_flat: Vec<_> = agg_results.into_iter().flatten().collect();
-    let other_flat: Vec<_> = other_results.into_iter().flatten().collect();
-    let results: Vec<_> = agg_flat.into_iter().chain(other_flat.into_iter()).collect();
+    // Flatten results
+    let results: Vec<_> = results.into_iter().flatten().collect();
     tracing::info!("Processed {} messages", results.len());
     // Batch collect successful deletions
     let mut to_delete: Vec<String> = Vec::new();
