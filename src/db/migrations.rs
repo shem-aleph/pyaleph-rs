@@ -39,9 +39,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Error> {
 async fn create_messages_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS messages (
-            item_hash VARCHAR(64) PRIMARY KEY,
+            item_hash VARCHAR(128) PRIMARY KEY,
             message_type VARCHAR(20) NOT NULL,
-            chain VARCHAR(10) NOT NULL,
+            chain VARCHAR(64) NOT NULL,
             sender VARCHAR(256) NOT NULL,
             signature TEXT NOT NULL,
             item_type VARCHAR(20) NOT NULL,
@@ -59,13 +59,14 @@ async fn create_messages_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_pending_messages_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS pending_messages (
-            item_hash VARCHAR(64) PRIMARY KEY,
+            item_hash VARCHAR(128) PRIMARY KEY,
             message JSONB NOT NULL,
             reception_time DOUBLE PRECISION NOT NULL,
             fetched BOOLEAN DEFAULT FALSE,
             check_message BOOLEAN DEFAULT TRUE,
             retries INTEGER DEFAULT 0,
             next_attempt DOUBLE PRECISION NOT NULL,
+            trusted_source BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     "#)
@@ -77,7 +78,7 @@ async fn create_pending_messages_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_rejected_messages_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS rejected_messages (
-            item_hash VARCHAR(64) PRIMARY KEY,
+            item_hash VARCHAR(128) PRIMARY KEY,
             message JSONB NOT NULL,
             error_code INTEGER NOT NULL,
             error_message TEXT,
@@ -92,8 +93,8 @@ async fn create_rejected_messages_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_forgotten_messages_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS forgotten_messages (
-            item_hash VARCHAR(64) PRIMARY KEY,
-            forget_hash VARCHAR(64) NOT NULL,
+            item_hash VARCHAR(128) PRIMARY KEY,
+            forget_hash VARCHAR(128) NOT NULL,
             reason TEXT,
             forgotten_at TIMESTAMPTZ DEFAULT NOW()
         )
@@ -106,12 +107,12 @@ async fn create_forgotten_messages_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_aggregates_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS aggregates (
-            address VARCHAR(100) NOT NULL,
-            key VARCHAR(255) NOT NULL,
+            address VARCHAR(256) NOT NULL,
+            key VARCHAR(256) NOT NULL,
             content JSONB NOT NULL,
             time DOUBLE PRECISION NOT NULL,
             dirty BOOLEAN DEFAULT FALSE,
-            last_revision_hash VARCHAR(64),
+            last_revision_hash VARCHAR(128),
             created_at TIMESTAMPTZ DEFAULT NOW(),
             PRIMARY KEY (address, key)
         )
@@ -125,9 +126,9 @@ async fn create_aggregate_elements_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS aggregate_elements (
             id BIGSERIAL PRIMARY KEY,
-            address VARCHAR(100) NOT NULL,
-            key VARCHAR(255) NOT NULL,
-            item_hash VARCHAR(64) NOT NULL,
+            address VARCHAR(256) NOT NULL,
+            key VARCHAR(256) NOT NULL,
+            item_hash VARCHAR(128) NOT NULL,
             content JSONB NOT NULL,
             time DOUBLE PRECISION NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW()
@@ -141,15 +142,15 @@ async fn create_aggregate_elements_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_posts_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS posts (
-            item_hash VARCHAR(64) PRIMARY KEY,
-            address VARCHAR(100) NOT NULL,
+            item_hash VARCHAR(128) PRIMARY KEY,
+            address VARCHAR(256) NOT NULL,
             post_type VARCHAR(50) NOT NULL,
             content JSONB NOT NULL,
-            ref_ VARCHAR(64),
+            ref_ VARCHAR(128),
             channel TEXT,
             time DOUBLE PRECISION NOT NULL,
-            original_item_hash VARCHAR(64),
-            latest_amend VARCHAR(64),
+            original_item_hash VARCHAR(128),
+            latest_amend VARCHAR(128),
             amends JSONB,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
@@ -162,7 +163,7 @@ async fn create_posts_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_balances_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS balances (
-            address VARCHAR(100) NOT NULL,
+            address VARCHAR(256) NOT NULL,
             chain VARCHAR(10) NOT NULL,
             balance DECIMAL(78, 18) NOT NULL DEFAULT 0,
             updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -177,7 +178,7 @@ async fn create_balances_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_credit_balances_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS credit_balances (
-            address VARCHAR(100) PRIMARY KEY,
+            address VARCHAR(256) PRIMARY KEY,
             balance DECIMAL(78, 18) NOT NULL DEFAULT 0,
             expiration TIMESTAMPTZ,
             updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -191,8 +192,8 @@ async fn create_credit_balances_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_file_pins_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS file_pins (
-            item_hash VARCHAR(64) NOT NULL,
-            owner VARCHAR(100) NOT NULL,
+            item_hash VARCHAR(128) NOT NULL,
+            owner VARCHAR(256) NOT NULL,
             size BIGINT NOT NULL DEFAULT 0,
             content_type VARCHAR(100),
             created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -207,7 +208,7 @@ async fn create_file_pins_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_file_tags_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS file_tags (
-            item_hash VARCHAR(64) NOT NULL,
+            item_hash VARCHAR(128) NOT NULL,
             tag VARCHAR(100) NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             PRIMARY KEY (item_hash, tag)
@@ -221,10 +222,10 @@ async fn create_file_tags_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_programs_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS programs (
-            item_hash VARCHAR(64) PRIMARY KEY,
-            owner VARCHAR(100) NOT NULL,
-            code_ref VARCHAR(64) NOT NULL,
-            runtime_ref VARCHAR(64) NOT NULL,
+            item_hash VARCHAR(128) PRIMARY KEY,
+            owner VARCHAR(256) NOT NULL,
+            code_ref VARCHAR(128) NOT NULL,
+            runtime_ref VARCHAR(128) NOT NULL,
             memory INTEGER NOT NULL,
             vcpus INTEGER NOT NULL,
             allow_amend BOOLEAN DEFAULT TRUE,
@@ -239,9 +240,9 @@ async fn create_programs_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_instances_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS instances (
-            item_hash VARCHAR(64) PRIMARY KEY,
-            owner VARCHAR(100) NOT NULL,
-            rootfs_ref VARCHAR(64) NOT NULL,
+            item_hash VARCHAR(128) PRIMARY KEY,
+            owner VARCHAR(256) NOT NULL,
+            rootfs_ref VARCHAR(128) NOT NULL,
             memory INTEGER NOT NULL,
             vcpus INTEGER NOT NULL,
             payment_type VARCHAR(20),
@@ -259,10 +260,10 @@ async fn create_instances_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_vm_versions_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS vm_versions (
-            item_hash VARCHAR(64) PRIMARY KEY,
-            original_hash VARCHAR(64) NOT NULL,
+            item_hash VARCHAR(128) PRIMARY KEY,
+            original_hash VARCHAR(128) NOT NULL,
             version INTEGER NOT NULL,
-            owner VARCHAR(100) NOT NULL,
+            owner VARCHAR(256) NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     "#)
@@ -277,8 +278,8 @@ async fn create_chain_txs_table(pool: &PgPool) -> Result<(), Error> {
             hash VARCHAR(100) NOT NULL,
             chain VARCHAR(10) NOT NULL,
             height BIGINT NOT NULL,
-            item_hash VARCHAR(64) NOT NULL,
-            publisher VARCHAR(100),
+            item_hash VARCHAR(128) NOT NULL,
+            publisher VARCHAR(256),
             protocol VARCHAR(50) NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             PRIMARY KEY (hash, chain)
@@ -292,7 +293,7 @@ async fn create_chain_txs_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_account_costs_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS account_costs (
-            address VARCHAR(100) PRIMARY KEY,
+            address VARCHAR(256) PRIMARY KEY,
             storage_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
             compute_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
             total_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
@@ -307,11 +308,10 @@ async fn create_account_costs_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_chain_sync_state_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS chain_sync_state (
-            chain VARCHAR(10) NOT NULL,
-            sync_type VARCHAR(50) NOT NULL,
-            last_height BIGINT NOT NULL DEFAULT 0,
+            chain VARCHAR(64) PRIMARY KEY,
+            last_block BIGINT NOT NULL DEFAULT 0,
             last_sync TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (chain, sync_type)
+            last_sync_timestamp BIGINT DEFAULT 0
         )
     "#)
     .execute(pool)
@@ -322,10 +322,10 @@ async fn create_chain_sync_state_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_pending_txs_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS pending_txs (
-            ipfs_hash VARCHAR(64) PRIMARY KEY,
+            ipfs_hash VARCHAR(128) PRIMARY KEY,
             chain VARCHAR(10) NOT NULL,
             item_hashes JSONB NOT NULL,
-            tx_hash VARCHAR(100),
+            tx_hash VARCHAR(128),
             status VARCHAR(20) NOT NULL DEFAULT 'pending',
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
