@@ -270,9 +270,12 @@ pub async fn process_message(message: &Message, ctx: &HandlerContext) -> Process
     }
     
     // Check permissions (security aggregate delegation)
-    if let Err(e) = handler.check_permissions(message, ctx).await {
-        tracing::warn!("Message permission check failed: {}", e);
-        return e.into();
+    // Skip for trusted sources (indexer data is pre-verified by the network)
+    if !ctx.trusted_source {
+        if let Err(e) = handler.check_permissions(message, ctx).await {
+            tracing::warn!("Message permission check failed: {}", e);
+            return e.into();
+        }
     }
     
     // Process
