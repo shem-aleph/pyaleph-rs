@@ -102,6 +102,22 @@ impl MessageHandler for AggregateHandler {
                 }
             }
             
+
+            // Insert into aggregate_elements for tracking and duplicate detection
+            sqlx::query(
+                "INSERT INTO aggregate_elements (address, key, item_hash, content, time)
+                 SELECT $1, $2, $3, $4, $5
+                 WHERE NOT EXISTS (SELECT 1 FROM aggregate_elements WHERE item_hash = $3)"
+            )
+            .bind(&content.address)
+            .bind(&content.key)
+            .bind(&message.item_hash)
+            .bind(&content.content)
+            .bind(content.time)
+            .execute(pool)
+            .await
+            .map_err(|e| HandlerError::Database(e.to_string()))?;
+            
             tracing::debug!("Stored aggregate: {}/{}", content.address, content.key);
         }
         

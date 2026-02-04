@@ -81,7 +81,9 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
         r#"
         SELECT * FROM pending_messages 
         WHERE next_attempt <= $1 AND retries < $2
-        ORDER BY reception_time ASC
+        ORDER BY
+            CASE WHEN message->>'type' = 'AGGREGATE' THEN 0 ELSE 1 END,
+            reception_time ASC
         LIMIT $3
         FOR UPDATE SKIP LOCKED
         "#
@@ -275,7 +277,7 @@ async fn process_single_message(
     }
     
     // Step 6: Create handler context
-    let handler_ctx = create_handler_context(ctx);
+    let handler_ctx = create_handler_context(ctx, pending.trusted_source);
     
     // Step 7: Process with appropriate handler
     let status = handlers::process_message(&message, &handler_ctx).await;
@@ -509,11 +511,12 @@ async fn store_processed_message(db: &PgPool, message: &Message) -> Result<(), P
 }
 
 /// Create a handler context from the processor context
-fn create_handler_context(ctx: &ProcessorContext) -> HandlerContext {
+fn create_handler_context(ctx: &ProcessorContext, trusted_source: bool) -> HandlerContext {
     let mut handler_ctx = HandlerContext::new();
     handler_ctx.crypto = Some(ctx.crypto.clone());
     handler_ctx.pool = Some(ctx.db.clone());
     handler_ctx.db = Some(Arc::new(crate::db::PgDatabase::new(ctx.db.clone())));
+    handler_ctx.trusted_source = trusted_source;
     handler_ctx
 }
 
