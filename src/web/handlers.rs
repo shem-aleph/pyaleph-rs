@@ -1048,7 +1048,6 @@ pub async fn get_posts(
          COALESCE(am.signature, om.signature) AS signature, \
          COALESCE(am.item_type, om.item_type) AS item_type, \
          CASE WHEN am.item_content IS NOT NULL THEN am.item_content ELSE om.item_content END AS item_content, \
-         COALESCE(am.size, om.size) AS size, \
          om.signature AS original_signature, \
          p.post_type AS original_type \
          FROM posts p \
@@ -1119,11 +1118,19 @@ pub async fn get_posts(
     }
     
     // Filter by tags (searches coalesced content->tags array, matching Python pyaleph)
+    // Note: Can't use and_jsonb_array_contains because "COALESCE(a.content, p.content)"
+    // contains parentheses/commas that fail the column name validator and would panic.
+    // Use the @> containment operator via and_raw instead.
     if let Some(ref tags) = params.tags {
         let tag_list = crate::db::parse_csv_param(tags);
         for tag in tag_list {
-            builder.and_jsonb_array_contains("COALESCE(a.content, p.content)", "tags", tag.clone());
-            count_builder.and_jsonb_array_contains("COALESCE(a.content, p.content)", "tags", tag);
+            // Build a JSON containment check: content @> '{"tags":["value"]}'::jsonb
+            // We construct the JSON object programmatically to avoid escaping issues.
+            let check_obj = serde_json::json!({"tags": [&tag]});
+            let check_str = check_obj.to_string().replace('\'', "''");
+            let clause = format!("COALESCE(a.content, p.content) @> '{}'::jsonb", check_str);
+            builder.and_raw(&clause);
+            count_builder.and_raw(&clause);
         }
     }
     
@@ -1166,17 +1173,22 @@ pub async fn get_posts(
         Option<String>,            // 10: signature (coalesced)
         Option<String>,            // 11: item_type (coalesced)
         Option<String>,            // 12: item_content
-        Option<i64>,               // 13: size (coalesced)
-        Option<String>,            // 14: original_signature
-        Option<String>,            // 15: original_type
+        Option<String>,            // 13: original_signature
+        Option<String>,            // 14: original_type
     );
     
     // Get the posts with joined message data
     let (query, args) = builder.build();
-    let rows: Vec<PostJoinRow> = sqlx::query_as_with(&query, args)
+    let rows: Vec<PostJoinRow> = match sqlx::query_as_with(&query, args)
         .fetch_all(state.db())
         .await
-        .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Posts query failed: {} | SQL: {}", e, query);
+            vec![]
+        }
+    };
     
     // Get original item_hashes for confirmation lookup
     let item_hashes: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
@@ -1214,7 +1226,7 @@ pub async fn get_posts(
             .unwrap_or_default();
         let confirmed = !confirmations.is_empty();
         
-        let size = row.13.unwrap_or_else(|| row.12.as_ref().map(|c| c.len() as i64).unwrap_or(0));
+        let size = row.12.as_ref().map(|c| c.len() as i64).unwrap_or(0);
         
         PostResponseV0 {
             item_hash: row.1.clone(),          // coalesced (amend or original)
@@ -1234,8 +1246,8 @@ pub async fn get_posts(
             size,
             confirmed,
             confirmations,
-            original_signature: row.14.clone(),
-            original_type: row.15.clone(),
+            original_signature: row.13.clone(),
+            original_type: row.14.clone(),
         }
     }).collect();
     
