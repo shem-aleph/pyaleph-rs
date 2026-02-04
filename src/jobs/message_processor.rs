@@ -513,6 +513,7 @@ fn create_handler_context(ctx: &ProcessorContext) -> HandlerContext {
     let mut handler_ctx = HandlerContext::new();
     handler_ctx.crypto = Some(ctx.crypto.clone());
     handler_ctx.pool = Some(ctx.db.clone());
+    handler_ctx.db = Some(Arc::new(crate::db::PgDatabase::new(ctx.db.clone())));
     handler_ctx
 }
 

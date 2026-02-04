@@ -6,9 +6,11 @@ pub mod models;
 pub mod accessors;
 pub mod migrations;
 pub mod pool;
+pub mod pg_database;
 pub mod query_builder;
 pub mod sync_state;
 
+pub use pg_database::PgDatabase;
 pub use sync_state::SyncStateAccessor;
 pub use models::*;
 pub use query_builder::{QueryBuilder, parse_csv_param, validate_sort_column};
