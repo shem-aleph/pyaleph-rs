@@ -363,30 +363,43 @@ impl RabbitMQService {
 }
 
 /// Start the RabbitMQ consumer loop
+///
+/// On initial connection failure, logs a warning and retries every 5 minutes
+/// (RabbitMQ is optional — only needed when p2p-service is running).
 pub async fn run_consumer(
     config: RabbitMQConfig,
     message_tx: mpsc::Sender<P2PMessage>,
 ) {
     let mut service = RabbitMQService::new(config.clone());
-    
+    let mut has_connected = false;
+
     loop {
         // Try to connect
         if let Err(e) = service.connect().await {
-            error!("Failed to connect to RabbitMQ: {}", e);
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            if !has_connected {
+                warn!("RabbitMQ not available ({}), consumer disabled. Will retry every 5 minutes.", e);
+            } else {
+                warn!("RabbitMQ connection lost ({}), retrying in 5 minutes...", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
             continue;
         }
-        
+
+        if !has_connected {
+            info!("RabbitMQ consumer connected successfully");
+        }
+        has_connected = true;
+
         // Start consuming
         let consumer = match service.start_consuming().await {
             Ok(c) => c,
             Err(e) => {
-                error!("Failed to start consumer: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                warn!("Failed to start RabbitMQ consumer: {}, retrying in 5 minutes", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
                 continue;
             }
         };
-        
+
         // Process messages
         let mut consumer = consumer;
         while let Some(delivery) = consumer.next().await {
@@ -405,22 +418,22 @@ pub async fn run_consumer(
                             warn!("Failed to parse P2P message: {}", e);
                         }
                     }
-                    
+
                     // Acknowledge
                     if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
                         warn!("Failed to ack message: {}", e);
                     }
                 }
                 Err(e) => {
-                    error!("Consumer error: {}", e);
+                    warn!("Consumer error: {}", e);
                     break;
                 }
             }
         }
-        
-        // Connection lost, retry
-        warn!("RabbitMQ connection lost, reconnecting...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        // Connection lost after successful connection, retry at long interval
+        warn!("RabbitMQ connection lost, reconnecting in 5 minutes...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
     }
 }
 

@@ -88,7 +88,13 @@ impl P2pConsumerContext {
     }
 }
 
-/// Run the P2P consumer job. Loops forever, reconnecting on failure.
+/// Retry interval when RabbitMQ is unavailable (5 minutes)
+const LONG_RECONNECT_DELAY_SECS: u64 = 300;
+
+/// Run the P2P consumer job.
+///
+/// On initial connection failure, logs a warning once and retries every 5 minutes
+/// instead of spamming errors every 5 seconds.
 pub async fn run(ctx: Arc<P2pConsumerContext>) {
     if !ctx.config.rabbitmq.enabled {
         info!("RabbitMQ integration disabled, p2p consumer not starting");
@@ -103,22 +109,25 @@ pub async fn run(ctx: Arc<P2pConsumerContext>) {
         ctx.config.rabbitmq.sub_exchange, queue_topic, alive_topic
     );
 
+    let mut has_connected = false;
+
     loop {
         match run_consumer_loop(&ctx, &queue_topic, &alive_topic).await {
             Ok(()) => {
                 // Clean exit (shouldn't happen normally)
                 warn!("P2P consumer loop exited cleanly, restarting...");
+                has_connected = true;
             }
             Err(e) => {
-                error!("P2P consumer error: {}", e);
+                if !has_connected {
+                    warn!("RabbitMQ not available, P2P consumer disabled ({}). Will retry every 5 minutes.", e);
+                } else {
+                    warn!("P2P consumer connection lost: {}. Retrying in 5 minutes...", e);
+                }
             }
         }
 
-        info!(
-            "Reconnecting to RabbitMQ in {}s...",
-            RECONNECT_DELAY_SECS
-        );
-        tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+        tokio::time::sleep(Duration::from_secs(LONG_RECONNECT_DELAY_SECS)).await;
     }
 }
 
