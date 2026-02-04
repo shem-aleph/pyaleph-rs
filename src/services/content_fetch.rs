@@ -342,6 +342,7 @@ async fn get_unfetched_messages(
         FROM messages
         WHERE item_content IS NULL
           AND item_type IN ('storage', 'ipfs')
+          AND sender NOT IN ('0x51A58800b26AA1451aaA803d1746687cB88E0501')
         ORDER BY RANDOM()
         LIMIT $1
         "#,

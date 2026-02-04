@@ -38,6 +38,11 @@ const INDEXER_LIMIT: usize = 200;
 /// Batch size for database inserts
 const DB_BATCH_SIZE: usize = 500;
 
+/// Blacklisted sender addresses — skip these during sync to prevent OOM from spam
+const BLACKLISTED_SENDERS: &[&str] = &[
+    "0x51A58800b26AA1451aaA803d1746687cB88E0501", // UNSLASHED - 3.5M spam messages
+];
+
 /// Run the chain sync job
 pub async fn run(config: Arc<Config>) {
     let indexers = start_indexers(&config.chains).await;
@@ -304,6 +309,16 @@ async fn sync_chain_from_indexer_optimized(
         let all_messages: Vec<Message> = seen.into_values().collect();
         info!("{}: {} unique messages after deduplication", chain, all_messages.len());
 
+        // Filter out blacklisted senders (prevents OOM from spam addresses)
+        let pre_blacklist = all_messages.len();
+        let all_messages: Vec<Message> = all_messages
+            .into_iter()
+            .filter(|m| !BLACKLISTED_SENDERS.contains(&m.sender.as_str()))
+            .collect();
+        if all_messages.len() < pre_blacklist {
+            info!("{}: Filtered {} blacklisted messages", chain, pre_blacklist - all_messages.len());
+        }
+
         // Filter out messages that already exist in the database (critical optimization)
         let all_messages = filter_new_messages(pool, all_messages).await;
         info!("{}: {} truly new messages after DB dedup", chain, all_messages.len());
@@ -350,10 +365,12 @@ async fn sync_chain_from_indexer_optimized(
             }
         }
         
-        // Update cursor
+        // Update cursor — store timestamp + 1 to advance past the last processed event
+        // (indexer uses inclusive startDate, so we must skip past the last seen timestamp)
         if let Some(last_event) = events.last() {
-            start_ts = last_event.timestamp + 1;
-            SyncStateAccessor::update_last_sync_timestamp(pool, chain, last_event.timestamp).await?;
+            let next_ts = last_event.timestamp + 1;
+            start_ts = next_ts;
+            SyncStateAccessor::update_last_sync_timestamp(pool, chain, next_ts).await?;
         }
         
         if events_count < limit {
