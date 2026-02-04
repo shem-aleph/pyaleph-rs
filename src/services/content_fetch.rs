@@ -162,6 +162,11 @@ pub async fn run(ctx: Arc<ContentFetchContext>) {
                 Ok(content) => {
                     if let Err(e) = store_fetched_content(&ctx.db, &item_hash, &content).await {
                         warn!("Failed to store content for {}: {}", item_hash, e);
+                    } else if let Err(e) = queue_for_processing(&ctx.db, &item_hash).await {
+                        warn!("Failed to queue {} for processing: {}", item_hash, e);
+                        // Content was stored but queuing failed — still count as fetched
+                        fetched_count += 1;
+                        failure_counts.remove(&item_hash);
                     } else {
                         fetched_count += 1;
                         failure_counts.remove(&item_hash);
@@ -368,6 +373,53 @@ async fn store_fetched_content(
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Queue a message for handler processing after content has been fetched.
+///
+/// Reconstructs the Message JSON from the messages table row and inserts it
+/// into pending_messages so the message_processor picks it up and runs the
+/// appropriate handler (PostHandler, AggregateHandler, etc.).
+async fn queue_for_processing(
+    pool: &PgPool,
+    item_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO pending_messages (
+            item_hash, message, reception_time, fetched, check_message,
+            retries, next_attempt, trusted_source
+        )
+        SELECT
+            m.item_hash,
+            jsonb_build_object(
+                'type', m.message_type,
+                'chain', m.chain,
+                'sender', m.sender,
+                'signature', m.signature,
+                'item_type', m.item_type,
+                'item_hash', m.item_hash,
+                'item_content', m.item_content,
+                'channel', m.channel,
+                'time', m.time
+            ),
+            EXTRACT(EPOCH FROM NOW()),
+            true,
+            true,
+            0,
+            EXTRACT(EPOCH FROM NOW()),
+            true
+        FROM messages m
+        WHERE m.item_hash = $1
+        ON CONFLICT (item_hash) DO NOTHING
+        "#,
+    )
+    .bind(item_hash)
+    .execute(pool)
+    .await?;
+
+    debug!("Queued {} for handler processing", item_hash);
     Ok(())
 }
 
