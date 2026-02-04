@@ -46,6 +46,10 @@ struct Args {
     /// Use indexer-based sync (recommended, uses multichain.api.aleph.cloud)
     #[arg(long)]
     indexer_sync: bool,
+    
+    /// Use direct RPC sync (eth_getLogs, bypasses rate-limited multichain indexer)
+    #[arg(long)]
+    rpc_sync: bool,
 }
 
 #[tokio::main]
@@ -112,7 +116,19 @@ async fn main() -> anyhow::Result<()> {
                 let config_arc = Arc::new(config.clone());
                 
                 // Start chain sync if enabled
-                if args.indexer_sync {
+                if args.rpc_sync {
+                    info!("Starting RPC-based chain sync (direct eth_getLogs)");
+                    let pool_clone = pool.clone();
+                    let ipfs_url = config.ipfs.api_url.clone();
+                    let config_arc_rpc = config_arc.clone();
+                    tokio::spawn(async move {
+                        jobs::chain_sync::run_rpc_sync(
+                            config_arc_rpc,
+                            pool_clone,
+                            &ipfs_url,
+                        ).await;
+                    });
+                } else if args.indexer_sync {
                     info!("Starting indexer-based chain sync (multichain.api.aleph.cloud)");
                     let pool_clone = pool.clone();
                     let ipfs_url = config.ipfs.api_url.clone();

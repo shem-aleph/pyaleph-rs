@@ -824,3 +824,269 @@ async fn insert_chain_tx_confirmations(
     
     Ok(count)
 }
+
+/// Run RPC-based chain sync (direct eth_getLogs, bypasses multichain indexer)
+///
+/// This is an alternative to `run_indexer_sync` that reads SyncEvent logs directly
+/// from Ethereum RPC endpoints, avoiding the rate-limited multichain indexer API.
+pub async fn run_rpc_sync(config: Arc<Config>, pool: PgPool, ipfs_url: &str) {
+    use crate::chains::rpc_sync::RpcSyncClient;
+
+    let eth_config = match &config.chains.ethereum {
+        Some(c) if c.enabled => c,
+        _ => {
+            info!("RPC sync: Ethereum not configured or disabled");
+            return;
+        }
+    };
+
+    let rpc_client = match RpcSyncClient::new(eth_config) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("RPC sync: failed to create client: {}", e);
+            return;
+        }
+    };
+
+    let ipfs_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(MAX_CONCURRENT_IPFS)
+        .build()
+        .expect("Failed to build HTTP client");
+
+    let gateway_url = config.ipfs.gateway_url.as_str();
+
+    info!(
+        "Starting RPC-based chain sync (direct eth_getLogs, max {} concurrent IPFS fetches)",
+        MAX_CONCURRENT_IPFS
+    );
+
+    // Ensure chain_sync_state row exists for ETH rpc_sync
+    if let Err(e) = ensure_rpc_sync_state(&pool, &rpc_client).await {
+        error!("RPC sync: failed to init sync state: {}", e);
+    }
+
+    let mut interval = interval(Duration::from_secs(15));
+
+    loop {
+        interval.tick().await;
+
+        if let Err(e) = rpc_sync_cycle(
+            &rpc_client,
+            &ipfs_client,
+            ipfs_url,
+            gateway_url,
+            &pool,
+        ).await {
+            error!("RPC sync cycle error: {}", e);
+            // Wait a bit longer on error
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+
+/// Ensure the chain_sync_state row exists for RPC sync tracking
+async fn ensure_rpc_sync_state(
+    pool: &PgPool,
+    client: &crate::chains::rpc_sync::RpcSyncClient,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Use sync_type 'rpc_sync' to track separately from indexer
+    // But since the actual table PK is just (chain), we need to use
+    // the last_block column for RPC block tracking
+    let result: Option<(i64,)> = sqlx::query_as(
+        "SELECT last_block FROM chain_sync_state WHERE chain = $1"
+    )
+    .bind("ETH")
+    .fetch_optional(pool)
+    .await?;
+
+    if result.is_none() {
+        let start = client.start_block() as i64;
+        sqlx::query(
+            "INSERT INTO chain_sync_state (chain, last_block, last_sync, last_sync_timestamp) \
+             VALUES ($1, $2, NOW(), 0) ON CONFLICT (chain) DO NOTHING"
+        )
+        .bind("ETH")
+        .bind(start)
+        .execute(pool)
+        .await?;
+        info!("RPC sync: initialized sync state at block {}", start);
+    }
+
+    Ok(())
+}
+
+/// Get the last RPC-synced block from DB
+async fn get_last_rpc_block(pool: &PgPool) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let result: Option<(i64,)> = sqlx::query_as(
+        "SELECT last_block FROM chain_sync_state WHERE chain = 'ETH'"
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(result.map(|(b,)| b as u64).unwrap_or(0))
+}
+
+/// Update the last RPC-synced block
+async fn update_last_rpc_block(pool: &PgPool, block: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        "INSERT INTO chain_sync_state (chain, last_block, last_sync) \
+         VALUES ('ETH', $1, NOW()) \
+         ON CONFLICT (chain) DO UPDATE SET last_block = $1, last_sync = NOW()"
+    )
+    .bind(block as i64)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// One cycle of RPC sync: fetch events, get IPFS content, insert messages
+async fn rpc_sync_cycle(
+    rpc_client: &crate::chains::rpc_sync::RpcSyncClient,
+    ipfs_client: &reqwest::Client,
+    ipfs_url: &str,
+    gateway_url: &str,
+    pool: &PgPool,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::chains::rpc_sync::RpcSyncClient;
+
+    // Get where we left off
+    let last_block = get_last_rpc_block(pool).await?;
+    let start_block = last_block + 1;
+
+    // Fetch sync events from RPC
+    let (events, end_block) = rpc_client.fetch_sync_events(start_block).await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    info!("RPC sync: {} sync events from blocks {}..{}", events.len(), start_block, end_block);
+
+    // Extract IPFS CIDs from sync events
+    let cids_to_fetch = RpcSyncClient::extract_ipfs_cids(&events);
+    
+    if cids_to_fetch.is_empty() {
+        // No valid CIDs but still advance the cursor
+        update_last_rpc_block(pool, end_block).await?;
+        return Ok(0);
+    }
+
+    info!("RPC sync: {} IPFS CIDs to fetch", cids_to_fetch.len());
+
+    // Semaphore for limiting concurrent IPFS fetches
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IPFS));
+
+    // Parallel IPFS fetches for batch files
+    let fetch_futures: Vec<_> = cids_to_fetch.iter().map(|(cid, _block)| {
+        let sem = Arc::clone(&semaphore);
+        let client = ipfs_client.clone();
+        let url = ipfs_url.to_string();
+        let gw = gateway_url.to_string();
+        let cid = cid.clone();
+
+        async move {
+            let _permit = sem.acquire().await.ok()?;
+            // Try local IPFS first, then gateway
+            match fetch_ipfs_with_retry(&client, &url, &cid, 2).await {
+                Ok(content) => Some(content),
+                Err(_) => {
+                    // Fallback to gateway
+                    fetch_from_gateway(&client, &gw, &cid, 2).await.ok()
+                }
+            }
+        }
+    }).collect();
+
+    let ipfs_results: Vec<Option<String>> = futures::future::join_all(fetch_futures).await;
+
+    // Collect all messages from IPFS batches
+    let mut all_messages: Vec<crate::types::Message> = Vec::new();
+    let mut successful_fetches = 0;
+
+    for result in ipfs_results.into_iter() {
+        if let Some(content) = result {
+            if let Ok(batch) = serde_json::from_str::<IpfsBatchContent>(&content) {
+                all_messages.extend(batch.content.messages);
+                successful_fetches += 1;
+            }
+        }
+    }
+
+    info!(
+        "RPC sync: fetched {}/{} IPFS batches, {} total messages",
+        successful_fetches, cids_to_fetch.len(), all_messages.len()
+    );
+
+    // Deduplicate messages by item_hash
+    let mut seen: HashMap<String, crate::types::Message> = HashMap::new();
+    for msg in all_messages {
+        seen.insert(msg.item_hash.clone(), msg);
+    }
+    let all_messages: Vec<crate::types::Message> = seen.into_values().collect();
+    info!("RPC sync: {} unique messages after deduplication", all_messages.len());
+
+    // Filter out blacklisted senders
+    let pre_blacklist = all_messages.len();
+    let all_messages: Vec<crate::types::Message> = all_messages
+        .into_iter()
+        .filter(|m| !BLACKLISTED_SENDERS.contains(&m.sender.as_str()))
+        .collect();
+    if all_messages.len() < pre_blacklist {
+        info!("RPC sync: filtered {} blacklisted messages", pre_blacklist - all_messages.len());
+    }
+
+    // Filter out existing messages
+    let all_messages = filter_new_messages(pool, all_messages).await;
+    info!("RPC sync: {} truly new messages after DB dedup", all_messages.len());
+
+    let mut total_messages = 0;
+
+    if !all_messages.is_empty() {
+        // Split: inline messages vs storage-type that need content
+        let (have_content, need_content): (Vec<_>, Vec<_>) = all_messages
+            .into_iter()
+            .partition(|m| m.item_content.is_some());
+
+        // Insert inline messages immediately
+        if !have_content.is_empty() {
+            let inserted = batch_insert_messages_and_queue(pool, &have_content).await?;
+            total_messages += inserted;
+            info!("RPC sync: inserted {} inline messages", inserted);
+        }
+
+        // Insert storage-type message shells and resolve content in background
+        if !need_content.is_empty() {
+            let storage_count = need_content.len();
+            let inserted = batch_insert_messages_and_queue(pool, &need_content).await?;
+            total_messages += inserted;
+
+            // Resolve content in background
+            let pool_clone = pool.clone();
+            let client_clone = ipfs_client.clone();
+            let gateway = gateway_url.to_string();
+            let sem = Arc::clone(&semaphore);
+            tokio::spawn(async move {
+                resolve_and_update_content(
+                    &client_clone,
+                    &gateway,
+                    &pool_clone,
+                    need_content,
+                    &sem,
+                ).await;
+            });
+            info!("RPC sync: spawned background content resolution for {} messages", storage_count);
+        }
+    }
+
+    // Update cursor
+    update_last_rpc_block(pool, end_block).await?;
+
+    if total_messages > 0 {
+        info!("RPC sync: synced {} messages, now at block {}", total_messages, end_block);
+    }
+
+    Ok(total_messages)
+}

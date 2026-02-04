@@ -15,6 +15,7 @@ pub mod indexer;
 pub mod solana;
 pub mod tezos;
 pub mod tx_packer;
+pub mod rpc_sync;
 
 use async_trait::async_trait;
 use thiserror::Error;
