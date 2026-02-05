@@ -164,6 +164,8 @@ pub trait Database: Send + Sync {
     // Forget operations
     async fn get_forgotten_hashes(&self, hashes: &[String]) -> Result<Vec<String>, String>;
     async fn mark_forgotten(&self, item_hash: &str, forget_hash: &str, reason: Option<&str>) -> Result<(), String>;
+    async fn delete_message(&self, item_hash: &str) -> Result<(), String>;
+    async fn delete_derived_data(&self, item_hash: &str, message_type: &str) -> Result<(), String>;
     async fn get_dependent_vms(&self, file_hash: &str) -> Result<Vec<String>, String>;
     
     // Balance operations

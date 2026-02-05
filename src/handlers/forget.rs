@@ -176,20 +176,35 @@ impl MessageHandler for ForgetHandler {
         
         for hash in &content.hashes {
             tracing::debug!("Forgetting hash: {}", hash);
-            
-            // Mark as forgotten in database
+
             if let Some(ref db) = ctx.db {
+                // Look up the message to get its type for derived table cleanup
+                let message_type = db.get_message(hash).await
+                    .map_err(|e| HandlerError::Database(e))?
+                    .map(|m| m.message_type.to_string());
+
+                // Mark as forgotten (insert into forgotten_messages)
                 db.mark_forgotten(
                     hash,
                     &message.item_hash,
                     content.reason.as_deref(),
                 ).await.map_err(|e| HandlerError::Database(e))?;
-                
+
                 // Remove file pin if it exists
                 db.remove_file_pin(hash, &content.address).await
                     .map_err(|e| HandlerError::Database(e))?;
+
+                // Delete from derived tables based on message type
+                if let Some(ref msg_type) = message_type {
+                    db.delete_derived_data(hash, msg_type).await
+                        .map_err(|e| HandlerError::Database(e))?;
+                }
+
+                // Delete from messages table (pyaleph removes forgotten messages from messages)
+                db.delete_message(hash).await
+                    .map_err(|e| HandlerError::Database(e))?;
             }
-            
+
             // Unpin from IPFS
             if let Some(ref ipfs) = ctx.ipfs {
                 if let Err(e) = ipfs.unpin(hash).await {

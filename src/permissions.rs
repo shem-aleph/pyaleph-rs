@@ -458,6 +458,14 @@ mod tests {
             Ok(())
         }
 
+        async fn delete_message(&self, _item_hash: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn delete_derived_data(&self, _item_hash: &str, _message_type: &str) -> Result<(), String> {
+            Ok(())
+        }
+
         async fn get_dependent_vms(
             &self,
             _file_hash: &str,

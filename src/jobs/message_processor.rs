@@ -226,7 +226,17 @@ async fn process_single_message(
         debug!("Message {} is a duplicate, skipping", message.item_hash);
         return Ok(ProcessResult::Processed); // Just remove from pending
     }
-    
+
+    // Step 2b: Check if already forgotten (race condition: FORGET processed before target)
+    // Reference: aleph/handlers/message_handler.py:443-457
+    if is_forgotten(&ctx.db, &message.item_hash).await? {
+        debug!("Message {} is already forgotten, rejecting", message.item_hash);
+        return Ok(ProcessResult::Rejected(
+            ErrorCode::InvalidFormat,
+            "Message already forgotten".to_string(),
+        ));
+    }
+
     // Step 3: Fetch content if needed
     // For storage/IPFS messages without content, defer to content_fetch service
     // rather than trying to fetch here (avoids race conditions and wasted retries)
@@ -410,6 +420,18 @@ async fn is_duplicate(db: &PgPool, item_hash: &str) -> Result<bool, ProcessorErr
     .map_err(|e| ProcessorError::Database(e.to_string()))?;
     
     Ok(has_derived)
+}
+
+/// Check if a message has already been forgotten
+async fn is_forgotten(db: &PgPool, item_hash: &str) -> Result<bool, ProcessorError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM forgotten_messages WHERE item_hash = $1)"
+    )
+    .bind(item_hash)
+    .fetch_one(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+    Ok(exists)
 }
 
 /// Mark a pending message as fetched

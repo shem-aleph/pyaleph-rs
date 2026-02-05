@@ -308,6 +308,59 @@ impl Database for PgDatabase {
         Ok(())
     }
 
+    async fn delete_message(&self, item_hash: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM messages WHERE item_hash = $1")
+            .bind(item_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn delete_derived_data(&self, item_hash: &str, message_type: &str) -> Result<(), String> {
+        match message_type {
+            "POST" => {
+                sqlx::query("DELETE FROM posts WHERE item_hash = $1")
+                    .bind(item_hash)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "AGGREGATE" => {
+                sqlx::query("DELETE FROM aggregate_elements WHERE item_hash = $1")
+                    .bind(item_hash)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "STORE" => {
+                // file_pins already handled by remove_file_pin
+            }
+            "PROGRAM" => {
+                sqlx::query("DELETE FROM programs WHERE item_hash = $1")
+                    .bind(item_hash)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "INSTANCE" => {
+                sqlx::query("DELETE FROM instances WHERE item_hash = $1")
+                    .bind(item_hash)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            _ => {}
+        }
+        // Clean up confirmations
+        sqlx::query("DELETE FROM chain_txs WHERE item_hash = $1")
+            .bind(item_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     async fn get_dependent_vms(&self, file_hash: &str) -> Result<Vec<String>, String> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT item_hash FROM programs WHERE code_ref = $1 OR runtime_ref = $1 \
