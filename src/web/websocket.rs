@@ -584,6 +584,67 @@ async fn get_message_history(
     Ok(messages)
 }
 
+/// WebSocket upgrade handler for /api/ws0/status
+/// Streams node status metrics (message counts) to clients, sending updates only when values change.
+pub async fn status_ws_handler(
+    State(state): State<Arc<crate::web::state::AppState>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| status_ws(socket, state))
+}
+
+/// Handle a status WebSocket connection
+async fn status_ws(mut socket: WebSocket, state: Arc<crate::web::state::AppState>) {
+    let mut previous_json: Option<String> = None;
+
+    loop {
+        // Build status metrics
+        let status = if state.has_db() {
+            // Query message counts using pg_class estimates (fast, no seq scan)
+            let messages: i64 = sqlx::query_scalar(
+                "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'messages'"
+            )
+            .fetch_one(state.db())
+            .await
+            .unwrap_or(0);
+
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'pending_messages'"
+            )
+            .fetch_one(state.db())
+            .await
+            .unwrap_or(0);
+
+            let files: i64 = sqlx::query_scalar(
+                "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'file_pins'"
+            )
+            .fetch_one(state.db())
+            .await
+            .unwrap_or(0);
+
+            serde_json::json!({
+                "pyaleph_status_sync_messages_total": messages,
+                "pyaleph_status_sync_pending_messages_total": pending,
+                "pyaleph_status_sync_permanent_files_total": files,
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let json_str = status.to_string();
+
+        // Only send if changed
+        if previous_json.as_ref() != Some(&json_str) {
+            if socket.send(WsMessage::Text(json_str.clone().into())).await.is_err() {
+                break;
+            }
+            previous_json = Some(json_str);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Connect WebSocket to RabbitMQ for live updates
 pub async fn connect_to_rabbitmq(
     ws_state: Arc<WsState>,

@@ -156,8 +156,8 @@ pub fn api_ws0() -> Router<Arc<AppState>> {
         // WebSocket messages endpoint (pyaleph compatibility)
         // Supports query params: addresses, channels, msgTypes, hashes, history
         .route("/messages", get(websocket::ws_handler))
-        // WebSocket status endpoint
-        .route("/status", get(handlers::health_check))
+        // WebSocket status endpoint - streams node metrics over WebSocket
+        .route("/status", get(websocket::status_ws_handler))
 }
 
 /// Legacy routes for backwards compatibility
