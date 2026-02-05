@@ -779,11 +779,11 @@ pub async fn get_aggregates(
     Query(params): Query<AggregateQuery>,
 ) -> impl IntoResponse {
     if !state.has_db() {
-        return Json(json!({
+        return (StatusCode::OK, Json(json!({
             "address": address,
             "data": {},
             "error": "Database not available"
-        }));
+        })));
     }
     
     // Parse keys filter safely
@@ -844,18 +844,18 @@ pub async fn get_aggregates(
         };
         
         if aggregates.is_empty() {
-            return Json(json!({
+            return (StatusCode::NOT_FOUND, Json(json!({
                 "error": "No aggregate found for this address"
-            }));
+            })));
         }
-        
+
         // Build data and info maps
         let mut data = serde_json::Map::new();
         let mut info = serde_json::Map::new();
-        
+
         for (key, content, created, last_updated, last_update_hash, original_hash) in aggregates {
             data.insert(key.clone(), content);
-            
+
             // Convert timestamps to ISO format
             let created_dt = chrono::DateTime::from_timestamp(created as i64, 0)
                 .map(|dt| dt.to_rfc3339())
@@ -863,7 +863,7 @@ pub async fn get_aggregates(
             let last_updated_dt = chrono::DateTime::from_timestamp(last_updated as i64, 0)
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_else(|| last_updated.to_string());
-            
+
             info.insert(key, json!({
                 "created": created_dt,
                 "last_updated": last_updated_dt,
@@ -871,12 +871,12 @@ pub async fn get_aggregates(
                 "last_update_item_hash": last_update_hash.unwrap_or_default(),
             }));
         }
-        
-        Json(json!({
+
+        (StatusCode::OK, Json(json!({
             "address": address,
             "data": data,
             "info": info,
-        }))
+        })))
     } else {
         // Regular query without metadata
         let aggregates: Vec<(String, serde_json::Value)> = match &key_list {
@@ -910,11 +910,11 @@ pub async fn get_aggregates(
         };
         
         if aggregates.is_empty() {
-            return Json(json!({
+            return (StatusCode::NOT_FOUND, Json(json!({
                 "error": "No aggregate found for this address"
-            }));
+            })));
         }
-        
+
         // Handle value_only - only works for single key
         if value_only {
             if let Some(ref keys) = key_list {
@@ -922,23 +922,23 @@ pub async fn get_aggregates(
                     // Find the matching aggregate and return just its value
                     for (key, content) in &aggregates {
                         if key == &keys[0] {
-                            return Json(content.clone());
+                            return (StatusCode::OK, Json(content.clone()));
                         }
                     }
                 }
             }
         }
-        
+
         // Build data map
         let mut data = serde_json::Map::new();
         for (key, content) in aggregates {
             data.insert(key, content);
         }
-        
-        Json(json!({
+
+        (StatusCode::OK, Json(json!({
             "address": address,
             "data": data,
-        }))
+        })))
     }
 }
 
@@ -1268,7 +1268,9 @@ pub async fn get_posts(
     }))
 }
 
-/// Get balance for an address - matches pyaleph format
+/// Get balance for an address - matches pyaleph GetAccountBalanceResponse format
+/// Reference: aleph/web/controllers/accounts.py:get_account_balance
+/// Returns balance as float, with per-chain details map and locked_amount from costs
 pub async fn get_balance(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
@@ -1276,32 +1278,60 @@ pub async fn get_balance(
     if !state.has_db() {
         return Json(json!({
             "address": address,
-            "balance": "0",
-            "locked_balance": "0",
+            "balance": 0.0,
+            "locked_amount": 0.0,
+            "details": {},
+            "credit_balance": 0,
         }));
     }
-    
-    let balance = sqlx::query_as::<_, crate::db::models::BalanceDb>(
-        "SELECT * FROM balances WHERE address = $1"
+
+    // Query all per-chain balances for this address
+    let chain_balances: Vec<(String, rust_decimal::Decimal)> = sqlx::query_as(
+        "SELECT chain, balance FROM balances WHERE address = $1"
+    )
+    .bind(&address)
+    .fetch_all(state.db())
+    .await
+    .unwrap_or_default();
+
+    // Build details map and compute total
+    let mut details = serde_json::Map::new();
+    let mut total = rust_decimal::Decimal::ZERO;
+    for (chain, balance) in &chain_balances {
+        let bal_f64: f64 = balance.to_string().parse().unwrap_or(0.0);
+        details.insert(chain.clone(), json!(bal_f64));
+        total += balance;
+    }
+    let total_f64: f64 = total.to_string().parse().unwrap_or(0.0);
+
+    // Query locked_amount from account_costs (total_cost for the address)
+    let locked: rust_decimal::Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(total_cost), 0) FROM account_costs WHERE address = $1"
+    )
+    .bind(&address)
+    .fetch_one(state.db())
+    .await
+    .unwrap_or(rust_decimal::Decimal::ZERO);
+    let locked_f64: f64 = locked.to_string().parse().unwrap_or(0.0);
+
+    // Query credit_balance
+    let credit_balance: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(balance, 0)::bigint FROM credit_balances WHERE address = $1"
     )
     .bind(&address)
     .fetch_optional(state.db())
     .await
     .ok()
-    .flatten();
-    
-    match balance {
-        Some(b) => Json(json!({
-            "address": address,
-            "balance": b.balance.to_string(),
-            "locked_balance": "0",
-        })),
-        None => Json(json!({
-            "address": address,
-            "balance": "0",
-            "locked_balance": "0",
-        })),
-    }
+    .flatten()
+    .unwrap_or(0);
+
+    Json(json!({
+        "address": address,
+        "balance": total_f64,
+        "locked_amount": locked_f64,
+        "details": details,
+        "credit_balance": credit_balance,
+    }))
 }
 
 /// Get credit balance for an address
@@ -1347,11 +1377,11 @@ pub struct CreditBalancesQuery {
     pub page: Option<u32>,
 }
 
-/// Credit balance response item
+/// Credit balance response item — matches Python AddressCreditBalanceResponse
 #[derive(Debug, Serialize)]
 pub struct CreditBalanceItem {
     pub address: String,
-    pub credits: String,  // String for big numbers
+    pub credits: i64,  // Integer to match Python pyaleph
 }
 
 /// Get all credit balances - matches pyaleph /credit_balances format
@@ -1439,7 +1469,7 @@ pub async fn get_credit_balances(
         .into_iter()
         .map(|(address, balance)| CreditBalanceItem {
             address,
-            credits: balance.to_string(),
+            credits: balance.to_string().parse::<i64>().unwrap_or(0),
         })
         .collect();
     
@@ -3568,12 +3598,202 @@ pub async fn list_posts_page(
     get_posts(State(state), Query(params)).await
 }
 
-/// GET /api/v1/posts - V1 posts endpoint (same as v0 for now)
+/// V1 post response — simpler format with ISO timestamps, no chain/signature/confirmations
+#[derive(Debug, Clone, Serialize)]
+pub struct PostResponseV1 {
+    pub item_hash: String,
+    pub content: serde_json::Value,
+    pub original_item_hash: String,
+    pub original_type: Option<String>,
+    pub address: String,
+    #[serde(rename = "ref")]
+    pub ref_: Option<String>,
+    pub channel: Option<String>,
+    /// ISO 8601 timestamp
+    pub created: String,
+    /// ISO 8601 timestamp
+    pub last_updated: String,
+}
+
+/// GET /api/v1/posts - V1 posts endpoint with ISO timestamps and simplified fields
+/// Reference: aleph/web/controllers/posts.py:view_posts_list_v1 + merged_post_to_dict
 pub async fn get_posts_v1(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PostsQuery>,
 ) -> impl IntoResponse {
-    get_posts(State(state), Query(params)).await
+    let page = params.page.unwrap_or(1);
+    let raw_pagination = params.limit.or(params.pagination).unwrap_or(20);
+    let per_page = if raw_pagination == 0 { 10_000 } else { raw_pagination.min(1000) };
+    let offset = ((page - 1) * per_page) as i64;
+
+    let order_param = params.order.or(params.sort_order);
+
+    if !state.has_db() {
+        return Json(json!({
+            "posts": [],
+            "pagination_total": 0,
+            "pagination_page": page,
+            "pagination_per_page": per_page,
+            "pagination_item": "posts",
+        }));
+    }
+
+    // V1 query: simpler than v0, no messages join needed
+    // Returns: original_item_hash, item_hash (coalesced), content (coalesced),
+    //          address, ref_, channel, created (original created_at), last_updated (coalesced),
+    //          original_type
+    let mut builder = crate::db::QueryBuilder::new(
+        "SELECT p.item_hash AS original_item_hash, \
+         COALESCE(a.item_hash, p.item_hash) AS item_hash, \
+         COALESCE(a.content, p.content) AS content, \
+         p.address, \
+         p.ref_, p.channel, \
+         p.created_at AS created, \
+         COALESCE(a.created_at, p.created_at) AS last_updated, \
+         p.post_type AS original_type \
+         FROM posts p \
+         LEFT JOIN posts a ON p.latest_amend = a.item_hash \
+         WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
+    );
+    let mut count_builder = crate::db::QueryBuilder::new(
+        "SELECT COUNT(*) FROM posts p \
+         LEFT JOIN posts a ON p.latest_amend = a.item_hash \
+         WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
+    );
+
+    // Filter by addresses
+    if let Some(ref addresses) = params.addresses {
+        let addr_list = crate::db::parse_csv_param(addresses);
+        if !addr_list.is_empty() {
+            builder.and_in("p.address", &addr_list);
+            count_builder.and_in("p.address", &addr_list);
+        }
+    }
+
+    // Filter by channels
+    if let Some(ref channels) = params.channels {
+        let channel_list = crate::db::parse_csv_param(channels);
+        if !channel_list.is_empty() {
+            builder.and_in("p.channel", &channel_list);
+            count_builder.and_in("p.channel", &channel_list);
+        }
+    }
+
+    // Filter by post types
+    if let Some(ref types) = params.types {
+        let type_list = crate::db::parse_csv_param(types);
+        if !type_list.is_empty() {
+            builder.and_in("p.post_type", &type_list);
+            count_builder.and_in("p.post_type", &type_list);
+        }
+    }
+
+    // Filter by refs
+    if let Some(ref refs) = params.refs {
+        let ref_list = crate::db::parse_csv_param(refs);
+        if !ref_list.is_empty() {
+            builder.and_in("p.ref_", &ref_list);
+            count_builder.and_in("p.ref_", &ref_list);
+        }
+    }
+
+    // Filter by item hashes
+    if let Some(ref hashes) = params.hashes {
+        let hash_list = crate::db::parse_csv_param(hashes);
+        if !hash_list.is_empty() {
+            builder.and_in("p.item_hash", &hash_list);
+            count_builder.and_in("p.item_hash", &hash_list);
+        }
+    }
+
+    // Time filters
+    if let Some(start) = params.start_date {
+        builder.and_gte("p.time", start);
+        count_builder.and_gte("p.time", start);
+    }
+    if let Some(end) = params.end_date {
+        builder.and_lte("p.time", end);
+        count_builder.and_lte("p.time", end);
+    }
+
+    // Filter by tags
+    if let Some(ref tags) = params.tags {
+        let tag_list = crate::db::parse_csv_param(tags);
+        for tag in tag_list {
+            let check_obj = serde_json::json!({"tags": [&tag]});
+            let check_str = check_obj.to_string().replace('\'', "''");
+            let clause = format!("COALESCE(a.content, p.content) @> '{}'::jsonb", check_str);
+            builder.and_raw(&clause);
+            count_builder.and_raw(&clause);
+        }
+    }
+
+    // Sort column
+    let sort_column = match params.sort_by.as_deref() {
+        Some("time") | None => "COALESCE(a.created_at, p.created_at)".to_string(),
+        Some("address") => "p.address".to_string(),
+        Some("post_type") => "p.post_type".to_string(),
+        Some("channel") => "p.channel".to_string(),
+        _ => "COALESCE(a.created_at, p.created_at)".to_string(),
+    };
+
+    let ascending = order_param.map(|o| o == 1).unwrap_or(false);
+    let order_dir = if ascending { "ASC" } else { "DESC" };
+    builder.and_raw(&format!("1=1 ORDER BY {} {} LIMIT {} OFFSET {}", sort_column, order_dir, per_page, offset));
+
+    // Get total count
+    let (count_query, count_args) = count_builder.build();
+    let total: (i64,) = sqlx::query_as_with(&count_query, count_args)
+        .fetch_one(state.db())
+        .await
+        .unwrap_or((0,));
+
+    // V1 row type: no messages table fields
+    type PostV1Row = (
+        String,                                       // 0: original_item_hash
+        String,                                       // 1: item_hash (coalesced)
+        serde_json::Value,                            // 2: content (coalesced)
+        String,                                       // 3: address
+        Option<String>,                               // 4: ref_
+        Option<String>,                               // 5: channel
+        chrono::DateTime<chrono::Utc>,                // 6: created (original created_at)
+        chrono::DateTime<chrono::Utc>,                // 7: last_updated (coalesced created_at)
+        Option<String>,                               // 8: original_type
+    );
+
+    let (query, args) = builder.build();
+    let rows: Vec<PostV1Row> = match sqlx::query_as_with(&query, args)
+        .fetch_all(state.db())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("V1 posts query failed: {} | SQL: {}", e, query);
+            vec![]
+        }
+    };
+
+    let posts: Vec<PostResponseV1> = rows.iter().map(|row| {
+        PostResponseV1 {
+            item_hash: row.1.clone(),
+            content: row.2.clone(),
+            original_item_hash: row.0.clone(),
+            original_type: row.8.clone(),
+            address: row.3.clone(),
+            ref_: row.4.clone(),
+            channel: row.5.clone(),
+            created: row.6.to_rfc3339(),
+            last_updated: row.7.to_rfc3339(),
+        }
+    }).collect();
+
+    Json(json!({
+        "posts": posts,
+        "pagination_total": total.0,
+        "pagination_page": page,
+        "pagination_per_page": per_page,
+        "pagination_item": "posts",
+    }))
 }
 
 /// GET /metrics - Prometheus metrics
