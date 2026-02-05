@@ -3552,9 +3552,7 @@ pub async fn list_channels(
 /// GET /api/v0/version - API version info
 pub async fn get_version() -> impl IntoResponse {
     Json(json!({
-        "version": "0.2.0",
-        "api_version": "v0",
-        "name": "pyaleph-rs"
+        "version": env!("CARGO_PKG_VERSION")
     }))
 }
 
