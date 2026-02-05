@@ -234,7 +234,13 @@ pub async fn list_messages(
     
     // Build query with safe parameterized filters
     let mut builder = crate::db::QueryBuilder::new("SELECT * FROM messages WHERE 1=1");
-    
+
+    // Exclude forgotten messages unless explicitly requested via msgStatuses=forgotten
+    let include_forgotten = status_list.iter().any(|s| s == "forgotten");
+    if !include_forgotten {
+        builder.and_raw("NOT EXISTS (SELECT 1 FROM forgotten_messages WHERE forgotten_messages.item_hash = messages.item_hash)");
+    }
+
     // Parse addresses filter (parameterized)
     if let Some(ref addresses) = params.addresses {
         let addr_list = crate::db::parse_csv_param(addresses);
@@ -2276,40 +2282,52 @@ pub async fn get_resource_cost(
         }));
     }
 
-    // Query account_costs for this item_hash and sum up costs
-    let costs = sqlx::query_as::<_, crate::db::models::AccountCostDb>(
-        "SELECT * FROM account_costs WHERE item_hash = $1"
+    // Look up the message sender to find their account costs
+    let msg = sqlx::query_as::<_, (String,)>(
+        "SELECT sender FROM messages WHERE item_hash = $1"
     )
     .bind(&hash)
-    .fetch_all(state.db())
+    .fetch_optional(state.db())
     .await
-    .unwrap_or_default();
+    .ok()
+    .flatten();
 
-    if costs.is_empty() {
-        return Json(json!({
+    let address = match msg {
+        Some((sender,)) => sender,
+        None => {
+            return Json(json!({
+                "hash": hash,
+                "storage_cost": "0",
+                "compute_cost": "0",
+                "total_cost": "0",
+            }));
+        }
+    };
+
+    // Query account-level costs
+    let costs = sqlx::query_as::<_, crate::db::models::AccountCostDb>(
+        "SELECT * FROM account_costs WHERE address = $1"
+    )
+    .bind(&address)
+    .fetch_optional(state.db())
+    .await
+    .ok()
+    .flatten();
+
+    match costs {
+        Some(c) => Json(json!({
+            "hash": hash,
+            "storage_cost": c.storage_cost.to_string(),
+            "compute_cost": c.compute_cost.to_string(),
+            "total_cost": c.total_cost.to_string(),
+        })),
+        None => Json(json!({
             "hash": hash,
             "storage_cost": "0",
             "compute_cost": "0",
             "total_cost": "0",
-        }));
+        })),
     }
-
-    let mut storage_cost = rust_decimal::Decimal::ZERO;
-    let mut compute_cost = rust_decimal::Decimal::ZERO;
-    for c in &costs {
-        match c.cost_type.as_str() {
-            "storage" => storage_cost += c.cost_hold,
-            _ => compute_cost += c.cost_hold,
-        }
-    }
-    let total_cost = storage_cost + compute_cost;
-
-    Json(json!({
-        "hash": hash,
-        "storage_cost": storage_cost.to_string(),
-        "compute_cost": compute_cost.to_string(),
-        "total_cost": total_cost.to_string(),
-    }))
 }
 
 /// Get node statistics
@@ -2925,56 +2943,7 @@ pub async fn get_message_price(
                 })));
             }
 
-            // Try to read costs from account_costs table (pyaleph behavior)
-            let db_costs = sqlx::query_as::<_, crate::db::models::AccountCostDb>(
-                "SELECT * FROM account_costs WHERE item_hash = $1"
-            )
-            .bind(&item_hash)
-            .fetch_all(state.db())
-            .await
-            .unwrap_or_default();
-
-            if !db_costs.is_empty() {
-                // Build response from DB costs (matching pyaleph format)
-                let payment_type = db_costs.first()
-                    .map(|c| c.payment_type.as_str())
-                    .unwrap_or("hold");
-                let charged_address = db_costs.first()
-                    .map(|c| c.owner.as_str())
-                    .unwrap_or(&msg.sender);
-
-                // Sum up costs based on payment type
-                let required_tokens: f64 = db_costs.iter()
-                    .map(|c| {
-                        let cost = match payment_type {
-                            "superfluid" | "stream" => &c.cost_stream,
-                            "credit" => &c.cost_credit,
-                            _ => &c.cost_hold,
-                        };
-                        cost.to_string().parse::<f64>().unwrap_or(0.0)
-                    })
-                    .sum();
-
-                let detail: Vec<serde_json::Value> = db_costs.iter()
-                    .map(|c| json!({
-                        "type": c.cost_type,
-                        "name": c.name,
-                        "cost_hold": c.cost_hold.to_string(),
-                        "cost_stream": c.cost_stream.to_string(),
-                        "cost_credit": c.cost_credit.to_string()
-                    }))
-                    .collect();
-
-                return (StatusCode::OK, Json(json!({
-                    "required_tokens": required_tokens,
-                    "payment_type": payment_type,
-                    "cost": format!("{:.6}", required_tokens),
-                    "detail": detail,
-                    "charged_address": charged_address,
-                })));
-            }
-
-            // Fallback: calculate on-the-fly if no DB costs exist
+            // Calculate cost on-the-fly from message content
             match message_type.as_str() {
                 "PROGRAM" => {
                     let program = sqlx::query_as::<_, crate::db::models::ProgramDb>(

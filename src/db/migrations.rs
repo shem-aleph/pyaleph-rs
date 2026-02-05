@@ -291,33 +291,17 @@ async fn create_chain_txs_table(pool: &PgPool) -> Result<(), Error> {
 }
 
 async fn create_account_costs_table(pool: &PgPool) -> Result<(), Error> {
-    // Match pyaleph schema: per-message cost breakdown with payment types
-    // Reference: aleph/db/models/account_costs.py:AccountCostsDb
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS account_costs (
-            id BIGSERIAL PRIMARY KEY,
-            owner VARCHAR(256) NOT NULL,
-            item_hash VARCHAR(128) NOT NULL,
-            type VARCHAR(50) NOT NULL,
-            name VARCHAR(256) NOT NULL,
-            ref_ VARCHAR(256),
-            payment_type VARCHAR(20) NOT NULL DEFAULT 'hold',
-            cost_hold DECIMAL(78, 18) NOT NULL DEFAULT 0,
-            cost_stream DECIMAL(78, 18) NOT NULL DEFAULT 0,
-            cost_credit DECIMAL(78, 18) NOT NULL DEFAULT 0,
-            UNIQUE (owner, item_hash, type, name)
+            address VARCHAR(256) PRIMARY KEY,
+            storage_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
+            compute_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
+            total_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
+            last_calculated TIMESTAMPTZ DEFAULT NOW()
         )
     "#)
     .execute(pool)
     .await?;
-
-    // Index for looking up costs by item_hash (used by /price/{hash})
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_account_costs_item_hash ON account_costs(item_hash)")
-        .execute(pool).await?;
-    // Index for looking up costs by owner (used by total cost queries)
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_account_costs_owner ON account_costs(owner)")
-        .execute(pool).await?;
-
     Ok(())
 }
 
