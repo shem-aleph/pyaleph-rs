@@ -288,7 +288,7 @@
     <div class="config-section">
         <div class="config-row">
             <label for="apiUrl">API URL:</label>
-            <input type="text" id="apiUrl" value="http://localhost:8080/api/v0/monitor" placeholder="http://localhost:8080/api/v0/monitor">
+            <input type="text" id="apiUrl" value="/api/v0/monitor" placeholder="/api/v0/monitor">
             <button onclick="connect()">Connect</button>
             <span class="refresh-info">Auto-refresh: <span id="refreshInterval">5</span>s | Last: <span id="lastUpdate">--</span></span>
         </div>
@@ -376,7 +376,12 @@
     </div>
 
     <script>
-        let apiUrl = localStorage.getItem('pyaleph-monitor-url') || 'http://localhost:8080/api/v0/monitor';
+        // Clear stale absolute URLs from localStorage so we use the relative path
+        const stored = localStorage.getItem('pyaleph-monitor-url');
+        if (stored && stored.startsWith('http')) {
+            localStorage.removeItem('pyaleph-monitor-url');
+        }
+        let apiUrl = localStorage.getItem('pyaleph-monitor-url') || '/api/v0/monitor';
         let refreshTimer = null;
         let history = [];
         let lastData = null;
