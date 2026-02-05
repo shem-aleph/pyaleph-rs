@@ -65,15 +65,19 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         
         // Storage - IMPORTANT: More specific routes MUST come BEFORE generic :hash routes
         .route("/storage/upload", post(handlers::upload_file))
+        .route("/storage/add_file", post(handlers::upload_file))
         .route("/storage/add_json", post(handlers::add_json_storage))
         .route("/storage/by-message-hash/:hash", get(handlers::get_storage_by_message_hash))
         .route("/storage/by-ref/:address/:ref", get(handlers::get_storage_by_address_ref))
         .route("/storage/by-ref/:ref", get(handlers::get_storage_by_ref))
         // P2: Storage count endpoint - BEFORE generic storage/:hash
         .route("/storage/count/:hash", get(handlers::get_storage_count))
+        .route("/storage/raw/:hash", get(handlers::get_storage_raw))
         // Generic storage routes last
         .route("/storage/:hash", get(handlers::get_storage))
-        .route("/storage/:hash/raw", get(handlers::get_storage_raw))
+
+        // IPFS routes
+        .route("/ipfs/add_json", post(handlers::add_json_storage))
         
         // Hashes endpoint
         .route("/hashes", get(handlers::get_hashes))
