@@ -112,7 +112,17 @@ async fn main() -> anyhow::Result<()> {
         match db::init_db(&config.database).await {
             Ok(pool) => {
                 info!("Database connected and migrated");
-                
+
+                // Run startup backfill (populate derived tables from messages)
+                match jobs::backfill::run_startup_backfill(&pool).await {
+                    Ok(result) => {
+                        info!("Startup backfill: {}", result);
+                    }
+                    Err(e) => {
+                        warn!("Startup backfill failed (continuing anyway): {}", e);
+                    }
+                }
+
                 let config_arc = Arc::new(config.clone());
                 
                 // Start chain sync if enabled
