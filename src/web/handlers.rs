@@ -502,6 +502,7 @@ pub async fn list_messages(
 }
 
 /// Get a single message by hash - matches pyaleph format
+/// Reference: aleph/web/controllers/messages.py:view_message
 pub async fn get_message(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -512,14 +513,14 @@ pub async fn get_message(
             "message": "Database not available"
         })));
     }
-    
+
     let message = sqlx::query_as::<_, crate::db::models::MessageDb>(
         "SELECT * FROM messages WHERE item_hash = $1"
     )
     .bind(&hash)
     .fetch_optional(state.db())
     .await;
-    
+
     match message {
         Ok(Some(msg)) => {
             // Fetch confirmations
@@ -537,33 +538,37 @@ pub async fn get_message(
                 height: height as u64,
             })
             .collect();
-            
+
+            // Use created_at as reception_time (when message was inserted into DB)
+            let reception_time = msg.created_at.timestamp() as f64;
             let response = MessageResponse::from_db(&msg, confirmations);
-            
+
             (StatusCode::OK, Json(json!({
                 "status": "processed",
+                "item_hash": hash,
+                "reception_time": reception_time,
                 "message": response
             })))
         }
         Ok(None) => {
-            // Check if it's pending
-            let pending = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM pending_messages WHERE item_hash = $1)"
+            // Check if it's pending and get reception_time
+            let pending = sqlx::query_as::<_, (String, f64)>(
+                "SELECT item_hash, reception_time FROM pending_messages WHERE item_hash = $1 LIMIT 1"
             )
             .bind(&hash)
-            .fetch_one(state.db())
+            .fetch_optional(state.db())
             .await
-            .unwrap_or(false);
-            
-            if pending {
+            .unwrap_or(None);
+
+            if let Some((_item_hash, reception_time)) = pending {
                 (StatusCode::OK, Json(json!({
                     "status": "pending",
                     "item_hash": hash,
+                    "reception_time": reception_time,
                 })))
             } else {
                 (StatusCode::NOT_FOUND, Json(json!({
-                    "status": "not_found",
-                    "item_hash": hash,
+                    "error": "Message not found"
                 })))
             }
         }
