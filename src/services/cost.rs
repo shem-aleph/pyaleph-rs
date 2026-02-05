@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::types::{ProductPriceType, ProductPrice, ProductPriceOptions};
+use crate::types::{ProductPriceType, ProductPrice, ProductPriceOptions, InstanceContent, ProgramContent, VolumeSource, PaymentType};
+use crate::handlers::AccountCostRecord;
 
 /// Address that holds the pricing aggregate
 pub const PRICING_AGGREGATE_ADDRESS: &str = "0x4D52380D3191274a04846c89c069E6C3F2Ed94e4";
@@ -698,6 +699,151 @@ impl CostService {
             credit: multiplied_cost.credit * discount_multiplier,
         })
     }
+
+    /// Calculate costs for an instance message.
+    /// Returns a list of AccountCostRecord entries (execution + rootfs + volume costs).
+    /// Reference: aleph/services/cost.py _calculate_executable_costs()
+    pub fn calculate_instance_costs(
+        &self,
+        item_hash: &str,
+        content: &InstanceContent,
+    ) -> Vec<AccountCostRecord> {
+        let owner = &content.address;
+        let payment_type = content.payment.as_ref()
+            .map(|p| match p.payment_type {
+                PaymentType::Hold => "hold",
+                PaymentType::Credit => "credit",
+                PaymentType::Superfluid => "superfluid",
+            })
+            .unwrap_or("hold")
+            .to_string();
+
+        let mut costs = Vec::new();
+        let compute_units = self.calculate_compute_units(content.resources.memory, content.resources.vcpus);
+
+        // 1. Execution cost
+        let cu_dec = Decimal::from(compute_units);
+        let exec_hold = defaults::compute_holding() * cu_dec;
+        let exec_credit = defaults::compute_credit() * cu_dec;
+        costs.push(AccountCostRecord {
+            owner: owner.to_string(),
+            item_hash: item_hash.to_string(),
+            cost_type: "EXECUTION".to_string(),
+            name: "execution".to_string(),
+            ref_hash: None,
+            payment_type: payment_type.clone(),
+            cost_hold: exec_hold,
+            cost_stream: Decimal::ZERO,
+            cost_credit: exec_credit,
+        });
+
+        // 2. Rootfs volume cost
+        let rootfs_mib = Decimal::from(content.rootfs.size_mib);
+        costs.push(AccountCostRecord {
+            owner: owner.to_string(),
+            item_hash: item_hash.to_string(),
+            cost_type: "EXECUTION_INSTANCE_VOLUME_ROOTFS".to_string(),
+            name: "rootfs".to_string(),
+            ref_hash: Some(content.rootfs.parent.ref_.clone()),
+            payment_type: payment_type.clone(),
+            cost_hold: defaults::storage_holding() * rootfs_mib,
+            cost_stream: Decimal::ZERO,
+            cost_credit: defaults::storage_credit() * rootfs_mib,
+        });
+
+        // 3. Machine volume costs
+        for (i, vol) in content.volumes.iter().enumerate() {
+            let (cost_type, size, ref_hash) = match &vol.source {
+                VolumeSource::Immutable { ref_, .. } => (
+                    "EXECUTION_VOLUME_IMMUTABLE", 0u32, Some(ref_.clone()),
+                ),
+                VolumeSource::Persistent { size_mib, .. } => (
+                    "EXECUTION_VOLUME_PERSISTENT", *size_mib, None,
+                ),
+                VolumeSource::Ephemeral { size_mib, .. } => (
+                    "EXECUTION_VOLUME_EPHEMERAL", *size_mib, None,
+                ),
+            };
+            let size_dec = Decimal::from(size);
+            costs.push(AccountCostRecord {
+                owner: owner.to_string(),
+                item_hash: item_hash.to_string(),
+                cost_type: cost_type.to_string(),
+                name: format!("volume_{}", i),
+                ref_hash,
+                payment_type: payment_type.clone(),
+                cost_hold: defaults::storage_holding() * size_dec,
+                cost_stream: Decimal::ZERO,
+                cost_credit: defaults::storage_credit() * size_dec,
+            });
+        }
+
+        costs
+    }
+
+    /// Calculate costs for a program message.
+    /// Same structure as instance costs but with program-specific cost type names.
+    pub fn calculate_program_costs(
+        &self,
+        item_hash: &str,
+        content: &ProgramContent,
+    ) -> Vec<AccountCostRecord> {
+        let owner = &content.address;
+        let payment_type = content.payment.as_ref()
+            .map(|p| match p.payment_type {
+                PaymentType::Hold => "hold",
+                PaymentType::Credit => "credit",
+                PaymentType::Superfluid => "superfluid",
+            })
+            .unwrap_or("hold")
+            .to_string();
+
+        let mut costs = Vec::new();
+        let compute_units = self.calculate_compute_units(content.resources.memory, content.resources.vcpus);
+
+        // 1. Execution cost
+        let cu_dec = Decimal::from(compute_units);
+        costs.push(AccountCostRecord {
+            owner: owner.to_string(),
+            item_hash: item_hash.to_string(),
+            cost_type: "EXECUTION".to_string(),
+            name: "execution".to_string(),
+            ref_hash: None,
+            payment_type: payment_type.clone(),
+            cost_hold: defaults::compute_holding() * cu_dec,
+            cost_stream: Decimal::ZERO,
+            cost_credit: defaults::compute_credit() * cu_dec,
+        });
+
+        // 2. Machine volume costs
+        for (i, vol) in content.volumes.iter().enumerate() {
+            let (cost_type, size, ref_hash) = match &vol.source {
+                VolumeSource::Immutable { ref_, .. } => (
+                    "EXECUTION_VOLUME_IMMUTABLE", 0u32, Some(ref_.clone()),
+                ),
+                VolumeSource::Persistent { size_mib, .. } => (
+                    "EXECUTION_VOLUME_PERSISTENT", *size_mib, None,
+                ),
+                VolumeSource::Ephemeral { size_mib, .. } => (
+                    "EXECUTION_VOLUME_EPHEMERAL", *size_mib, None,
+                ),
+            };
+            let size_dec = Decimal::from(size);
+            costs.push(AccountCostRecord {
+                owner: owner.to_string(),
+                item_hash: item_hash.to_string(),
+                cost_type: cost_type.to_string(),
+                name: format!("volume_{}", i),
+                ref_hash,
+                payment_type: payment_type.clone(),
+                cost_hold: defaults::storage_holding() * size_dec,
+                cost_stream: Decimal::ZERO,
+                cost_credit: defaults::storage_credit() * size_dec,
+            });
+        }
+
+        costs
+    }
 }
 
 /// Result of a cost calculation
@@ -857,5 +1003,38 @@ mod tests {
         let tier = cost.get_gpu_tier("custom-gpu").await;
         assert!(tier.is_some());
         assert_eq!(tier.unwrap().vram_gb, 16);
+    }
+
+    #[tokio::test]
+    async fn test_instance_cost_calculation() {
+        let cost = CostService::new();
+        let content = crate::types::InstanceContent {
+            address: "0xTest".to_string(),
+            allow_amend: true,
+            rootfs: crate::types::RootfsInfo {
+                parent: crate::types::RootfsParent { ref_: "rootfs_hash".to_string(), use_latest: true },
+                persistence: "host".to_string(),
+                size_mib: 20480,
+            },
+            resources: crate::types::VmResources { memory: 2048, vcpus: 1, seconds: 30 },
+            environment: None,
+            metadata: None,
+            variables: None,
+            volumes: vec![],
+            authorized_keys: vec![],
+            payment: Some(crate::types::PaymentInfo {
+                chain: crate::types::Chain::ETH,
+                payment_type: crate::types::PaymentType::Hold,
+                receiver: None,
+            }),
+            requirements: None,
+            replaces: None,
+            time: 1234567890.0,
+        };
+        let costs = cost.calculate_instance_costs("test_hash", &content);
+        assert_eq!(costs.len(), 2); // execution + rootfs
+        assert_eq!(costs[0].cost_type, "EXECUTION");
+        assert!(costs[0].cost_hold > Decimal::ZERO);
+        assert_eq!(costs[1].cost_type, "EXECUTION_INSTANCE_VOLUME_ROOTFS");
     }
 }

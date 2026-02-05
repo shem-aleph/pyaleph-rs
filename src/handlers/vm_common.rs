@@ -1,7 +1,8 @@
 //! Shared validation and processing logic for INSTANCE and PROGRAM messages.
 //! Reference: aleph/handlers/content/vm.py
 
-use crate::types::{VolumeInfo, VolumeSource};
+use crate::types::{VolumeInfo, VolumeSource, PaymentType};
+use rust_decimal::Decimal;
 use super::{HandlerContext, HandlerError};
 
 /// Collect all volume refs that need to be checked for existence.
@@ -86,4 +87,50 @@ pub async fn validate_amendment(
         }
     }
     Ok(())
+}
+
+/// Validate that address has sufficient balance for the VM costs.
+/// - HOLD: balance >= existing_cost + new_cost
+/// - CREDIT: balance >= (existing_per_sec + new_per_sec) * 86400 (1-day minimum)
+/// - SUPERFLUID: pass (validated on-chain)
+/// Reference: aleph/services/cost_validation.py validate_balance_for_payment()
+pub async fn validate_balance(
+    address: &str,
+    payment_type: PaymentType,
+    message_cost: Decimal,
+    ctx: &HandlerContext,
+) -> Result<(), HandlerError> {
+    match payment_type {
+        PaymentType::Superfluid => Ok(()), // Validated on-chain via streams
+        PaymentType::Hold => {
+            if let Some(ref db) = ctx.db {
+                let balance = db.get_balance(address, "ETH").await
+                    .map_err(HandlerError::Database)?
+                    .unwrap_or(Decimal::ZERO);
+                let existing_cost = db.get_total_cost_for_address(address, "hold").await
+                    .map_err(HandlerError::Database)?;
+                let required = existing_cost + message_cost;
+                if balance < required {
+                    return Err(HandlerError::InsufficientBalance);
+                }
+            }
+            Ok(())
+        }
+        PaymentType::Credit => {
+            if let Some(ref db) = ctx.db {
+                let balance = db.get_credit_balance(address).await
+                    .map_err(HandlerError::Database)?
+                    .unwrap_or(Decimal::ZERO);
+                let existing_per_sec = db.get_total_cost_for_address(address, "credit").await
+                    .map_err(HandlerError::Database)?;
+                let total_per_sec = existing_per_sec + message_cost;
+                let day_seconds = Decimal::from(86400);
+                let required = total_per_sec * day_seconds;
+                if balance < required {
+                    return Err(HandlerError::InsufficientCredit);
+                }
+            }
+            Ok(())
+        }
+    }
 }

@@ -337,18 +337,24 @@ impl Database for PgDatabase {
                 // file_pins already handled by remove_file_pin
             }
             "PROGRAM" => {
+                sqlx::query("DELETE FROM vm_machine_volumes WHERE vm_hash = $1")
+                    .bind(item_hash).execute(&self.pool).await.map_err(|e| e.to_string())?;
                 sqlx::query("DELETE FROM programs WHERE item_hash = $1")
-                    .bind(item_hash)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    .bind(item_hash).execute(&self.pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("DELETE FROM vm_versions WHERE vm_hash = $1")
+                    .bind(item_hash).execute(&self.pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("DELETE FROM account_costs WHERE item_hash = $1")
+                    .bind(item_hash).execute(&self.pool).await.map_err(|e| e.to_string())?;
             }
             "INSTANCE" => {
+                sqlx::query("DELETE FROM vm_machine_volumes WHERE vm_hash = $1")
+                    .bind(item_hash).execute(&self.pool).await.map_err(|e| e.to_string())?;
                 sqlx::query("DELETE FROM instances WHERE item_hash = $1")
-                    .bind(item_hash)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    .bind(item_hash).execute(&self.pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("DELETE FROM vm_versions WHERE vm_hash = $1")
+                    .bind(item_hash).execute(&self.pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("DELETE FROM account_costs WHERE item_hash = $1")
+                    .bind(item_hash).execute(&self.pool).await.map_err(|e| e.to_string())?;
             }
             _ => {}
         }
