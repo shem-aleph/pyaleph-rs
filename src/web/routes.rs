@@ -113,6 +113,9 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         
         // Pricing & Costs
         .route("/price", get(handlers::get_pricing))
+        .route("/price/estimate", post(handlers::price_estimate))
+        .route("/price/recalculate", post(handlers::recalculate_costs))
+        .route("/price/:hash/recalculate", post(handlers::recalculate_costs_for_hash))
         .route("/price/:hash", get(handlers::get_message_price))
         .route("/pricing", get(handlers::get_pricing))
         .route("/cost/estimate", post(handlers::estimate_cost))

@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -1714,6 +1714,179 @@ pub async fn estimate_cost(
     }
 }
 
+/// POST /price/estimate — Estimate cost for a message dict
+/// Accepts {"message": {...}} where message is a full Aleph message dict.
+/// Parses item_content to extract resources (memory, vcpus, storage) and calculates cost.
+/// Reference: aleph/web/controllers/prices.py:message_price_estimate
+#[derive(Debug, Deserialize)]
+pub struct PriceEstimateRequest {
+    pub message: serde_json::Value,
+}
+
+pub async fn price_estimate(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PriceEstimateRequest>,
+) -> impl IntoResponse {
+    let msg = &request.message;
+
+    // Determine message type
+    let msg_type = msg.get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_uppercase();
+
+    // Extract content: parse item_content string or use content field
+    let content: serde_json::Value = if let Some(ic) = msg.get("item_content").and_then(|v| v.as_str()) {
+        match serde_json::from_str(ic) {
+            Ok(v) => v,
+            Err(_) => {
+                return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+                    "error": "Failed to parse item_content as JSON"
+                })));
+            }
+        }
+    } else if let Some(content_val) = msg.get("content") {
+        content_val.clone()
+    } else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+            "error": "Message must contain item_content or content"
+        })));
+    };
+
+    // Extract address for charged_address
+    let charged_address = content.get("address")
+        .and_then(|v| v.as_str())
+        .or_else(|| msg.get("sender").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    // Extract payment type from content
+    let payment_type_str = content.get("payment")
+        .and_then(|p| p.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("hold");
+
+    match msg_type.as_str() {
+        "PROGRAM" | "INSTANCE" => {
+            // Extract resources
+            let resources = content.get("resources").unwrap_or(&serde_json::Value::Null);
+            let memory = resources.get("memory")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2048) as u32;
+            let vcpus = resources.get("vcpus")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+
+            // Calculate storage from volumes
+            let mut total_storage_mib: u64 = if msg_type == "PROGRAM" { 20480 } else { 40960 };
+
+            // Add persistent/ephemeral volumes
+            if let Some(volumes) = content.get("volumes").and_then(|v| v.as_array()) {
+                for vol in volumes {
+                    if let Some(size) = vol.get("size_mib").and_then(|v| v.as_u64()) {
+                        total_storage_mib += size;
+                    } else if let Some(size) = vol.get("estimated_size_mib").and_then(|v| v.as_u64()) {
+                        total_storage_mib += size;
+                    }
+                }
+            }
+
+            // Determine product type
+            let is_confidential = content.get("trusted_execution").is_some()
+                && !content.get("trusted_execution").unwrap().is_null();
+
+            let product_type = if is_confidential {
+                ProductPriceType::InstanceConfidential
+            } else if msg_type == "PROGRAM" {
+                ProductPriceType::Program
+            } else {
+                ProductPriceType::Instance
+            };
+
+            let internet_enabled = content.get("environment")
+                .and_then(|e| e.get("internet"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let hours = 24 * 30; // Monthly cost estimate
+
+            if let Some(cost) = state.cost.calculate_instance_cost(
+                memory,
+                vcpus,
+                total_storage_mib,
+                hours,
+                product_type,
+                internet_enabled,
+            ).await {
+                let required_tokens = match payment_type_str {
+                    "credit" => cost.credit.to_string().parse::<f64>().unwrap_or(0.0),
+                    "superfluid" | "stream" => cost.payg.to_string().parse::<f64>().unwrap_or(0.0),
+                    _ => cost.holding.to_string().parse::<f64>().unwrap_or(0.0),
+                };
+                let compute_units = state.cost.calculate_compute_units(memory, vcpus);
+
+                (StatusCode::OK, Json(json!({
+                    "required_tokens": required_tokens,
+                    "payment_type": payment_type_str,
+                    "cost": format!("{:.6}", required_tokens),
+                    "detail": [
+                        {
+                            "type": "compute",
+                            "name": format!("{} compute units", compute_units),
+                            "cost_hold": cost.holding.to_string(),
+                            "cost_stream": cost.payg.to_string(),
+                            "cost_credit": cost.credit.to_string()
+                        }
+                    ],
+                    "charged_address": charged_address,
+                })))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                    "error": "Unable to calculate cost"
+                })))
+            }
+        }
+        "STORE" => {
+            // For STORE messages, calculate storage cost
+            let size_mib = content.get("size")
+                .and_then(|v| v.as_u64())
+                .or_else(|| content.get("estimated_size_mib").and_then(|v| v.as_u64()))
+                .unwrap_or(1);
+
+            let hours = 24 * 30;
+
+            if let Some(cost) = state.cost.calculate_storage_cost(size_mib.max(1), hours, ProductPriceType::Storage).await {
+                let required_tokens = cost.holding.to_string().parse::<f64>().unwrap_or(0.0);
+
+                (StatusCode::OK, Json(json!({
+                    "required_tokens": required_tokens,
+                    "payment_type": "hold",
+                    "cost": format!("{:.6}", required_tokens),
+                    "detail": [
+                        {
+                            "type": "storage",
+                            "name": format!("{} MiB", size_mib),
+                            "cost_hold": cost.holding.to_string(),
+                            "cost_stream": cost.payg.to_string(),
+                            "cost_credit": cost.credit.to_string()
+                        }
+                    ],
+                    "charged_address": charged_address,
+                })))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                    "error": "Unable to calculate storage cost"
+                })))
+            }
+        }
+        _ => {
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+                "error": format!("Invalid or unsupported message type: '{}'. Only PROGRAM, INSTANCE, and STORE are supported.", msg_type)
+            })))
+        }
+    }
+}
+
 // ===== Additional Endpoints =====
 
 /// Get message content — returns inner content.content for POST messages only
@@ -2048,28 +2221,41 @@ pub async fn get_resource_cost(
             "error": "Database not available"
         }));
     }
-    
-    let cost = sqlx::query_as::<_, crate::db::models::AccountCostDb>(
-        "SELECT * FROM account_costs WHERE address IN (SELECT owner FROM programs WHERE item_hash = $1 UNION SELECT owner FROM instances WHERE item_hash = $1)"
+
+    // Query account_costs for this item_hash and sum up costs
+    let costs = sqlx::query_as::<_, crate::db::models::AccountCostDb>(
+        "SELECT * FROM account_costs WHERE item_hash = $1"
     )
     .bind(&hash)
-    .fetch_optional(state.db())
-    .await;
-    
-    match cost {
-        Ok(Some(c)) => Json(json!({
-            "hash": hash,
-            "storage_cost": c.storage_cost.to_string(),
-            "compute_cost": c.compute_cost.to_string(),
-            "total_cost": c.total_cost.to_string(),
-        })),
-        _ => Json(json!({
+    .fetch_all(state.db())
+    .await
+    .unwrap_or_default();
+
+    if costs.is_empty() {
+        return Json(json!({
             "hash": hash,
             "storage_cost": "0",
             "compute_cost": "0",
             "total_cost": "0",
-        })),
+        }));
     }
+
+    let mut storage_cost = rust_decimal::Decimal::ZERO;
+    let mut compute_cost = rust_decimal::Decimal::ZERO;
+    for c in &costs {
+        match c.cost_type.as_str() {
+            "storage" => storage_cost += c.cost_hold,
+            _ => compute_cost += c.cost_hold,
+        }
+    }
+    let total_cost = storage_cost + compute_cost;
+
+    Json(json!({
+        "hash": hash,
+        "storage_cost": storage_cost.to_string(),
+        "compute_cost": compute_cost.to_string(),
+        "total_cost": total_cost.to_string(),
+    }))
 }
 
 /// Get node statistics
@@ -2353,12 +2539,13 @@ pub struct BalancesQuery {
 
 /// Balance item in response
 /// Reference: aleph/schemas/api/accounts.py:AddressBalanceResponse
+/// Python pyaleph uses FloatDecimal = Annotated[Decimal, PlainSerializer(lambda x: float(x))]
 #[derive(Debug, Clone, Serialize)]
 pub struct BalanceItem {
     pub address: String,
     pub chain: String,
-    /// Balance as string to preserve precision for large numbers
-    pub balance: String,
+    /// Balance as float (matching pyaleph FloatDecimal serialization)
+    pub balance: f64,
 }
 
 /// Get list of balances - matches pyaleph /api/v0/balances format
@@ -2448,7 +2635,7 @@ pub async fn get_balances(
         .map(|b| BalanceItem {
             address: b.address,
             chain: b.chain,
-            balance: b.balance.to_string(),
+            balance: b.balance.to_string().parse::<f64>().unwrap_or(0.0),
         })
         .collect();
     
@@ -2634,6 +2821,7 @@ pub struct MessagePriceResponse {
 }
 
 /// Get price for an executable message (program or instance)
+/// Reads from account_costs table first (matching pyaleph behavior), falls back to on-the-fly calculation.
 /// Matches pyaleph /api/v0/price/{item_hash} format
 /// Reference: aleph/web/controllers/prices.py:message_price
 pub async fn get_message_price(
@@ -2645,60 +2833,126 @@ pub async fn get_message_price(
             "error": "Database not available"
         })));
     }
-    
-    // First, check if message exists and get its type
+
+    // Check if message is pending first
+    let pending = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pending_messages WHERE item_hash = $1)"
+    )
+    .bind(&item_hash)
+    .fetch_one(state.db())
+    .await
+    .unwrap_or(false);
+
+    if pending {
+        // Return 102 Processing status (pyaleph compat: HTTPProcessing)
+        return (StatusCode::PROCESSING, Json(json!({
+            "error": "Message still pending",
+            "item_hash": item_hash,
+            "status": "pending"
+        })));
+    }
+
+    // Check if message exists and get its type
     let message = sqlx::query_as::<_, crate::db::models::MessageDb>(
         "SELECT * FROM messages WHERE item_hash = $1"
     )
     .bind(&item_hash)
     .fetch_optional(state.db())
     .await;
-    
+
     match message {
         Ok(Some(msg)) => {
             let message_type = msg.message_type.to_uppercase();
-            
+
             // Only executable messages (PROGRAM, INSTANCE) and STORE have prices
+            if !matches!(message_type.as_str(), "PROGRAM" | "INSTANCE" | "STORE") {
+                return (StatusCode::BAD_REQUEST, Json(json!({
+                    "error": format!("Message is not an executable or store message: {}", item_hash)
+                })));
+            }
+
+            // Try to read costs from account_costs table (pyaleph behavior)
+            let db_costs = sqlx::query_as::<_, crate::db::models::AccountCostDb>(
+                "SELECT * FROM account_costs WHERE item_hash = $1"
+            )
+            .bind(&item_hash)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default();
+
+            if !db_costs.is_empty() {
+                // Build response from DB costs (matching pyaleph format)
+                let payment_type = db_costs.first()
+                    .map(|c| c.payment_type.as_str())
+                    .unwrap_or("hold");
+                let charged_address = db_costs.first()
+                    .map(|c| c.owner.as_str())
+                    .unwrap_or(&msg.sender);
+
+                // Sum up costs based on payment type
+                let required_tokens: f64 = db_costs.iter()
+                    .map(|c| {
+                        let cost = match payment_type {
+                            "superfluid" | "stream" => &c.cost_stream,
+                            "credit" => &c.cost_credit,
+                            _ => &c.cost_hold,
+                        };
+                        cost.to_string().parse::<f64>().unwrap_or(0.0)
+                    })
+                    .sum();
+
+                let detail: Vec<serde_json::Value> = db_costs.iter()
+                    .map(|c| json!({
+                        "type": c.cost_type,
+                        "name": c.name,
+                        "cost_hold": c.cost_hold.to_string(),
+                        "cost_stream": c.cost_stream.to_string(),
+                        "cost_credit": c.cost_credit.to_string()
+                    }))
+                    .collect();
+
+                return (StatusCode::OK, Json(json!({
+                    "required_tokens": required_tokens,
+                    "payment_type": payment_type,
+                    "cost": format!("{:.6}", required_tokens),
+                    "detail": detail,
+                    "charged_address": charged_address,
+                })));
+            }
+
+            // Fallback: calculate on-the-fly if no DB costs exist
             match message_type.as_str() {
                 "PROGRAM" => {
-                    // Get program details
                     let program = sqlx::query_as::<_, crate::db::models::ProgramDb>(
                         "SELECT * FROM programs WHERE item_hash = $1"
                     )
                     .bind(&item_hash)
                     .fetch_optional(state.db())
                     .await;
-                    
+
                     match program {
                         Ok(Some(prog)) => {
-                            // Calculate cost for this program
-                            let hours = 24 * 30; // Monthly cost estimate
-                            let storage_mib = 20480u64; // Default 20GB storage
-                            
+                            let hours = 24 * 30;
+                            let storage_mib = 20480u64;
+
                             if let Some(cost) = state.cost.calculate_instance_cost(
-                                prog.memory as u32,
-                                prog.vcpus as u32,
-                                storage_mib,
-                                hours,
-                                ProductPriceType::Program,
-                                false, // internet_enabled - would need to parse content
+                                prog.memory as u32, prog.vcpus as u32,
+                                storage_mib, hours, ProductPriceType::Program, false,
                             ).await {
                                 let required_tokens = cost.holding.to_string().parse::<f64>().unwrap_or(0.0);
                                 let compute_units = state.cost.calculate_compute_units(prog.memory as u32, prog.vcpus as u32);
-                                
+
                                 (StatusCode::OK, Json(json!({
                                     "required_tokens": required_tokens,
                                     "payment_type": "hold",
-                                    "cost": format!("{:.6} ALEPH", required_tokens),
-                                    "detail": [
-                                        {
-                                            "type": "compute",
-                                            "name": format!("{} compute units", compute_units),
-                                            "cost_hold": cost.holding.to_string(),
-                                            "cost_stream": cost.payg.to_string(),
-                                            "cost_credit": cost.credit.to_string()
-                                        }
-                                    ],
+                                    "cost": format!("{:.6}", required_tokens),
+                                    "detail": [{
+                                        "type": "compute",
+                                        "name": format!("{} compute units", compute_units),
+                                        "cost_hold": cost.holding.to_string(),
+                                        "cost_stream": cost.payg.to_string(),
+                                        "cost_credit": cost.credit.to_string()
+                                    }],
                                     "charged_address": prog.owner,
                                 })))
                             } else {
@@ -2717,36 +2971,27 @@ pub async fn get_message_price(
                     }
                 }
                 "INSTANCE" => {
-                    // Get instance details
                     let instance = sqlx::query_as::<_, crate::db::models::InstanceDb>(
                         "SELECT * FROM instances WHERE item_hash = $1"
                     )
                     .bind(&item_hash)
                     .fetch_optional(state.db())
                     .await;
-                    
+
                     match instance {
                         Ok(Some(inst)) => {
-                            // Determine product type from payment_type and trusted_execution
                             let product_type = if inst.trusted_execution.is_some() {
                                 ProductPriceType::InstanceConfidential
                             } else {
                                 ProductPriceType::Instance
                             };
-                            
-                            // Determine payment type
                             let payment_type = inst.payment_type.as_deref().unwrap_or("hold");
-                            
-                            let hours = 24 * 30; // Monthly cost estimate
-                            let storage_mib = 40960u64; // Default 40GB storage for instances
-                            
+                            let hours = 24 * 30;
+                            let storage_mib = 40960u64;
+
                             if let Some(cost) = state.cost.calculate_instance_cost(
-                                inst.memory as u32,
-                                inst.vcpus as u32,
-                                storage_mib,
-                                hours,
-                                product_type,
-                                false, // internet_enabled
+                                inst.memory as u32, inst.vcpus as u32,
+                                storage_mib, hours, product_type, false,
                             ).await {
                                 let required_tokens = match payment_type {
                                     "credit" => cost.credit.to_string().parse::<f64>().unwrap_or(0.0),
@@ -2754,20 +2999,18 @@ pub async fn get_message_price(
                                     _ => cost.holding.to_string().parse::<f64>().unwrap_or(0.0),
                                 };
                                 let compute_units = state.cost.calculate_compute_units(inst.memory as u32, inst.vcpus as u32);
-                                
+
                                 (StatusCode::OK, Json(json!({
                                     "required_tokens": required_tokens,
                                     "payment_type": payment_type,
-                                    "cost": format!("{:.6} ALEPH", required_tokens),
-                                    "detail": [
-                                        {
-                                            "type": "compute",
-                                            "name": format!("{} compute units", compute_units),
-                                            "cost_hold": cost.holding.to_string(),
-                                            "cost_stream": cost.payg.to_string(),
-                                            "cost_credit": cost.credit.to_string()
-                                        }
-                                    ],
+                                    "cost": format!("{:.6}", required_tokens),
+                                    "detail": [{
+                                        "type": "compute",
+                                        "name": format!("{} compute units", compute_units),
+                                        "cost_hold": cost.holding.to_string(),
+                                        "cost_stream": cost.payg.to_string(),
+                                        "cost_credit": cost.credit.to_string()
+                                    }],
                                     "charged_address": inst.owner,
                                 })))
                             } else {
@@ -2786,39 +3029,34 @@ pub async fn get_message_price(
                     }
                 }
                 "STORE" => {
-                    // For STORE messages, return storage cost
-                    // Need to get file size from file_pins or content
                     let file_pin = sqlx::query_as::<_, (i64,)>(
                         "SELECT size FROM file_pins WHERE item_hash = $1"
                     )
                     .bind(&item_hash)
                     .fetch_optional(state.db())
                     .await;
-                    
+
                     let size_bytes = match file_pin {
                         Ok(Some((size,))) => size as u64,
                         _ => 0u64,
                     };
-                    
                     let size_mib = size_bytes / (1024 * 1024);
-                    let hours = 24 * 30; // Monthly
-                    
+                    let hours = 24 * 30;
+
                     if let Some(cost) = state.cost.calculate_storage_cost(size_mib.max(1), hours, ProductPriceType::Storage).await {
                         let required_tokens = cost.holding.to_string().parse::<f64>().unwrap_or(0.0);
-                        
+
                         (StatusCode::OK, Json(json!({
                             "required_tokens": required_tokens,
                             "payment_type": "hold",
-                            "cost": format!("{:.6} ALEPH", required_tokens),
-                            "detail": [
-                                {
-                                    "type": "storage",
-                                    "name": format!("{} MiB", size_mib),
-                                    "cost_hold": cost.holding.to_string(),
-                                    "cost_stream": cost.payg.to_string(),
-                                    "cost_credit": cost.credit.to_string()
-                                }
-                            ],
+                            "cost": format!("{:.6}", required_tokens),
+                            "detail": [{
+                                "type": "storage",
+                                "name": format!("{} MiB", size_mib),
+                                "cost_hold": cost.holding.to_string(),
+                                "cost_stream": cost.payg.to_string(),
+                                "cost_credit": cost.credit.to_string()
+                            }],
                             "charged_address": msg.sender,
                         })))
                     } else {
@@ -2827,43 +3065,98 @@ pub async fn get_message_price(
                         })))
                     }
                 }
-                _ => {
-                    // Not a priced message type
-                    (StatusCode::BAD_REQUEST, Json(json!({
-                        "error": format!("Message type '{}' does not have pricing. Only PROGRAM, INSTANCE, and STORE messages have prices.", message_type),
-                        "item_hash": item_hash,
-                        "message_type": message_type
-                    })))
-                }
+                _ => unreachable!(),
             }
         }
         Ok(None) => {
-            // Check if pending
-            let pending = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM pending_messages WHERE item_hash = $1)"
-            )
-            .bind(&item_hash)
-            .fetch_one(state.db())
-            .await
-            .unwrap_or(false);
-            
-            if pending {
-                (StatusCode::ACCEPTED, Json(json!({
-                    "error": "Message still pending",
-                    "item_hash": item_hash,
-                    "status": "pending"
-                })))
-            } else {
-                (StatusCode::NOT_FOUND, Json(json!({
-                    "error": "Message not found",
-                    "item_hash": item_hash
-                })))
-            }
+            (StatusCode::NOT_FOUND, Json(json!({
+                "error": format!("Message not found with hash: {}", item_hash)
+            })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
             "error": e.to_string()
         }))),
     }
+}
+
+/// POST /price/recalculate — Force recalculation of message costs
+/// Requires X-Auth-Token header for authentication.
+/// Reference: aleph/web/controllers/prices.py:recalculate_message_costs
+pub async fn recalculate_costs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Check auth token
+    let auth_token = headers.get("x-auth-token")
+        .and_then(|v| v.to_str().ok());
+
+    if auth_token.is_none() {
+        return (StatusCode::UNAUTHORIZED, Json(json!({
+            "error": "Authentication required. Provide X-Auth-Token header."
+        })));
+    }
+
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+
+    // Stub implementation — full recalculation requires pricing timeline system
+    (StatusCode::OK, Json(json!({
+        "message": "Cost recalculation not yet fully implemented",
+        "recalculated_count": 0,
+        "total_messages": 0,
+        "pricing_changes_found": 0
+    })))
+}
+
+/// POST /price/:hash/recalculate — Force recalculation for a specific message
+/// Requires X-Auth-Token header for authentication.
+pub async fn recalculate_costs_for_hash(
+    State(state): State<Arc<AppState>>,
+    Path(item_hash): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Check auth token
+    let auth_token = headers.get("x-auth-token")
+        .and_then(|v| v.to_str().ok());
+
+    if auth_token.is_none() {
+        return (StatusCode::UNAUTHORIZED, Json(json!({
+            "error": "Authentication required. Provide X-Auth-Token header."
+        })));
+    }
+
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+
+    // Verify message exists
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE item_hash = $1)"
+    )
+    .bind(&item_hash)
+    .fetch_one(state.db())
+    .await
+    .unwrap_or(false);
+
+    if !exists {
+        return (StatusCode::NOT_FOUND, Json(json!({
+            "error": format!("Message not found with hash: {}", item_hash)
+        })));
+    }
+
+    // Stub implementation — full recalculation requires pricing timeline system
+    (StatusCode::OK, Json(json!({
+        "message": "Cost recalculation not yet fully implemented",
+        "recalculated_count": 0,
+        "total_messages": 1,
+        "item_hash": item_hash,
+        "pricing_changes_found": 0
+    })))
 }
 
 // ===== Address Stats Endpoint =====

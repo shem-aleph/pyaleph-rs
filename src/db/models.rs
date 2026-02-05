@@ -197,15 +197,22 @@ pub struct ChainTxDb {
     pub created_at: DateTime<Utc>,
 }
 
-/// Account cost record
-/// Tracks resource usage costs per account
+/// Account cost record — per-message cost breakdown
+/// Matches pyaleph: aleph/db/models/account_costs.py:AccountCostsDb
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct AccountCostDb {
-    pub address: String,
-    pub storage_cost: Decimal,
-    pub compute_cost: Decimal,
-    pub total_cost: Decimal,
-    pub last_calculated: DateTime<Utc>,
+    pub id: i64,
+    pub owner: String,
+    pub item_hash: String,
+    #[serde(rename = "type")]
+    #[sqlx(rename = "type")]
+    pub cost_type: String,
+    pub name: String,
+    pub ref_: Option<String>,
+    pub payment_type: String,
+    pub cost_hold: Decimal,
+    pub cost_stream: Decimal,
+    pub cost_credit: Decimal,
 }
 
 /// Chain sync state record
