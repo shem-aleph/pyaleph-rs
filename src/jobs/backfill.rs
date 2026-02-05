@@ -38,6 +38,10 @@ pub struct BackfillResult {
     pub posts_errors: u64,
     pub aggregates_inserted: u64,
     pub aggregates_errors: u64,
+    pub instances_inserted: u64,
+    pub instances_errors: u64,
+    pub programs_inserted: u64,
+    pub programs_errors: u64,
     pub duration_secs: f64,
 }
 
@@ -45,13 +49,17 @@ impl std::fmt::Display for BackfillResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Backfill complete in {:.1}s: posts inserted={}, skipped={}, errors={} | aggregates inserted={}, errors={}",
+            "Backfill complete in {:.1}s: posts inserted={}, skipped={}, errors={} | aggregates inserted={}, errors={} | instances inserted={}, errors={} | programs inserted={}, errors={}",
             self.duration_secs,
             self.posts_inserted,
             self.posts_skipped,
             self.posts_errors,
             self.aggregates_inserted,
             self.aggregates_errors,
+            self.instances_inserted,
+            self.instances_errors,
+            self.programs_inserted,
+            self.programs_errors,
         )
     }
 }
@@ -97,12 +105,38 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
     .await
     .map_err(|e| format!("Failed to count missing aggregates: {}", e))?;
 
+    // Check missing instances
+    let missing_instances: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM messages m
+        WHERE m.message_type = 'INSTANCE'
+        AND m.item_content IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM instances i WHERE i.item_hash = m.item_hash)
+        "#
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("Failed to count missing instances: {}", e))?;
+
+    // Check missing programs
+    let missing_programs: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM messages m
+        WHERE m.message_type = 'PROGRAM'
+        AND m.item_content IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM programs p WHERE p.item_hash = m.item_hash)
+        "#
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("Failed to count missing programs: {}", e))?;
+
     info!(
-        "Backfill needed: {} posts, {} aggregates to process",
-        missing_posts.0, missing_aggregates.0
+        "Backfill needed: {} posts, {} aggregates, {} instances, {} programs to process",
+        missing_posts.0, missing_aggregates.0, missing_instances.0, missing_programs.0
     );
 
-    if missing_posts.0 == 0 && missing_aggregates.0 == 0 {
+    if missing_posts.0 == 0 && missing_aggregates.0 == 0 && missing_instances.0 == 0 && missing_programs.0 == 0 {
         BACKFILL_RUNNING.store(false, Ordering::SeqCst);
         let result = BackfillResult {
             posts_inserted: 0,
@@ -110,6 +144,10 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
             posts_errors: 0,
             aggregates_inserted: 0,
             aggregates_errors: 0,
+            instances_inserted: 0,
+            instances_errors: 0,
+            programs_inserted: 0,
+            programs_errors: 0,
             duration_secs: start.elapsed().as_secs_f64(),
         };
         info!("Backfill: nothing to do, all tables up to date");
@@ -119,6 +157,8 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
     // Run backfills
     let posts_result = backfill_posts(pool).await;
     let aggregates_result = backfill_aggregates(pool).await;
+    let instances_result = backfill_instances(pool).await;
+    let programs_result = backfill_programs(pool).await;
 
     BACKFILL_RUNNING.store(false, Ordering::SeqCst);
 
@@ -126,6 +166,10 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
         .map_err(|e| format!("Posts backfill failed: {}", e))?;
     let (aggregates_inserted, aggregates_errors) = aggregates_result
         .map_err(|e| format!("Aggregates backfill failed: {}", e))?;
+    let (instances_inserted, instances_errors) = instances_result
+        .map_err(|e| format!("Instances backfill failed: {}", e))?;
+    let (programs_inserted, programs_errors) = programs_result
+        .map_err(|e| format!("Programs backfill failed: {}", e))?;
 
     let result = BackfillResult {
         posts_inserted,
@@ -133,6 +177,10 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
         posts_errors,
         aggregates_inserted,
         aggregates_errors,
+        instances_inserted,
+        instances_errors,
+        programs_inserted,
+        programs_errors,
         duration_secs: start.elapsed().as_secs_f64(),
     };
 
@@ -457,6 +505,108 @@ async fn backfill_aggregates(pool: &PgPool) -> Result<(u64, u64), String> {
     );
 
     Ok((total_inserted, total_errors))
+}
+
+/// Backfill the instances table from INSTANCE messages in the messages table.
+///
+/// Parses item_content JSON in PostgreSQL and inserts into the enriched instances table.
+/// Idempotent via ON CONFLICT DO NOTHING.
+async fn backfill_instances(pool: &PgPool) -> Result<(u64, u64), String> {
+    info!("Backfilling instances table...");
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO instances (item_hash, owner, rootfs_ref, memory, vcpus, payment_type, payment_chain,
+            allow_amend, replaces, environment_reproducible, environment_internet, environment_aleph_api,
+            environment_shared_cache, environment_hypervisor, resources_seconds, metadata, variables,
+            authorized_keys, rootfs_use_latest, rootfs_persistence, rootfs_size_mib, node_hash, time, created_at)
+        SELECT
+            m.item_hash,
+            m.sender,
+            m.item_content::jsonb->'rootfs'->'parent'->>'ref',
+            COALESCE((m.item_content::jsonb->'resources'->>'memory')::integer, 0),
+            COALESCE((m.item_content::jsonb->'resources'->>'vcpus')::integer, 0),
+            m.item_content::jsonb->'payment'->>'type',
+            m.item_content::jsonb->'payment'->>'chain',
+            COALESCE((m.item_content::jsonb->>'allow_amend')::boolean, true),
+            m.item_content::jsonb->>'replaces',
+            COALESCE((m.item_content::jsonb->'environment'->>'reproducible')::boolean, false),
+            COALESCE((m.item_content::jsonb->'environment'->>'internet')::boolean, true),
+            COALESCE((m.item_content::jsonb->'environment'->>'aleph_api')::boolean, true),
+            COALESCE((m.item_content::jsonb->'environment'->>'shared_cache')::boolean, false),
+            m.item_content::jsonb->'environment'->>'hypervisor',
+            COALESCE((m.item_content::jsonb->'resources'->>'seconds')::integer, 30),
+            m.item_content::jsonb->'metadata',
+            m.item_content::jsonb->'variables',
+            m.item_content::jsonb->'authorized_keys',
+            COALESCE((m.item_content::jsonb->'rootfs'->'parent'->>'use_latest')::boolean, true),
+            m.item_content::jsonb->'rootfs'->>'persistence',
+            (m.item_content::jsonb->'rootfs'->>'size_mib')::integer,
+            m.item_content::jsonb->'requirements'->'node'->>'node_hash',
+            COALESCE((m.item_content::jsonb->>'time')::double precision, m.time),
+            NOW()
+        FROM messages m
+        WHERE m.message_type = 'INSTANCE'
+        AND m.item_content IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM instances i WHERE i.item_hash = m.item_hash)
+        ON CONFLICT (item_hash) DO NOTHING
+        "#
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Instance backfill failed: {}", e))?;
+
+    let inserted = result.rows_affected();
+    info!("Instances backfill complete: inserted={}", inserted);
+    Ok((inserted, 0))
+}
+
+/// Backfill the programs table from PROGRAM messages in the messages table.
+async fn backfill_programs(pool: &PgPool) -> Result<(u64, u64), String> {
+    info!("Backfilling programs table...");
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO programs (item_hash, owner, code_ref, runtime_ref, memory, vcpus, allow_amend,
+            replaces, environment_reproducible, environment_internet, environment_aleph_api,
+            environment_shared_cache, environment_hypervisor, resources_seconds, metadata, variables,
+            payment_type, payment_chain, node_hash, time, created_at)
+        SELECT
+            m.item_hash,
+            m.sender,
+            m.item_content::jsonb->'code'->>'ref',
+            m.item_content::jsonb->'runtime'->>'ref',
+            COALESCE((m.item_content::jsonb->'resources'->>'memory')::integer, 0),
+            COALESCE((m.item_content::jsonb->'resources'->>'vcpus')::integer, 0),
+            COALESCE((m.item_content::jsonb->>'allow_amend')::boolean, true),
+            m.item_content::jsonb->>'replaces',
+            COALESCE((m.item_content::jsonb->'environment'->>'reproducible')::boolean, false),
+            COALESCE((m.item_content::jsonb->'environment'->>'internet')::boolean, true),
+            COALESCE((m.item_content::jsonb->'environment'->>'aleph_api')::boolean, true),
+            COALESCE((m.item_content::jsonb->'environment'->>'shared_cache')::boolean, false),
+            m.item_content::jsonb->'environment'->>'hypervisor',
+            COALESCE((m.item_content::jsonb->'resources'->>'seconds')::integer, 30),
+            m.item_content::jsonb->'metadata',
+            m.item_content::jsonb->'variables',
+            m.item_content::jsonb->'payment'->>'type',
+            m.item_content::jsonb->'payment'->>'chain',
+            m.item_content::jsonb->'requirements'->'node'->>'node_hash',
+            COALESCE((m.item_content::jsonb->>'time')::double precision, m.time),
+            NOW()
+        FROM messages m
+        WHERE m.message_type = 'PROGRAM'
+        AND m.item_content IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM programs p WHERE p.item_hash = m.item_hash)
+        ON CONFLICT (item_hash) DO NOTHING
+        "#
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Program backfill failed: {}", e))?;
+
+    let inserted = result.rows_affected();
+    info!("Programs backfill complete: inserted={}", inserted);
+    Ok((inserted, 0))
 }
 
 /// Check if backfill is needed (quick check, doesn't run it)
