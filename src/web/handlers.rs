@@ -159,8 +159,10 @@ pub struct MessageQuery {
     pub limit: Option<u32>,
     pub page: Option<u32>,
     /// Start time filter (Unix timestamp)
+    #[serde(alias = "startDate")]
     pub start_date: Option<f64>,
     /// End time filter (Unix timestamp)
+    #[serde(alias = "endDate")]
     pub end_date: Option<f64>,
     /// Sort order: 1 for ascending, -1 for descending (default: -1)
     pub order: Option<i8>,
