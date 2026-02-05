@@ -4309,3 +4309,274 @@ pub async fn get_addresses_stats_v1(
         "pagination_item": "addresses"
     }))
 }
+
+// ============================================================================
+// Task 21: GET /api/v0/messages/hashes
+// ============================================================================
+
+/// Query parameters for message hashes endpoint
+#[derive(Debug, Deserialize)]
+pub struct MessageHashesQuery {
+    /// Message status filter (not used for messages table which is always processed)
+    pub status: Option<String>,
+    /// Page number (1-based)
+    pub page: Option<u32>,
+    /// Items per page
+    pub pagination: Option<u32>,
+    /// Start time filter (Unix timestamp)
+    #[serde(alias = "startDate")]
+    pub start_date: Option<f64>,
+    /// End time filter (Unix timestamp)
+    #[serde(alias = "endDate")]
+    pub end_date: Option<f64>,
+    /// Sort order: 1 for ascending, -1 for descending (default: -1)
+    #[serde(rename = "sortOrder")]
+    pub sort_order: Option<i8>,
+    /// If true, return only hashes without pagination info
+    pub hash_only: Option<bool>,
+}
+
+/// Get message hashes with optional date filters and pagination
+pub async fn get_message_hashes(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<MessageHashesQuery>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return Json(json!({
+            "hashes": [],
+            "pagination_per_page": 0,
+            "pagination_page": 1,
+            "pagination_total": 0,
+            "pagination_item": "hashes"
+        }));
+    }
+
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.pagination.unwrap_or(20).min(1000);
+    let offset = ((page - 1) * per_page) as i64;
+    let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
+
+    // Build query
+    let mut builder = crate::db::QueryBuilder::new("SELECT item_hash FROM messages WHERE 1=1");
+
+    if let Some(start) = params.start_date {
+        builder.and_gte("time", start);
+    }
+    if let Some(end) = params.end_date {
+        builder.and_lte("time", end);
+    }
+
+    builder.order_by("time", ascending);
+    builder.limit(per_page as i64);
+    builder.offset(offset);
+
+    // Count query
+    let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
+    if let Some(start) = params.start_date {
+        count_builder.and_gte("time", start);
+    }
+    if let Some(end) = params.end_date {
+        count_builder.and_lte("time", end);
+    }
+
+    let (count_query, count_args) = count_builder.build();
+    let total: (i64,) = sqlx::query_as_with(&count_query, count_args)
+        .fetch_one(state.db())
+        .await
+        .unwrap_or((0,));
+
+    let (query, args) = builder.build();
+    let hashes: Vec<(String,)> = sqlx::query_as_with(&query, args)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default();
+
+    let hash_list: Vec<String> = hashes.into_iter().map(|(h,)| h).collect();
+
+    Json(json!({
+        "hashes": hash_list,
+        "pagination_per_page": per_page,
+        "pagination_page": page,
+        "pagination_total": total.0,
+        "pagination_item": "hashes"
+    }))
+}
+
+// ============================================================================
+// Task 22: POST /ipfs/pubsub/pub and /p2p/pubsub/pub
+// ============================================================================
+
+/// Request body for pubsub publish
+#[derive(Debug, Deserialize)]
+pub struct PubSubPublishRequest {
+    pub topic: String,
+    pub data: String,
+}
+
+/// Publish a message via pubsub (RabbitMQ)
+pub async fn pub_json(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PubSubPublishRequest>,
+) -> impl IntoResponse {
+    // Validate topic matches configured queue topic
+    if body.topic != state.config.p2p.topic {
+        return (StatusCode::FORBIDDEN, Json(json!({
+            "status": "error",
+            "failed": [format!("Invalid topic: {}", body.topic)]
+        })));
+    }
+
+    // Validate data is valid JSON
+    if serde_json::from_str::<serde_json::Value>(&body.data).is_err() {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "status": "error",
+            "failed": ["Data is not valid JSON"]
+        })));
+    }
+
+    // Publish to RabbitMQ if available
+    if let Some(ref rabbitmq) = state.rabbitmq {
+        let rmq = rabbitmq.read().await;
+        if rmq.is_connected() {
+            // Parse the data as a message and publish to the p2p network
+            match serde_json::from_str::<crate::types::Message>(&body.data) {
+                Ok(message) => {
+                    if let Err(e) = rmq.publish_to_network(&message).await {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                            "status": "error",
+                            "failed": [format!("Failed to publish: {}", e)]
+                        })));
+                    }
+                }
+                Err(_) => {
+                    // Data is valid JSON but not a valid message - still OK for pubsub
+                    // Just skip the RabbitMQ publish
+                }
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(json!({
+        "status": "success",
+        "failed": []
+    })))
+}
+
+// ============================================================================
+// Task 23: POST /ipfs/add_file
+// ============================================================================
+
+/// Add a file to IPFS via multipart upload
+pub async fn ipfs_add_file(
+    State(state): State<Arc<AppState>>,
+    mut multipart: axum::extract::Multipart,
+) -> impl IntoResponse {
+    // Find the "file" field
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or_default().to_string();
+        if name != "file" {
+            continue;
+        }
+
+        let file_name = field.file_name().unwrap_or("unknown").to_string();
+
+        // Read the file content
+        let data = match field.bytes().await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({
+                    "status": "error",
+                    "message": format!("Failed to read file: {}", e)
+                })));
+            }
+        };
+
+        let size = data.len();
+
+        // Upload to IPFS
+        match state.ipfs.add_with_details(data).await {
+            Ok(add_response) => {
+                return (StatusCode::OK, Json(json!({
+                    "status": "success",
+                    "hash": add_response.hash,
+                    "name": file_name,
+                    "size": size,
+                })));
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                    "status": "error",
+                    "message": format!("IPFS upload failed: {}", e)
+                })));
+            }
+        }
+    }
+
+    // No file field found
+    (StatusCode::BAD_REQUEST, Json(json!({
+        "status": "error",
+        "message": "No 'file' field in multipart form"
+    })))
+}
+
+// ============================================================================
+// Task 24: GET /programs/on/message
+// ============================================================================
+
+/// Query parameters for programs on message endpoint
+#[derive(Debug, Deserialize)]
+pub struct ProgramsOnMessageQuery {
+    /// Sort order: 1 for ascending, -1 for descending (default: -1)
+    #[serde(rename = "sortOrder")]
+    pub sort_order: Option<i8>,
+}
+
+/// Get programs that have an on.message trigger
+pub async fn get_programs_on_message(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ProgramsOnMessageQuery>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return Json(json!([]));
+    }
+
+    let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
+    let order = if ascending { "ASC" } else { "DESC" };
+
+    let query = format!(
+        "SELECT item_hash, item_content FROM messages \
+         WHERE message_type = 'PROGRAM' \
+         AND item_content::jsonb->'on'->'message' IS NOT NULL \
+         ORDER BY time {}",
+        order
+    );
+
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(&query)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default();
+
+    let results: Vec<serde_json::Value> = rows
+        .into_iter()
+        .filter_map(|(item_hash, item_content)| {
+            let content: serde_json::Value = item_content
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::Value::Null);
+
+            // Extract the on.message field
+            let on_message = content.get("on")?.get("message")?;
+
+            Some(json!({
+                "item_hash": item_hash,
+                "content": {
+                    "on": {
+                        "message": on_message
+                    }
+                }
+            }))
+        })
+        .collect();
+
+    Json(json!(results))
+}

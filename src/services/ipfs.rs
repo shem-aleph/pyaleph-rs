@@ -61,30 +61,36 @@ impl IpfsService {
     
     /// Add content to IPFS
     pub async fn add(&self, content: Vec<u8>) -> Result<String, IpfsError> {
+        let response = self.add_with_details(content).await?;
+        Ok(response.hash)
+    }
+
+    /// Add content to IPFS and return full details (hash, name, size)
+    pub async fn add_with_details(&self, content: Vec<u8>) -> Result<AddResponse, IpfsError> {
         let url = format!("{}/api/v0/add", self.api_url);
-        
+
         let form = reqwest::multipart::Form::new()
             .part("file", reqwest::multipart::Part::bytes(content));
-        
+
         let response = self.client
             .post(&url)
             .multipart(form)
             .send()
             .await?;
-        
+
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(IpfsError::Api { message: error_text });
         }
-        
+
         let add_response: AddResponse = response.json().await?;
-        
+
         // Pin if configured
         if self.pin_content {
             let _ = self.pin(&add_response.hash).await;
         }
-        
-        Ok(add_response.hash)
+
+        Ok(add_response)
     }
     
     /// Get content from IPFS

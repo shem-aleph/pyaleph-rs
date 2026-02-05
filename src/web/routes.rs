@@ -39,6 +39,8 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/messages.json", get(handlers::list_messages))
         .route("/messages", get(handlers::list_messages))
         .route("/messages", post(handlers::post_message))
+        // Message hashes - MUST come before /messages/:hash to match first
+        .route("/messages/hashes", get(handlers::get_message_hashes))
         .route("/messages/:hash", get(handlers::get_message))
         .route("/messages/:hash/status", get(handlers::get_message_status))
         .route("/messages/:hash/content", get(handlers::get_message_content))
@@ -78,6 +80,7 @@ pub fn api_v0() -> Router<Arc<AppState>> {
 
         // IPFS routes
         .route("/ipfs/add_json", post(handlers::add_json_storage))
+        .route("/ipfs/add_file", post(handlers::ipfs_add_file))
         
         // Hashes endpoint
         .route("/hashes", get(handlers::get_hashes))
@@ -98,6 +101,7 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/addresses/:address/credit_history", get(handlers::get_address_credit_history))
         
         // Programs & Instances
+        .route("/programs/on/message", get(handlers::get_programs_on_message))
         .route("/programs/:address", get(handlers::get_programs))
         .route("/programs", get(handlers::list_programs))
         .route("/instances/:address", get(handlers::get_instances))
@@ -151,6 +155,9 @@ pub fn api_ws0() -> Router<Arc<AppState>> {
 /// Legacy routes for backwards compatibility
 fn legacy_routes() -> Router<Arc<AppState>> {
     Router::new()
+        // PubSub publish endpoints
+        .route("/ipfs/pubsub/pub", post(handlers::pub_json))
+        .route("/p2p/pubsub/pub", post(handlers::pub_json))
         // Direct access to common endpoints
         .route("/messages.json", get(handlers::list_messages))
         .route("/aggregates.json", get(handlers::list_aggregates))
