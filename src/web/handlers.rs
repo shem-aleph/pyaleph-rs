@@ -311,7 +311,22 @@ pub async fn list_messages(
             builder.and_jsonb_text_in("item_content", "address", &owner_list);
         }
     }
-    
+
+    // Parse contentKeys filter (check if content.content has any of these keys)
+    // Python: MessageDb.content["content"].has_any(ARRAY[keys])
+    if let Some(ref content_keys) = params.content_keys {
+        let key_list = crate::db::parse_csv_param(content_keys);
+        if !key_list.is_empty() {
+            // Use ?| operator to check if any of the keys exist in content.content
+            let keys_array: Vec<String> = key_list.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect();
+            let clause = format!(
+                "(item_content::jsonb->'content') ?| ARRAY[{}]",
+                keys_array.join(", ")
+            );
+            builder.and_raw(&clause);
+        }
+    }
+
     // Time filters (parameterized)
     if let Some(start) = params.start_date {
         builder.and_gte("time", start);
@@ -416,13 +431,25 @@ pub async fn list_messages(
             count_builder.and_jsonb_text_in("item_content", "address", &owner_list);
         }
     }
+    // contentKeys filter for count query
+    if let Some(ref content_keys) = params.content_keys {
+        let key_list = crate::db::parse_csv_param(content_keys);
+        if !key_list.is_empty() {
+            let keys_array: Vec<String> = key_list.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect();
+            let clause = format!(
+                "(item_content::jsonb->'content') ?| ARRAY[{}]",
+                keys_array.join(", ")
+            );
+            count_builder.and_raw(&clause);
+        }
+    }
     if let Some(start) = params.start_date {
         count_builder.and_gte("time", start);
     }
     if let Some(end) = params.end_date {
         count_builder.and_lte("time", end);
     }
-    
+
     // Block number filters for count query
     if params.start_block.is_some() || params.end_block.is_some() {
         let mut block_conditions = Vec::new();
@@ -741,9 +768,11 @@ pub async fn post_message(
             }
             
             (StatusCode::ACCEPTED, Json(json!({
-                "status": "pending",
-                "item_hash": msg.item_hash,
-                "message": "Message received and queued for processing"
+                "publication_status": {
+                    "status": "success",
+                    "failed": []
+                },
+                "message_status": "pending"
             })))
         }
         Err(e) => {
@@ -1143,12 +1172,12 @@ pub async fn get_posts(
     }
     
     // Determine sort column (validate against allowed columns)
-    let allowed_sort = &["time", "address", "post_type", "channel"];
     let sort_column = match params.sort_by.as_deref() {
         Some("time") | None => "COALESCE(a.time, p.time)".to_string(),
         Some("address") => "p.address".to_string(),
         Some("post_type") => "p.post_type".to_string(),
         Some("channel") => "p.channel".to_string(),
+        Some("tx-time") => "om.created_at".to_string(),
         _ => "COALESCE(a.created_at, p.created_at)".to_string(),
     };
     
@@ -2441,7 +2470,7 @@ pub struct ListAggregatesQuery {
     pub addresses: Option<String>,
     /// Filter by keys (comma-separated)
     pub keys: Option<String>,
-    /// Items per page (default: 20, max: 1000)
+    /// Items per page (default: 20, max: 500)
     pub limit: Option<u32>,
     /// Alias for limit (pyaleph compatibility)
     pub pagination: Option<u32>,
@@ -2450,6 +2479,9 @@ pub struct ListAggregatesQuery {
     /// Sort order: 1 for ascending, -1 for descending (default: -1, by last_updated)
     #[serde(rename = "sortOrder")]
     pub sort_order: Option<i8>,
+    /// Sort by field (default: last_modified)
+    #[serde(rename = "sortBy")]
+    pub sort_by: Option<String>,
 }
 
 /// Aggregate item in list response
@@ -2475,11 +2507,11 @@ pub async fn list_aggregates(
     Query(params): Query<ListAggregatesQuery>,
 ) -> impl IntoResponse {
     let page = params.page.unwrap_or(1).max(1);
-    // Support both limit and pagination params (limit takes precedence)
-    let per_page = params.limit.or(params.pagination).unwrap_or(20).min(1000);
+    // Support both limit and pagination params (limit takes precedence), max 500
+    let per_page = params.limit.or(params.pagination).unwrap_or(20).min(500);
     let offset = ((page - 1) * per_page) as i64;
     let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
-    
+
     if !state.has_db() {
         return Json(json!({
             "aggregates": [],
@@ -2490,7 +2522,7 @@ pub async fn list_aggregates(
             "error": "Database not available"
         }));
     }
-    
+
     // Build query with filters
     let mut builder = crate::db::QueryBuilder::new(
         "SELECT a.address, a.key, a.content, a.time as created,          COALESCE(ae.time, a.time) as last_updated          FROM aggregates a          LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash          WHERE 1=1"
@@ -2498,7 +2530,7 @@ pub async fn list_aggregates(
     let mut count_builder = crate::db::QueryBuilder::new(
         "SELECT COUNT(*) FROM aggregates WHERE 1=1"
     );
-    
+
     // Filter by addresses
     if let Some(ref addresses) = params.addresses {
         let addr_list = crate::db::parse_csv_param(addresses);
@@ -2507,7 +2539,7 @@ pub async fn list_aggregates(
             count_builder.and_in("address", &addr_list);
         }
     }
-    
+
     // Filter by keys
     if let Some(ref keys) = params.keys {
         let key_list = crate::db::parse_csv_param(keys);
@@ -2516,12 +2548,17 @@ pub async fn list_aggregates(
             count_builder.and_in("key", &key_list);
         }
     }
-    
-    // Order and pagination - order by last_updated (descending by default)
+
+    // Determine sort column - only last_modified is supported (matching pyaleph)
+    let sort_column = match params.sort_by.as_deref() {
+        Some("last_modified") | _ => "COALESCE(ae.time, a.time)",
+    };
+
+    // Order and pagination
     let order_dir = if ascending { "ASC" } else { "DESC" };
     builder.and_raw(&format!(
-        "1=1 ORDER BY COALESCE(ae.time, a.time) {} LIMIT {} OFFSET {}",
-        order_dir, per_page, offset
+        "1=1 ORDER BY {} {} LIMIT {} OFFSET {}",
+        sort_column, order_dir, per_page, offset
     ));
     
     // Get total count
@@ -4126,6 +4163,13 @@ pub struct AddressStatsV1Query {
     /// Sort order: 1 for ascending, -1 for descending (default: -1)
     #[serde(rename = "sortOrder")]
     pub sort_order: Option<i8>,
+    /// Filter addresses containing this substring (case-insensitive, max 66 chars)
+    #[serde(rename = "addressContains")]
+    pub address_contains: Option<String>,
+    /// Sort by message type count: "post", "aggregate", "store", "program", "instance", "forget"
+    /// Default: total messages
+    #[serde(rename = "sortBy")]
+    pub sort_by: Option<String>,
 }
 
 /// GET /api/v1/addresses/stats.json - Get paginated address statistics
@@ -4152,26 +4196,48 @@ pub async fn get_addresses_stats_v1(
     let per_page = params.pagination.unwrap_or(20).min(1000);
     let offset = ((page - 1) * per_page) as i64;
     let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
-    
-    // Get total unique senders count
-    let total: (i64,) = sqlx::query_as(
-        "SELECT COUNT(DISTINCT sender) FROM messages"
-    )
-    .fetch_one(state.db())
-    .await
-    .unwrap_or((0,));
-    
-    // Query addresses with their message counts, ordered by total messages
+
+    // Build WHERE clause for optional address filter
+    let address_filter = if let Some(ref search) = params.address_contains {
+        // Limit search string to 66 chars (max address length)
+        let search = &search[..search.len().min(66)];
+        format!("WHERE sender ILIKE '%{}%'", search.replace('\'', "''").replace('%', "\\%").replace('_', "\\_"))
+    } else {
+        String::new()
+    };
+
+    // Get total unique senders count (with filter)
+    let count_query = format!(
+        "SELECT COUNT(DISTINCT sender) FROM messages {}",
+        address_filter
+    );
+    let total: (i64,) = sqlx::query_as(&count_query)
+        .fetch_one(state.db())
+        .await
+        .unwrap_or((0,));
+
+    // Determine sort column based on sortBy parameter
+    let sort_column = match params.sort_by.as_deref() {
+        Some("post") => "SUM(CASE WHEN message_type = 'POST' THEN 1 ELSE 0 END)".to_string(),
+        Some("aggregate") => "SUM(CASE WHEN message_type = 'AGGREGATE' THEN 1 ELSE 0 END)".to_string(),
+        Some("store") => "SUM(CASE WHEN message_type = 'STORE' THEN 1 ELSE 0 END)".to_string(),
+        Some("program") => "SUM(CASE WHEN message_type = 'PROGRAM' THEN 1 ELSE 0 END)".to_string(),
+        Some("instance") => "SUM(CASE WHEN message_type = 'INSTANCE' THEN 1 ELSE 0 END)".to_string(),
+        Some("forget") => "SUM(CASE WHEN message_type = 'FORGET' THEN 1 ELSE 0 END)".to_string(),
+        _ => "COUNT(*)".to_string(),
+    };
+
+    // Query addresses with their message counts
     let order_clause = if ascending { "ASC" } else { "DESC" };
     let query = format!(
         "SELECT sender, COUNT(*) as total_messages \
-         FROM messages \
+         FROM messages {} \
          GROUP BY sender \
-         ORDER BY total_messages {} \
+         ORDER BY {} {} \
          LIMIT $1 OFFSET $2",
-        order_clause
+        address_filter, sort_column, order_clause
     );
-    
+
     let addresses: Vec<(String, i64)> = sqlx::query_as(&query)
         .bind(per_page as i64)
         .bind(offset)
