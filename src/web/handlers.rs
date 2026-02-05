@@ -3082,9 +3082,10 @@ pub async fn get_address_credit_history(
     }
     
     let page = params.page.unwrap_or(1).max(1);
-    let per_page = params.pagination.unwrap_or(20).min(1000);
+    let raw_pagination = params.pagination.unwrap_or(0);
+    let per_page = if raw_pagination == 0 { 10_000 } else { raw_pagination.min(1000) };
     let offset = ((page - 1) * per_page) as i64;
-    
+
     // Check if credit_history table exists
     let table_exists: (bool,) = sqlx::query_as(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'credit_history')"
@@ -3092,46 +3093,103 @@ pub async fn get_address_credit_history(
     .fetch_one(state.db())
     .await
     .unwrap_or((false,));
-    
+
     if !table_exists.0 {
         return (StatusCode::NOT_FOUND, Json(json!({
             "error": "Credit history not available (table does not exist)",
             "address": address
         })));
     }
-    
-    // Query credit history (simplified - without dynamic filters for now)
-    let history: Vec<(i64, Option<rust_decimal::Decimal>, Option<i64>, Option<String>, Option<String>, 
+
+    // Build dynamic WHERE clause with filters
+    let mut where_clauses = vec!["address = $1".to_string()];
+    let mut param_index = 1u32;
+
+    // Collect filter values for binding
+    let mut filter_values: Vec<String> = Vec::new();
+
+    if let Some(ref v) = params.tx_hash {
+        param_index += 1;
+        where_clauses.push(format!("tx_hash = ${}", param_index));
+        filter_values.push(v.clone());
+    }
+    if let Some(ref v) = params.token {
+        param_index += 1;
+        where_clauses.push(format!("token = ${}", param_index));
+        filter_values.push(v.clone());
+    }
+    if let Some(ref v) = params.chain {
+        param_index += 1;
+        where_clauses.push(format!("chain = ${}", param_index));
+        filter_values.push(v.clone());
+    }
+    if let Some(ref v) = params.provider {
+        param_index += 1;
+        where_clauses.push(format!("provider = ${}", param_index));
+        filter_values.push(v.clone());
+    }
+    if let Some(ref v) = params.origin {
+        param_index += 1;
+        where_clauses.push(format!("origin = ${}", param_index));
+        filter_values.push(v.clone());
+    }
+    if let Some(ref v) = params.origin_ref {
+        param_index += 1;
+        where_clauses.push(format!("origin_ref = ${}", param_index));
+        filter_values.push(v.clone());
+    }
+    if let Some(ref v) = params.payment_method {
+        param_index += 1;
+        where_clauses.push(format!("payment_method = ${}", param_index));
+        filter_values.push(v.clone());
+    }
+
+    let where_sql = where_clauses.join(" AND ");
+    let limit_param = param_index + 1;
+    let offset_param = param_index + 2;
+
+    let query_sql = format!(
+        "SELECT amount, price, bonus_amount, tx_hash, token, chain, provider, origin, origin_ref, \
+         payment_method, credit_ref, credit_index, expiration_date, message_timestamp \
+         FROM credit_history WHERE {} ORDER BY message_timestamp DESC LIMIT ${} OFFSET ${}",
+        where_sql, limit_param, offset_param
+    );
+
+    // Build and execute the query with dynamic bindings
+    let mut query = sqlx::query_as::<_, (i64, Option<rust_decimal::Decimal>, Option<i64>, Option<String>, Option<String>,
                       Option<String>, Option<String>, Option<String>, Option<String>, Option<String>,
-                      Option<String>, Option<i32>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>)> = 
-        sqlx::query_as(
-            "SELECT amount, price, bonus_amount, tx_hash, token, chain, provider, origin, origin_ref, \
-             payment_method, credit_ref, credit_index, expiration_date, message_timestamp \
-             FROM credit_history WHERE address = $1 ORDER BY message_timestamp DESC LIMIT $2 OFFSET $3"
-        )
-        .bind(&address)
-        .bind(per_page as i64)
-        .bind(offset)
-        .fetch_all(state.db())
-        .await
-        .unwrap_or_default();
-    
+                      Option<String>, Option<i32>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>)>(&query_sql)
+        .bind(&address);
+
+    for val in &filter_values {
+        query = query.bind(val);
+    }
+    query = query.bind(per_page as i64).bind(offset);
+
+    let history = query.fetch_all(state.db()).await.unwrap_or_default();
+
     if history.is_empty() {
         return (StatusCode::NOT_FOUND, Json(json!({
             "error": "No credit history found for this address",
             "address": address
         })));
     }
-    
-    // Get total count
-    let total: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM credit_history WHERE address = $1"
-    )
-    .bind(&address)
-    .fetch_one(state.db())
-    .await
-    .unwrap_or((0,));
-    
+
+    // Get total count with same filters
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM credit_history WHERE {}",
+        where_sql
+    );
+
+    let mut count_query = sqlx::query_as::<_, (i64,)>(&count_sql)
+        .bind(&address);
+
+    for val in &filter_values {
+        count_query = count_query.bind(val);
+    }
+
+    let total: (i64,) = count_query.fetch_one(state.db()).await.unwrap_or((0,));
+
     // Format response
     let history_items: Vec<CreditHistoryItem> = history.into_iter().map(|h| CreditHistoryItem {
         amount: h.0,
@@ -3149,13 +3207,13 @@ pub async fn get_address_credit_history(
         expiration_date: h.12.map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339()),
         message_timestamp: h.13.map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339()),
     }).collect();
-    
+
     (StatusCode::OK, Json(json!({
         "address": address,
         "credit_history": history_items,
         "pagination_page": page,
         "pagination_total": total.0,
-        "pagination_per_page": per_page,
+        "pagination_per_page": raw_pagination,
     })))
 }
 
