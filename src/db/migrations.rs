@@ -25,6 +25,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Error> {
     create_programs_table(pool).await?;
     create_instances_table(pool).await?;
     create_vm_versions_table(pool).await?;
+    create_vm_machine_volumes_table(pool).await?;
     create_chain_txs_table(pool).await?;
     create_account_costs_table(pool).await?;
     create_chain_sync_state_table(pool).await?;
@@ -229,6 +230,20 @@ async fn create_programs_table(pool: &PgPool) -> Result<(), Error> {
             memory INTEGER NOT NULL,
             vcpus INTEGER NOT NULL,
             allow_amend BOOLEAN DEFAULT TRUE,
+            replaces VARCHAR(128),
+            environment_reproducible BOOLEAN DEFAULT FALSE,
+            environment_internet BOOLEAN DEFAULT TRUE,
+            environment_aleph_api BOOLEAN DEFAULT TRUE,
+            environment_shared_cache BOOLEAN DEFAULT FALSE,
+            environment_hypervisor VARCHAR(20),
+            resources_seconds INTEGER DEFAULT 30,
+            metadata JSONB,
+            variables JSONB,
+            payment_type VARCHAR(20),
+            payment_chain VARCHAR(10),
+            cpu_architecture VARCHAR(20),
+            node_hash VARCHAR(128),
+            time DOUBLE PRECISION,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     "#)
@@ -249,6 +264,26 @@ async fn create_instances_table(pool: &PgPool) -> Result<(), Error> {
             payment_chain VARCHAR(10),
             allow_amend BOOLEAN DEFAULT TRUE,
             trusted_execution JSONB,
+            replaces VARCHAR(128),
+            environment_reproducible BOOLEAN DEFAULT FALSE,
+            environment_internet BOOLEAN DEFAULT TRUE,
+            environment_aleph_api BOOLEAN DEFAULT TRUE,
+            environment_shared_cache BOOLEAN DEFAULT FALSE,
+            environment_hypervisor VARCHAR(20),
+            resources_seconds INTEGER DEFAULT 30,
+            metadata JSONB,
+            variables JSONB,
+            authorized_keys JSONB,
+            rootfs_use_latest BOOLEAN DEFAULT TRUE,
+            rootfs_persistence VARCHAR(20),
+            rootfs_size_mib INTEGER,
+            cpu_architecture VARCHAR(20),
+            cpu_vendor VARCHAR(50),
+            node_owner VARCHAR(256),
+            node_address_regex VARCHAR(256),
+            node_hash VARCHAR(128),
+            payment_receiver VARCHAR(256),
+            time DOUBLE PRECISION,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     "#)
@@ -260,11 +295,35 @@ async fn create_instances_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_vm_versions_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS vm_versions (
-            item_hash VARCHAR(128) PRIMARY KEY,
+            vm_hash VARCHAR(128) PRIMARY KEY,
             original_hash VARCHAR(128) NOT NULL,
             version INTEGER NOT NULL,
             owner VARCHAR(256) NOT NULL,
+            current_version VARCHAR(128),
+            last_updated TIMESTAMPTZ,
             created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    "#)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn create_vm_machine_volumes_table(pool: &PgPool) -> Result<(), Error> {
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS vm_machine_volumes (
+            id BIGSERIAL PRIMARY KEY,
+            vm_hash VARCHAR(128) NOT NULL,
+            volume_type VARCHAR(20) NOT NULL,
+            comment TEXT,
+            mount VARCHAR(256),
+            size_mib INTEGER,
+            ref_hash VARCHAR(128),
+            use_latest BOOLEAN,
+            persistence VARCHAR(20),
+            name VARCHAR(256),
+            parent_ref VARCHAR(128),
+            parent_use_latest BOOLEAN
         )
     "#)
     .execute(pool)
@@ -293,11 +352,17 @@ async fn create_chain_txs_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_account_costs_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS account_costs (
-            address VARCHAR(256) PRIMARY KEY,
-            storage_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
-            compute_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
-            total_cost DECIMAL(78, 18) NOT NULL DEFAULT 0,
-            last_calculated TIMESTAMPTZ DEFAULT NOW()
+            id BIGSERIAL PRIMARY KEY,
+            owner VARCHAR(256) NOT NULL,
+            item_hash VARCHAR(128) NOT NULL,
+            cost_type VARCHAR(50) NOT NULL,
+            name VARCHAR(256) NOT NULL,
+            ref_hash VARCHAR(128),
+            payment_type VARCHAR(20) NOT NULL,
+            cost_hold DECIMAL(78, 18) NOT NULL DEFAULT 0,
+            cost_stream DECIMAL(78, 18) NOT NULL DEFAULT 0,
+            cost_credit DECIMAL(78, 18) NOT NULL DEFAULT 0,
+            UNIQUE(owner, item_hash, cost_type, name)
         )
     "#)
     .execute(pool)
@@ -395,7 +460,19 @@ async fn create_indexes(pool: &PgPool) -> Result<(), Error> {
     // VM versions indexes
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_vm_versions_original ON vm_versions(original_hash)")
         .execute(pool).await?;
-    
+
+    // VM enrichment indexes
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_instances_replaces ON instances(replaces) WHERE replaces IS NOT NULL")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_programs_replaces ON programs(replaces) WHERE replaces IS NOT NULL")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_vm_volumes_vm_hash ON vm_machine_volumes(vm_hash)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_account_costs_owner ON account_costs(owner)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_account_costs_item_hash ON account_costs(item_hash)")
+        .execute(pool).await?;
+
     // Forgotten messages indexes
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_forgotten_forget_hash ON forgotten_messages(forget_hash)")
         .execute(pool).await?;
