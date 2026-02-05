@@ -612,7 +612,7 @@ mod tests {
         let buffer = CryptoService::get_verification_buffer(
             &Chain::ETH,
             "0x1234567890123456789012345678901234567890",
-            &MessageType::POST,
+            &MessageType::Post,
             "abcd1234",
         );
         assert_eq!(buffer, "ETH\n0x1234567890123456789012345678901234567890\nPOST\nabcd1234");

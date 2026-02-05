@@ -274,9 +274,7 @@ fn extract_content_fields(message: &Message) -> (Option<String>, Option<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::{
-        AggregateElement, Database, FilePinRecord, HandlerContext, PostRecord,
-    };
+    use crate::handlers::{Database, FilePinRecord, HandlerContext, PostRecord};
     use crate::types::{Chain, ItemType, Message, MessageType, ProcessingStatus};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -355,22 +353,6 @@ mod tests {
             _key: &str,
             _content: &serde_json::Value,
             _time: f64,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn get_aggregate_elements(
-            &self,
-            _address: &str,
-            _key: &str,
-        ) -> Result<Vec<AggregateElement>, String> {
-            Ok(vec![])
-        }
-
-        async fn store_aggregate_element(
-            &self,
-            _address: &str,
-            _element: &AggregateElement,
         ) -> Result<(), String> {
             Ok(())
         }
