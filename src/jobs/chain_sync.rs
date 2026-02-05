@@ -146,13 +146,40 @@ async fn sync_chain(
         }
     }
     
+    if !result.sync_hashes.is_empty() {
+        info!(
+            "{:?}: Found {} sync hashes (IPFS batch CIDs) in blocks {} to {}",
+            chain, result.sync_hashes.len(), start_block, end_block
+        );
+        // Queue sync hashes for IPFS fetching via content_fetch service.
+        // Insert as messages with item_type='ipfs' and NULL item_content so
+        // the content_fetch service picks them up.
+        if let Some(pool) = pool {
+            for hash in &result.sync_hashes {
+                let now = chrono::Utc::now().timestamp() as f64;
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO pending_messages (item_hash, message, reception_time, fetched, check_message, retries, next_attempt, trusted_source)
+                    VALUES ($1, $2, $3, false, true, 0, $3, true)
+                    ON CONFLICT (item_hash) DO NOTHING
+                    "#,
+                )
+                .bind(hash)
+                .bind(serde_json::json!({"_sync_batch": true, "item_hash": hash}))
+                .bind(now)
+                .execute(pool)
+                .await;
+            }
+        }
+    }
+
     if !result.messages.is_empty() {
         info!(
             "{:?}: Synced {} messages from blocks {} to {}",
             chain, result.messages.len(), start_block, end_block
         );
     }
-    
+
     Ok(result.messages.len())
 }
 

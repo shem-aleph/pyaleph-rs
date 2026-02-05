@@ -195,8 +195,9 @@ impl EthereumIndexer {
         })
     }
     
-    /// Parse a log into an indexed message
-    fn parse_log(&self, log: &Log) -> Result<Option<IndexedMessage>, ChainError> {
+    /// Parse a log into an indexed message and/or sync hashes
+    /// Returns (Option<IndexedMessage>, Vec<String> of sync hashes)
+    fn parse_log(&self, log: &Log) -> Result<(Option<IndexedMessage>, Vec<String>), ChainError> {
         // Get transaction hash
         let tx_hash = log.transaction_hash
             .map(|h| format!("{:?}", h))
@@ -208,7 +209,7 @@ impl EthereumIndexer {
         
         // Check which event type this is
         if log.topics.is_empty() {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         }
         
         let event_sig = log.topics[0];
@@ -230,7 +231,7 @@ impl EthereumIndexer {
                         block_number,
                     ) {
                         Ok(message) => {
-                            return Ok(Some(IndexedMessage {
+                            return Ok((Some(IndexedMessage {
                                 message,
                                 chain_ref: ChainRef {
                                     chain: Chain::ETH,
@@ -241,7 +242,7 @@ impl EthereumIndexer {
                                     .map(|h| format!("{:?}", h))
                                     .unwrap_or_default(),
                                 block_time: None,
-                            }));
+                            }), Vec::new()));
                         }
                         Err(e) => {
                             warn!("Failed to parse message content: {}", e);
@@ -269,7 +270,7 @@ impl EthereumIndexer {
                             let sender_addr = EthAddress::from_slice(&sender.as_bytes()[12..]);
                             if !self.authorized_emitters.contains(&sender_addr) {
                                 debug!("Ignoring sync event from unauthorized emitter: {:?}", sender_addr);
-                                return Ok(None);
+                                return Ok((None, Vec::new()));
                             }
                         }
                     }
@@ -278,7 +279,7 @@ impl EthereumIndexer {
                     match abi::parse_sync_content(&decoded.content) {
                         Ok(hashes) => {
                             debug!("Sync message contains {} hashes to fetch", hashes.len());
-                            // TODO: Queue these hashes for fetching from IPFS
+                            return Ok((None, hashes));
                         }
                         Err(e) => {
                             warn!("Failed to parse sync content: {}", e);
@@ -291,9 +292,9 @@ impl EthereumIndexer {
             }
         }
         
-        Ok(None)
+        Ok((None, Vec::new()))
     }
-    
+
     /// Index blocks with dynamic range adjustment
     async fn index_blocks_adaptive(&self, start: u64, end: u64) -> Result<IndexResult, ChainError> {
         let mut batch_size = self.batch_size;
@@ -309,8 +310,11 @@ impl EthereumIndexer {
                     // Parse logs
                     for log in &logs {
                         match self.parse_log(log) {
-                            Ok(Some(msg)) => all_messages.push(msg),
-                            Ok(None) => {}
+                            Ok((Some(msg), _)) => all_messages.push(msg),
+                            Ok((None, hashes)) if !hashes.is_empty() => {
+                                all_sync_hashes.extend(hashes);
+                            }
+                            Ok((None, _)) => {}
                             Err(e) => warn!("Failed to parse log: {}", e),
                         }
                     }
@@ -396,21 +400,25 @@ impl ChainIndexer for EthereumIndexer {
         
         debug!("Found {} logs in blocks {} to {}", logs.len(), start, end);
         
-        // Parse logs into messages
+        // Parse logs into messages and sync hashes
         let mut messages = Vec::new();
+        let mut sync_hashes = Vec::new();
         for log in &logs {
             match self.parse_log(log) {
-                Ok(Some(msg)) => messages.push(msg),
-                Ok(None) => {}
+                Ok((Some(msg), _)) => messages.push(msg),
+                Ok((None, hashes)) if !hashes.is_empty() => {
+                    sync_hashes.extend(hashes);
+                }
+                Ok((None, _)) => {}
                 Err(e) => warn!("Failed to parse log: {}", e),
             }
         }
-        
-        info!("Indexed {} messages from blocks {} to {}", messages.len(), start, end);
-        
+
+        info!("Indexed {} messages, {} sync hashes from blocks {} to {}", messages.len(), sync_hashes.len(), start, end);
+
         Ok(IndexResult {
             messages,
-            sync_hashes: Vec::new(),
+            sync_hashes,
             last_block: end,
             blocks_processed: end - start + 1,
         })
