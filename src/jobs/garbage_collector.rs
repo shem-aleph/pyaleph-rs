@@ -182,13 +182,46 @@ async fn remove_file(db: &PgPool, ipfs: &IpfsService, hash: &str) -> Result<bool
     Ok(true)
 }
 
-/// Clean up orphaned IPFS pins (pins without corresponding file_pins entry)
+/// Clean up orphaned IPFS pins (file_pins with no corresponding message)
 async fn clean_orphaned_pins(db: &PgPool, ipfs: &IpfsService) -> Result<u64, GcError> {
-    // This would require querying IPFS for all pins and comparing with database
-    // For now, we skip this as it's expensive
-    // In production, this should be done periodically with rate limiting
-    
-    Ok(0)
+    // Find file_pins entries that no longer have a corresponding STORE message
+    let orphaned: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT fp.item_hash
+        FROM file_pins fp
+        LEFT JOIN messages m ON m.item_hash = fp.item_hash
+        WHERE m.item_hash IS NULL
+        LIMIT 100
+        "#
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| GcError::Database(e.to_string()))?;
+
+    if orphaned.is_empty() {
+        return Ok(0);
+    }
+
+    let mut cleaned = 0u64;
+    for (hash,) in &orphaned {
+        // Try to unpin from IPFS (ignore errors — pin may already be gone)
+        let _ = ipfs.unpin(hash).await;
+
+        if sqlx::query("DELETE FROM file_pins WHERE item_hash = $1")
+            .bind(hash)
+            .execute(db)
+            .await
+            .is_ok()
+        {
+            cleaned += 1;
+        }
+    }
+
+    if cleaned > 0 {
+        info!("Cleaned {} orphaned file pins", cleaned);
+    }
+
+    Ok(cleaned)
 }
 
 /// Clean up expired pending messages
