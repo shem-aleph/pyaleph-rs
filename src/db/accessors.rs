@@ -18,20 +18,36 @@ impl MessageAccessor {
     
     pub async fn list(
         pool: &PgPool,
-        _addresses: Option<&[String]>,
-        _message_type: Option<&str>,
-        _channel: Option<&str>,
+        addresses: Option<&[String]>,
+        message_type: Option<&str>,
+        channel: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<MessageDb>, sqlx::Error> {
-        // TODO: Implement with proper filtering
-        sqlx::query_as::<_, MessageDb>(
-            "SELECT * FROM messages ORDER BY time DESC LIMIT $1 OFFSET $2"
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
+        let mut builder = crate::db::QueryBuilder::new("SELECT * FROM messages WHERE 1=1");
+
+        if let Some(addrs) = addresses {
+            if !addrs.is_empty() {
+                builder.and_in("sender", addrs);
+            }
+        }
+
+        if let Some(msg_type) = message_type {
+            builder.and_eq("message_type", msg_type.to_string());
+        }
+
+        if let Some(ch) = channel {
+            builder.and_eq("channel", ch.to_string());
+        }
+
+        builder.order_by("time", false);
+        builder.limit(limit);
+        builder.offset(offset);
+
+        let (query, args) = builder.build();
+        sqlx::query_as_with(&query, args)
+            .fetch_all(pool)
+            .await
     }
     
     pub async fn insert(pool: &PgPool, message: &MessageDb) -> Result<(), sqlx::Error> {
@@ -63,15 +79,21 @@ impl AggregateAccessor {
     pub async fn get(
         pool: &PgPool,
         address: &str,
-        _keys: Option<&[String]>,
+        keys: Option<&[String]>,
     ) -> Result<Vec<AggregateDb>, sqlx::Error> {
-        // TODO: Implement with key filtering
-        sqlx::query_as::<_, AggregateDb>(
-            "SELECT * FROM aggregates WHERE address = $1"
-        )
-        .bind(address)
-        .fetch_all(pool)
-        .await
+        let mut builder = crate::db::QueryBuilder::new("SELECT * FROM aggregates WHERE 1=1");
+        builder.and_eq("address", address.to_string());
+
+        if let Some(keys) = keys {
+            if !keys.is_empty() {
+                builder.and_in("key", keys);
+            }
+        }
+
+        let (query, args) = builder.build();
+        sqlx::query_as_with(&query, args)
+            .fetch_all(pool)
+            .await
     }
 
     /// Get a specific aggregate by owner address and key.
