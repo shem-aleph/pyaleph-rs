@@ -1657,7 +1657,8 @@ pub async fn estimate_cost(
 
 // ===== Additional Endpoints =====
 
-/// Get message content
+/// Get message content — returns inner content.content for POST messages only
+/// Reference: aleph/web/controllers/messages.py:view_message_content
 pub async fn get_message_content(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -1667,46 +1668,56 @@ pub async fn get_message_content(
             "error": "Database not available"
         })));
     }
-    
+
     let message = sqlx::query_as::<_, crate::db::models::MessageDb>(
         "SELECT * FROM messages WHERE item_hash = $1"
     )
     .bind(&hash)
     .fetch_optional(state.db())
     .await;
-    
+
     match message {
         Ok(Some(msg)) => {
-            match msg.item_content {
-                Some(content) => {
-                    // Try to parse as JSON and return
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(json) => (StatusCode::OK, Json(json)),
-                        Err(_) => (StatusCode::OK, Json(json!({ "content": content }))),
-                    }
-                }
+            // Only POST messages have content via this endpoint
+            if msg.message_type.to_uppercase() != "POST" {
+                return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+                    "error": format!("Invalid message hash type {} for hash {}", msg.message_type, hash)
+                })));
+            }
+
+            // Get the item_content JSON string (inline or from IPFS)
+            let content_str = match msg.item_content {
+                Some(content) => content,
                 None => {
                     // Content not inline, try to fetch from IPFS
                     match state.ipfs.get(&hash).await {
-                        Ok(bytes) => {
-                            match String::from_utf8(bytes) {
-                                Ok(content) => {
-                                    match serde_json::from_str::<serde_json::Value>(&content) {
-                                        Ok(json) => (StatusCode::OK, Json(json)),
-                                        Err(_) => (StatusCode::OK, Json(json!({ "content": content }))),
-                                    }
-                                }
-                                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
-                                    "error": "Content is not valid UTF-8"
-                                }))),
-                            }
-                        }
-                        Err(e) => (StatusCode::NOT_FOUND, Json(json!({
+                        Ok(bytes) => match String::from_utf8(bytes) {
+                            Ok(s) => s,
+                            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                                "error": "Content is not valid UTF-8"
+                            }))),
+                        },
+                        Err(e) => return (StatusCode::NOT_FOUND, Json(json!({
                             "error": "Content not found",
                             "message": e.to_string()
                         }))),
                     }
                 }
+            };
+
+            // Parse the item_content and extract the inner "content" field
+            match serde_json::from_str::<serde_json::Value>(&content_str) {
+                Ok(parsed) => {
+                    if let Some(inner_content) = parsed.get("content") {
+                        (StatusCode::OK, Json(inner_content.clone()))
+                    } else {
+                        // Fallback: return the full parsed content if no inner "content" field
+                        (StatusCode::OK, Json(parsed))
+                    }
+                }
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                    "error": "Failed to parse message content as JSON"
+                }))),
             }
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({
