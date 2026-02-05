@@ -245,6 +245,26 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
                 
+                // Start cleanup job (periodic maintenance)
+                {
+                    let pool_clone = pool.clone();
+                    let config_arc_cleanup = Arc::new(config.clone());
+                    tokio::spawn(async move {
+                        jobs::cleanup::run(pool_clone, config_arc_cleanup).await;
+                    });
+                }
+
+                // Start garbage collector
+                {
+                    let pool_clone = pool.clone();
+                    let ipfs_clone = ipfs.clone();
+                    let config_arc_gc = Arc::new(config.clone());
+                    let metrics = Arc::new(services::Metrics::new());
+                    tokio::spawn(async move {
+                        jobs::garbage_collector::run(pool_clone, ipfs_clone, config_arc_gc, metrics).await;
+                    });
+                }
+
                 info!("Starting API server on {}:{}", config.api.host, config.api.port);
                 web::start_server_with_db(&config, pool).await?;
             }
