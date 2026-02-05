@@ -2956,9 +2956,9 @@ pub async fn get_address_files(
             "error": "Database not available"
         })));
     }
-    
+
     let page = params.page.unwrap_or(1).max(1);
-    let per_page = params.pagination.unwrap_or(20).min(1000);
+    let per_page = params.pagination.unwrap_or(100).min(1000);
     let offset = ((page - 1) * per_page) as i64;
     let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
     
