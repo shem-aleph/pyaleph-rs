@@ -1,59 +1,95 @@
 //! Program message handler
 //!
 //! Programs are serverless functions that run on Aleph compute nodes.
+//! Reference: aleph/handlers/content/vm.py VmMessageHandler
 
 use async_trait::async_trait;
 use crate::types::{Message, MessageType, ProgramContent};
-use super::{HandlerContext, HandlerError, MessageHandler};
+use super::{HandlerContext, HandlerError, MessageHandler, vm_common};
 
 /// Handler for program messages
 pub struct ProgramHandler;
+
+/// Parse and return the ProgramContent from a message
+fn parse_content(message: &Message) -> Result<ProgramContent, HandlerError> {
+    let content_str = message.item_content.as_ref()
+        .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
+    serde_json::from_str(content_str)
+        .map_err(|e| HandlerError::InvalidContent(format!("Failed to parse program content: {}", e)))
+}
 
 #[async_trait]
 impl MessageHandler for ProgramHandler {
     fn message_type(&self) -> MessageType {
         MessageType::Program
     }
-    
-    async fn validate(&self, message: &Message, _ctx: &HandlerContext) -> Result<(), HandlerError> {
-        let content_str = message.item_content.as_ref()
-            .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
-        
-        let content: ProgramContent = serde_json::from_str(content_str)
-            .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
-        
-        // Validate resource requirements
+
+    async fn validate(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        let content = parse_content(message)?;
+
+        // Validate resources
         if content.resources.memory == 0 {
             return Err(HandlerError::InvalidContent("Memory must be > 0".to_string()));
         }
-
         if content.resources.vcpus == 0 {
             return Err(HandlerError::InvalidContent("vCPUs must be > 0".to_string()));
         }
-        
+
+        // Validate code and runtime refs
+        let (mut pin_refs, mut tag_refs) = vm_common::collect_volume_refs(&content.volumes);
+        if content.code.use_latest {
+            tag_refs.push(content.code.ref_.clone());
+        } else {
+            pin_refs.push(content.code.ref_.clone());
+        }
+        if content.runtime.use_latest {
+            tag_refs.push(content.runtime.ref_.clone());
+        } else {
+            pin_refs.push(content.runtime.ref_.clone());
+        }
+        vm_common::validate_volume_refs(&pin_refs, &tag_refs, ctx).await?;
+
+        // Validate amendment if replaces is set
+        if let Some(ref replaces) = content.replaces {
+            vm_common::validate_amendment(replaces, ctx, false).await?;
+        }
+
         Ok(())
     }
-    
-    async fn process(&self, message: &Message, _ctx: &HandlerContext) -> Result<(), HandlerError> {
-        let content_str = message.item_content.as_ref()
-            .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
-        
-        let content: ProgramContent = serde_json::from_str(content_str)
-            .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
-        
+
+    async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        let content = parse_content(message)?;
+
+        if let Some(ref db) = ctx.db {
+            // Store program in database
+            db.store_program(&message.item_hash, &content, &message.sender).await
+                .map_err(HandlerError::Database)?;
+
+            // Store volumes
+            if !content.volumes.is_empty() {
+                db.store_vm_volumes(&message.item_hash, &content.volumes).await
+                    .map_err(HandlerError::Database)?;
+            }
+
+            // Upsert vm_versions
+            let vm_hash = content.replaces.as_deref().unwrap_or(&message.item_hash);
+            db.upsert_vm_version(
+                vm_hash,
+                &content.address,
+                &message.item_hash,
+                content.time,
+            ).await.map_err(HandlerError::Database)?;
+        }
+
         tracing::info!(
-            "Processing program: address={}, memory={}MB, vcpus={}",
+            "Processed program: hash={} address={} memory={}MB vcpus={} runtime={}",
+            &message.item_hash[..std::cmp::min(16, message.item_hash.len())],
             content.address,
             content.resources.memory,
-            content.resources.vcpus
+            content.resources.vcpus,
+            &content.runtime.ref_[..std::cmp::min(16, content.runtime.ref_.len())],
         );
-        
-        // TODO: Verify code hash exists
-        // TODO: Verify runtime hash exists
-        // TODO: Calculate compute costs
-        // TODO: Store program in database
-        // TODO: Signal to compute nodes
-        
+
         Ok(())
     }
 }

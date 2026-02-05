@@ -1,66 +1,91 @@
 //! Instance message handler
 //!
 //! Instances are persistent VMs running on Aleph compute nodes.
+//! Reference: aleph/handlers/content/vm.py VmMessageHandler
 
 use async_trait::async_trait;
 use crate::types::{Message, MessageType, InstanceContent};
-use super::{HandlerContext, HandlerError, MessageHandler};
+use super::{HandlerContext, HandlerError, MessageHandler, vm_common};
 
 /// Handler for instance messages
 pub struct InstanceHandler;
+
+/// Parse and return the InstanceContent from a message
+fn parse_content(message: &Message) -> Result<InstanceContent, HandlerError> {
+    let content_str = message.item_content.as_ref()
+        .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
+    serde_json::from_str(content_str)
+        .map_err(|e| HandlerError::InvalidContent(format!("Failed to parse instance content: {}", e)))
+}
 
 #[async_trait]
 impl MessageHandler for InstanceHandler {
     fn message_type(&self) -> MessageType {
         MessageType::Instance
     }
-    
-    async fn validate(&self, message: &Message, _ctx: &HandlerContext) -> Result<(), HandlerError> {
-        let content_str = message.item_content.as_ref()
-            .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
-        
-        let content: InstanceContent = serde_json::from_str(content_str)
-            .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
-        
-        // Validate resource requirements
+
+    async fn validate(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        let content = parse_content(message)?;
+
+        // Validate resources
         if content.resources.memory == 0 {
             return Err(HandlerError::InvalidContent("Memory must be > 0".to_string()));
         }
-
         if content.resources.vcpus == 0 {
             return Err(HandlerError::InvalidContent("vCPUs must be > 0".to_string()));
         }
-        
-        // Validate payment for paid instances
-        if let Some(payment) = &content.payment {
-            // TODO: Verify payment based on type
-            tracing::debug!("Payment type: {:?}", payment.payment_type);
+
+        // Validate rootfs parent ref + volume refs
+        let (mut pin_refs, mut tag_refs) = vm_common::collect_volume_refs(&content.volumes);
+        if content.rootfs.parent.use_latest {
+            tag_refs.push(content.rootfs.parent.ref_.clone());
+        } else {
+            pin_refs.push(content.rootfs.parent.ref_.clone());
         }
-        
+        vm_common::validate_volume_refs(&pin_refs, &tag_refs, ctx).await?;
+
+        // Validate amendment if replaces is set
+        if let Some(ref replaces) = content.replaces {
+            vm_common::validate_amendment(replaces, ctx, true).await?;
+        }
+
         Ok(())
     }
-    
-    async fn process(&self, message: &Message, _ctx: &HandlerContext) -> Result<(), HandlerError> {
-        let content_str = message.item_content.as_ref()
-            .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
-        
-        let content: InstanceContent = serde_json::from_str(content_str)
-            .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
-        
+
+    async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        let content = parse_content(message)?;
+
+        if let Some(ref db) = ctx.db {
+            // Store instance in database
+            db.store_instance(&message.item_hash, &content, &message.sender).await
+                .map_err(HandlerError::Database)?;
+
+            // Store volumes
+            if !content.volumes.is_empty() {
+                db.store_vm_volumes(&message.item_hash, &content.volumes).await
+                    .map_err(HandlerError::Database)?;
+            }
+
+            // Upsert vm_versions
+            // For amendments, vm_hash is the original; for new VMs, it's the current hash
+            let vm_hash = content.replaces.as_deref().unwrap_or(&message.item_hash);
+            db.upsert_vm_version(
+                vm_hash,
+                &content.address,
+                &message.item_hash,
+                content.time,
+            ).await.map_err(HandlerError::Database)?;
+        }
+
         tracing::info!(
-            "Processing instance: address={}, memory={}MB, vcpus={}, authorized_keys={}",
+            "Processed instance: hash={} address={} memory={}MB vcpus={} payment={:?}",
+            &message.item_hash[..std::cmp::min(16, message.item_hash.len())],
             content.address,
             content.resources.memory,
             content.resources.vcpus,
-            content.authorized_keys.len()
+            content.payment.as_ref().map(|p| &p.payment_type),
         );
-        
-        // TODO: Verify rootfs hash exists
-        // TODO: Calculate compute costs
-        // TODO: Verify payment/balance
-        // TODO: Store instance in database
-        // TODO: Signal to compute nodes for scheduling
-        
+
         Ok(())
     }
 }

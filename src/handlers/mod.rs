@@ -8,6 +8,7 @@ pub mod instance;
 pub mod post;
 pub mod program;
 pub mod store;
+pub mod vm_common;
 
 use async_trait::async_trait;
 use std::sync::Arc;
