@@ -766,7 +766,61 @@ pub async fn post_message(
                     tracing::warn!("Failed to publish to P2P: {}", e);
                 }
             }
-            
+
+            // Sync mode: poll until message is processed or rejected (up to 30s timeout)
+            if payload.sync && state.has_db() {
+                let item_hash = msg.item_hash.clone();
+                let start = std::time::Instant::now();
+                let timeout = std::time::Duration::from_secs(30);
+
+                loop {
+                    if start.elapsed() > timeout {
+                        // Timeout - return pending status
+                        return (StatusCode::ACCEPTED, Json(json!({
+                            "publication_status": {"status": "success", "failed": []},
+                            "message_status": "pending"
+                        })));
+                    }
+
+                    // Check if processed
+                    let processed = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM messages WHERE item_hash = $1)"
+                    )
+                    .bind(&item_hash)
+                    .fetch_one(state.db())
+                    .await
+                    .unwrap_or(false);
+
+                    if processed {
+                        return (StatusCode::OK, Json(json!({
+                            "publication_status": {"status": "success", "failed": []},
+                            "message_status": "processed"
+                        })));
+                    }
+
+                    // Check if rejected
+                    let rejected = sqlx::query_as::<_, (i32, Option<String>)>(
+                        "SELECT error_code, error_message FROM rejected_messages WHERE item_hash = $1"
+                    )
+                    .bind(&item_hash)
+                    .fetch_optional(state.db())
+                    .await
+                    .ok()
+                    .flatten();
+
+                    if let Some((code, message)) = rejected {
+                        return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+                            "publication_status": {"status": "success", "failed": []},
+                            "message_status": "rejected",
+                            "error_code": code,
+                            "details": message,
+                        })));
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+
             (StatusCode::ACCEPTED, Json(json!({
                 "publication_status": {
                     "status": "success",
