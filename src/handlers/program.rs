@@ -23,11 +23,11 @@ impl MessageHandler for ProgramHandler {
             .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
         
         // Validate resource requirements
-        if content.memory == 0 {
+        if content.resources.memory == 0 {
             return Err(HandlerError::InvalidContent("Memory must be > 0".to_string()));
         }
-        
-        if content.vcpus == 0 {
+
+        if content.resources.vcpus == 0 {
             return Err(HandlerError::InvalidContent("vCPUs must be > 0".to_string()));
         }
         
@@ -44,8 +44,8 @@ impl MessageHandler for ProgramHandler {
         tracing::info!(
             "Processing program: address={}, memory={}MB, vcpus={}",
             content.address,
-            content.memory,
-            content.vcpus
+            content.resources.memory,
+            content.resources.vcpus
         );
         
         // TODO: Verify code hash exists

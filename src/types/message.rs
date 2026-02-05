@@ -191,58 +191,132 @@ pub struct ForgetContent {
     pub time: Timestamp,
 }
 
-/// Program (serverless function) content
+/// VM resource requirements
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmResources {
+    pub memory: u32,
+    pub vcpus: u32,
+    #[serde(default = "default_seconds")]
+    pub seconds: u32,
+}
+
+fn default_seconds() -> u32 { 30 }
+
+/// VM environment settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmEnvironment {
+    #[serde(default)]
+    pub reproducible: bool,
+    #[serde(default)]
+    pub internet: bool,
+    #[serde(default)]
+    pub aleph_api: bool,
+    #[serde(default)]
+    pub shared_cache: bool,
+    #[serde(default)]
+    pub hypervisor: Option<String>,
+}
+
+/// VM node/CPU requirements
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmRequirements {
+    #[serde(default)]
+    pub cpu: Option<CpuRequirements>,
+    #[serde(default)]
+    pub node: Option<NodeRequirements>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuRequirements {
+    pub architecture: Option<String>,
+    pub vendor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeRequirements {
+    pub node_hash: Option<String>,
+    pub address_regex: Option<String>,
+    pub owner: Option<String>,
+}
+
+fn default_true() -> bool { true }
+
+/// Program (serverless function) content — matches on-chain JSON format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramContent {
     pub address: Address,
-    /// Whether to allow amends
+    #[serde(default = "default_true")]
     pub allow_amend: bool,
-    /// Runtime to use
     pub runtime: RuntimeInfo,
-    /// Code reference
     pub code: CodeInfo,
-    /// Environment variables
+    pub resources: VmResources,
+    #[serde(default)]
+    pub environment: Option<VmEnvironment>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
     #[serde(default)]
     pub variables: Option<Value>,
-    /// Volumes to mount
     #[serde(default)]
     pub volumes: Vec<VolumeInfo>,
-    /// Memory in MiB
-    pub memory: u32,
-    /// vCPUs
-    pub vcpus: u32,
+    #[serde(default)]
+    pub payment: Option<PaymentInfo>,
+    #[serde(default)]
+    pub requirements: Option<VmRequirements>,
+    #[serde(default)]
+    pub replaces: Option<String>,
+    #[serde(default)]
+    pub data: Option<DataInfo>,
+    #[serde(default)]
+    pub export: Option<ExportInfo>,
     pub time: Timestamp,
 }
 
-/// Instance (VM) content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataInfo {
+    #[serde(rename = "ref")]
+    pub ref_: String,
+    pub use_latest: bool,
+    #[serde(default)]
+    pub mount: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportInfo {
+    pub encoding: Option<String>,
+}
+
+/// Instance (VM) content — matches on-chain JSON format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceContent {
     pub address: Address,
+    #[serde(default = "default_true")]
     pub allow_amend: bool,
-    /// Root filesystem
     pub rootfs: RootfsInfo,
-    /// Environment variables
+    pub resources: VmResources,
+    #[serde(default)]
+    pub environment: Option<VmEnvironment>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
     #[serde(default)]
     pub variables: Option<Value>,
-    /// Volumes to mount
     #[serde(default)]
     pub volumes: Vec<VolumeInfo>,
-    /// Memory in MiB
-    pub memory: u32,
-    /// vCPUs
-    pub vcpus: u32,
-    /// SSH keys for access
     #[serde(default)]
-    pub ssh_keys: Vec<String>,
-    /// Payment info
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorized_keys: Vec<String>,
+    #[serde(default)]
     pub payment: Option<PaymentInfo>,
+    #[serde(default)]
+    pub requirements: Option<VmRequirements>,
+    /// For amendments — references the original instance item_hash
+    #[serde(default)]
+    pub replaces: Option<String>,
     pub time: Timestamp,
 }
 
 /// Runtime information for programs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeInfo {
+    #[serde(rename = "ref")]
     pub ref_: String,
     pub use_latest: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,6 +328,7 @@ pub struct RuntimeInfo {
 pub struct CodeInfo {
     pub encoding: String,
     pub entrypoint: String,
+    #[serde(rename = "ref")]
     pub ref_: String,
     pub use_latest: bool,
 }
@@ -261,7 +336,10 @@ pub struct CodeInfo {
 /// Volume information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeInfo {
+    #[serde(default)]
     pub mount: String,
+    #[serde(default)]
+    pub comment: Option<String>,
     #[serde(flatten)]
     pub source: VolumeSource,
 }
@@ -272,7 +350,7 @@ pub struct VolumeInfo {
 pub enum VolumeSource {
     Ephemeral { ephemeral: bool, size_mib: u32 },
     Persistent { persistence: String, name: String, size_mib: u32 },
-    Immutable { ref_: String, use_latest: bool },
+    Immutable { #[serde(rename = "ref")] ref_: String, use_latest: bool },
 }
 
 /// Root filesystem information for instances
@@ -286,6 +364,7 @@ pub struct RootfsInfo {
 /// Root filesystem parent reference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootfsParent {
+    #[serde(rename = "ref")]
     pub ref_: String,
     pub use_latest: bool,
 }
@@ -307,4 +386,104 @@ pub enum PaymentType {
     Hold,
     Superfluid,
     Credit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rootfs_parent_deser() {
+        let json = r#"{"ref": "abc123", "use_latest": true}"#;
+        let parent: RootfsParent = serde_json::from_str(json).unwrap();
+        assert_eq!(parent.ref_, "abc123");
+        assert!(parent.use_latest);
+    }
+
+    #[test]
+    fn test_instance_content_real_data() {
+        let json = r#"{
+            "address": "0xf594985F5C271005a4dA1c4F107AB42a7166aEF7",
+            "allow_amend": false,
+            "authorized_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"],
+            "environment": {"reproducible": false, "internet": true, "aleph_api": true, "shared_cache": false, "hypervisor": "qemu"},
+            "metadata": {"name": "SV-1"},
+            "payment": {"chain": "ETH", "type": "hold"},
+            "resources": {"memory": 8192, "seconds": 30, "vcpus": 4},
+            "rootfs": {"parent": {"ref": "b6ff5c3a8205d1ca4c7c3369300eeafff498b558f71b851aa2114afd0a532717", "use_latest": true}, "persistence": "host", "size_mib": 81920},
+            "time": 1770280454.236,
+            "volumes": []
+        }"#;
+        let content: InstanceContent = serde_json::from_str(json).unwrap();
+        assert_eq!(content.resources.memory, 8192);
+        assert_eq!(content.resources.vcpus, 4);
+        assert_eq!(content.authorized_keys.len(), 1);
+        assert_eq!(content.rootfs.parent.ref_, "b6ff5c3a8205d1ca4c7c3369300eeafff498b558f71b851aa2114afd0a532717");
+        assert!(!content.allow_amend);
+    }
+
+    #[test]
+    fn test_instance_content_with_requirements() {
+        let json = r#"{
+            "address": "0x25020a5F992a70E61686D21A473f464d86BaF9BD",
+            "allow_amend": false,
+            "authorized_keys": [],
+            "environment": {"aleph_api": true, "hypervisor": "qemu", "internet": true, "reproducible": false, "shared_cache": false},
+            "payment": {"chain": "ETH", "type": "credit"},
+            "requirements": {"node": {"node_hash": "d02cc93b18e23f62556cc574fa3696b350cae36e760c43186cbb866c6677c628"}},
+            "resources": {"memory": 2048, "seconds": 30, "vcpus": 2},
+            "rootfs": {"parent": {"ref": "abc123", "use_latest": true}, "persistence": "host", "size_mib": 20480},
+            "time": 1770217145.481,
+            "volumes": []
+        }"#;
+        let content: InstanceContent = serde_json::from_str(json).unwrap();
+        assert!(content.requirements.is_some());
+        assert_eq!(content.requirements.unwrap().node.unwrap().node_hash.unwrap(), "d02cc93b18e23f62556cc574fa3696b350cae36e760c43186cbb866c6677c628");
+    }
+
+    #[test]
+    fn test_instance_content_with_volumes() {
+        let json = r#"{
+            "address": "0x1234567890abcdef",
+            "allow_amend": false,
+            "authorized_keys": [],
+            "resources": {"memory": 2048, "seconds": 30, "vcpus": 1},
+            "rootfs": {"parent": {"ref": "abc", "use_latest": true}, "persistence": "host", "size_mib": 20480},
+            "time": 1768920524.78,
+            "volumes": [{"comment": "persist one", "mount": "/mnt/persist-one", "name": "persist-one", "persistence": "host", "size_mib": 30000}]
+        }"#;
+        let content: InstanceContent = serde_json::from_str(json).unwrap();
+        assert_eq!(content.volumes.len(), 1);
+        assert_eq!(content.volumes[0].mount, "/mnt/persist-one");
+    }
+
+    #[test]
+    fn test_instance_content_minimal() {
+        // Test that defaults work (allow_amend defaults to true, etc.)
+        let json = r#"{
+            "address": "0xABC",
+            "rootfs": {"parent": {"ref": "hash123", "use_latest": true}, "persistence": "host", "size_mib": 20480},
+            "resources": {"memory": 2048, "vcpus": 1},
+            "time": 1234567890.0
+        }"#;
+        let content: InstanceContent = serde_json::from_str(json).unwrap();
+        assert!(content.allow_amend); // default true
+        assert_eq!(content.resources.seconds, 30); // default 30
+        assert!(content.authorized_keys.is_empty());
+        assert!(content.volumes.is_empty());
+    }
+
+    #[test]
+    fn test_runtime_info_deser() {
+        let json = r#"{"ref": "runtime_hash_123", "use_latest": true, "comment": "ASGI"}"#;
+        let info: RuntimeInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.ref_, "runtime_hash_123");
+    }
+
+    #[test]
+    fn test_code_info_deser() {
+        let json = r#"{"encoding": "zip", "entrypoint": "main:app", "ref": "code_hash_456", "use_latest": true}"#;
+        let info: CodeInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.ref_, "code_hash_456");
+    }
 }

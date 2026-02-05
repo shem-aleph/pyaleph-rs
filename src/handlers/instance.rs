@@ -23,11 +23,11 @@ impl MessageHandler for InstanceHandler {
             .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
         
         // Validate resource requirements
-        if content.memory == 0 {
+        if content.resources.memory == 0 {
             return Err(HandlerError::InvalidContent("Memory must be > 0".to_string()));
         }
-        
-        if content.vcpus == 0 {
+
+        if content.resources.vcpus == 0 {
             return Err(HandlerError::InvalidContent("vCPUs must be > 0".to_string()));
         }
         
@@ -48,11 +48,11 @@ impl MessageHandler for InstanceHandler {
             .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
         
         tracing::info!(
-            "Processing instance: address={}, memory={}MB, vcpus={}, ssh_keys={}",
+            "Processing instance: address={}, memory={}MB, vcpus={}, authorized_keys={}",
             content.address,
-            content.memory,
-            content.vcpus,
-            content.ssh_keys.len()
+            content.resources.memory,
+            content.resources.vcpus,
+            content.authorized_keys.len()
         );
         
         // TODO: Verify rootfs hash exists

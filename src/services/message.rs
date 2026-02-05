@@ -279,12 +279,12 @@ impl MessageService {
         .bind(&content.address)
         .bind(&content.code.ref_)
         .bind(&content.runtime.ref_)
-        .bind(content.memory as i32)
-        .bind(content.vcpus as i32)
+        .bind(content.resources.memory as i32)
+        .bind(content.resources.vcpus as i32)
         .bind(content.allow_amend)
         .execute(pool)
         .await?;
-        
+
         debug!("Stored program: {}", message.item_hash);
         Ok(())
     }
@@ -308,8 +308,8 @@ impl MessageService {
         .bind(&message.item_hash)
         .bind(&content.address)
         .bind(&content.rootfs.parent.ref_)
-        .bind(content.memory as i32)
-        .bind(content.vcpus as i32)
+        .bind(content.resources.memory as i32)
+        .bind(content.resources.vcpus as i32)
         .bind(&payment_type)
         .bind(&payment_chain)
         .bind(content.allow_amend)
