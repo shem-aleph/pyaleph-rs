@@ -193,7 +193,9 @@ pub async fn list_messages(
 ) -> impl IntoResponse {
     let page = params.page.unwrap_or(1);
     // Support both 'limit' and 'pagination' parameters (limit takes precedence)
-    let per_page = params.limit.or(params.pagination).unwrap_or(20).min(1000); // Max 1000 per page
+    // pagination=0 means "no limit" (pyaleph compat) — cap at 10,000
+    let raw_pagination = params.limit.or(params.pagination).unwrap_or(20);
+    let per_page = if raw_pagination == 0 { 10_000 } else { raw_pagination.min(1000) };
     let offset = ((page - 1) * per_page) as i64;
     
     // Merge msgType and msgTypes (msgType takes precedence)
@@ -1019,12 +1021,14 @@ pub async fn get_posts(
 ) -> impl IntoResponse {
     let page = params.page.unwrap_or(1);
     // Support both limit and pagination parameters (limit takes precedence)
-    let per_page = params.limit.or(params.pagination).unwrap_or(20).min(1000);
+    // pagination=0 means "no limit" (pyaleph compat) — cap at 10,000
+    let raw_pagination = params.limit.or(params.pagination).unwrap_or(20);
+    let per_page = if raw_pagination == 0 { 10_000 } else { raw_pagination.min(1000) };
     let offset = ((page - 1) * per_page) as i64;
-    
+
     // Merge order and sort_order (order takes precedence)
     let order_param = params.order.or(params.sort_order);
-    
+
     if !state.has_db() {
         return Json(json!({
             "posts": [],
