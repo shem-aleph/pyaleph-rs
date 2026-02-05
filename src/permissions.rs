@@ -274,7 +274,7 @@ fn extract_content_fields(message: &Message) -> (Option<String>, Option<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::{Database, FilePinRecord, HandlerContext, PostRecord};
+    use crate::handlers::{Database, FilePinRecord, HandlerContext, PostRecord, VmRecord, AccountCostRecord};
     use crate::types::{Chain, ItemType, Message, MessageType, ProcessingStatus};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -469,6 +469,18 @@ mod tests {
         ) -> Result<Option<rust_decimal::Decimal>, String> {
             Ok(None)
         }
+
+        async fn store_instance(&self, _item_hash: &str, _content: &crate::types::InstanceContent, _sender: &str) -> Result<(), String> { Ok(()) }
+        async fn store_program(&self, _item_hash: &str, _content: &crate::types::ProgramContent, _sender: &str) -> Result<(), String> { Ok(()) }
+        async fn get_instance(&self, _item_hash: &str) -> Result<Option<VmRecord>, String> { Ok(None) }
+        async fn get_program(&self, _item_hash: &str) -> Result<Option<VmRecord>, String> { Ok(None) }
+        async fn store_vm_volumes(&self, _vm_hash: &str, _volumes: &[crate::types::VolumeInfo]) -> Result<(), String> { Ok(()) }
+        async fn upsert_vm_version(&self, _vm_hash: &str, _owner: &str, _current_version: &str, _time: f64) -> Result<(), String> { Ok(()) }
+        async fn is_vm_amend_allowed(&self, _vm_hash: &str) -> Result<Option<bool>, String> { Ok(Some(true)) }
+        async fn delete_vm_updates(&self, _vm_hash: &str) -> Result<Vec<String>, String> { Ok(vec![]) }
+        async fn check_volume_refs_exist(&self, _refs: &[String], _use_latest_refs: &[String]) -> Result<(Vec<String>, Vec<String>), String> { Ok((vec![], vec![])) }
+        async fn get_total_cost_for_address(&self, _address: &str, _payment_type: &str) -> Result<rust_decimal::Decimal, String> { Ok(rust_decimal::Decimal::ZERO) }
+        async fn store_account_costs(&self, _costs: &[AccountCostRecord]) -> Result<(), String> { Ok(()) }
     }
 
     /// Helper to create a test message

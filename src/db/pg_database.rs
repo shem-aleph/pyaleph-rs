@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use crate::handlers::{Database, PostRecord, FilePinRecord};
-use crate::types::{Message, MessageType, ItemType, Chain, ProcessingStatus};
+use crate::handlers::{Database, PostRecord, FilePinRecord, VmRecord, AccountCostRecord};
+use crate::types::{Message, MessageType, ItemType, Chain, ProcessingStatus, InstanceContent, ProgramContent, VolumeInfo, VolumeSource};
 
 /// Parse a MessageType from its DB string representation (UPPERCASE)
 fn parse_message_type(s: &str) -> Result<MessageType, String> {
@@ -395,5 +395,334 @@ impl Database for PgDatabase {
         .await
         .map_err(|e| e.to_string())?;
         Ok(row.map(|(b,)| b))
+    }
+
+    async fn store_instance(&self, item_hash: &str, content: &InstanceContent, sender: &str) -> Result<(), String> {
+        let env = content.environment.as_ref();
+        let req = content.requirements.as_ref();
+        let payment_type = content.payment.as_ref().map(|p| format!("{:?}", p.payment_type).to_lowercase());
+        let payment_chain = content.payment.as_ref().map(|p| p.chain.to_string());
+        let payment_receiver = content.payment.as_ref().and_then(|p| p.receiver.clone());
+        let authorized_keys_json = serde_json::to_value(&content.authorized_keys).ok();
+        let metadata = content.metadata.clone();
+        let variables = content.variables.clone();
+
+        sqlx::query(
+            "INSERT INTO instances (item_hash, owner, rootfs_ref, memory, vcpus, payment_type, payment_chain, \
+             allow_amend, replaces, environment_reproducible, environment_internet, environment_aleph_api, \
+             environment_shared_cache, environment_hypervisor, resources_seconds, metadata, variables, \
+             authorized_keys, rootfs_use_latest, rootfs_persistence, rootfs_size_mib, \
+             cpu_architecture, cpu_vendor, node_owner, node_address_regex, node_hash, \
+             payment_receiver, time, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
+                     $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, NOW()) \
+             ON CONFLICT (item_hash) DO NOTHING"
+        )
+        .bind(item_hash)
+        .bind(sender)
+        .bind(&content.rootfs.parent.ref_)
+        .bind(content.resources.memory as i32)
+        .bind(content.resources.vcpus as i32)
+        .bind(&payment_type)
+        .bind(&payment_chain)
+        .bind(content.allow_amend)
+        .bind(&content.replaces)
+        .bind(env.map(|e| e.reproducible).unwrap_or(false))
+        .bind(env.map(|e| e.internet).unwrap_or(true))
+        .bind(env.map(|e| e.aleph_api).unwrap_or(true))
+        .bind(env.map(|e| e.shared_cache).unwrap_or(false))
+        .bind(env.and_then(|e| e.hypervisor.clone()))
+        .bind(content.resources.seconds as i32)
+        .bind(&metadata)
+        .bind(&variables)
+        .bind(&authorized_keys_json)
+        .bind(content.rootfs.parent.use_latest)
+        .bind(&content.rootfs.persistence)
+        .bind(content.rootfs.size_mib as i32)
+        .bind(req.and_then(|r| r.cpu.as_ref()).and_then(|c| c.architecture.clone()))
+        .bind(req.and_then(|r| r.cpu.as_ref()).and_then(|c| c.vendor.clone()))
+        .bind(req.and_then(|r| r.node.as_ref()).and_then(|n| n.owner.clone()))
+        .bind(req.and_then(|r| r.node.as_ref()).and_then(|n| n.address_regex.clone()))
+        .bind(req.and_then(|r| r.node.as_ref()).and_then(|n| n.node_hash.clone()))
+        .bind(&payment_receiver)
+        .bind(content.time)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn store_program(&self, item_hash: &str, content: &ProgramContent, sender: &str) -> Result<(), String> {
+        let env = content.environment.as_ref();
+        let req = content.requirements.as_ref();
+        let payment_type = content.payment.as_ref().map(|p| format!("{:?}", p.payment_type).to_lowercase());
+        let payment_chain = content.payment.as_ref().map(|p| p.chain.to_string());
+        let metadata = content.metadata.clone();
+        let variables = content.variables.clone();
+
+        sqlx::query(
+            "INSERT INTO programs (item_hash, owner, code_ref, runtime_ref, memory, vcpus, allow_amend, \
+             replaces, environment_reproducible, environment_internet, environment_aleph_api, \
+             environment_shared_cache, environment_hypervisor, resources_seconds, metadata, variables, \
+             payment_type, payment_chain, cpu_architecture, node_hash, time, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, NOW()) \
+             ON CONFLICT (item_hash) DO NOTHING"
+        )
+        .bind(item_hash)
+        .bind(sender)
+        .bind(&content.code.ref_)
+        .bind(&content.runtime.ref_)
+        .bind(content.resources.memory as i32)
+        .bind(content.resources.vcpus as i32)
+        .bind(content.allow_amend)
+        .bind(&content.replaces)
+        .bind(env.map(|e| e.reproducible).unwrap_or(false))
+        .bind(env.map(|e| e.internet).unwrap_or(true))
+        .bind(env.map(|e| e.aleph_api).unwrap_or(true))
+        .bind(env.map(|e| e.shared_cache).unwrap_or(false))
+        .bind(env.and_then(|e| e.hypervisor.clone()))
+        .bind(content.resources.seconds as i32)
+        .bind(&metadata)
+        .bind(&variables)
+        .bind(&payment_type)
+        .bind(&payment_chain)
+        .bind(req.and_then(|r| r.cpu.as_ref()).and_then(|c| c.architecture.clone()))
+        .bind(req.and_then(|r| r.node.as_ref()).and_then(|n| n.node_hash.clone()))
+        .bind(content.time)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_instance(&self, item_hash: &str) -> Result<Option<VmRecord>, String> {
+        let row: Option<(String, String, bool, Option<String>, Option<f64>)> = sqlx::query_as(
+            "SELECT item_hash, owner, allow_amend, replaces, time FROM instances WHERE item_hash = $1"
+        )
+        .bind(item_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(row.map(|(item_hash, owner, allow_amend, replaces, time)| VmRecord {
+            item_hash, owner, allow_amend, replaces, time: time.unwrap_or(0.0),
+        }))
+    }
+
+    async fn get_program(&self, item_hash: &str) -> Result<Option<VmRecord>, String> {
+        let row: Option<(String, String, bool, Option<String>, Option<f64>)> = sqlx::query_as(
+            "SELECT item_hash, owner, allow_amend, replaces, time FROM programs WHERE item_hash = $1"
+        )
+        .bind(item_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(row.map(|(item_hash, owner, allow_amend, replaces, time)| VmRecord {
+            item_hash, owner, allow_amend, replaces, time: time.unwrap_or(0.0),
+        }))
+    }
+
+    async fn store_vm_volumes(&self, vm_hash: &str, volumes: &[VolumeInfo]) -> Result<(), String> {
+        for vol in volumes {
+            let (volume_type, size_mib, ref_hash, use_latest, persistence, name) = match &vol.source {
+                VolumeSource::Immutable { ref_, use_latest } => {
+                    ("immutable", None, Some(ref_.clone()), Some(*use_latest), None, None)
+                }
+                VolumeSource::Persistent { persistence, name, size_mib } => {
+                    ("persistent", Some(*size_mib as i32), None, None, Some(persistence.clone()), Some(name.clone()))
+                }
+                VolumeSource::Ephemeral { size_mib, .. } => {
+                    ("ephemeral", Some(*size_mib as i32), None, None, None, None)
+                }
+            };
+            sqlx::query(
+                "INSERT INTO vm_machine_volumes (vm_hash, volume_type, comment, mount, size_mib, ref_hash, use_latest, persistence, name) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            )
+            .bind(vm_hash)
+            .bind(volume_type)
+            .bind(&vol.comment)
+            .bind(&vol.mount)
+            .bind(size_mib)
+            .bind(&ref_hash)
+            .bind(use_latest)
+            .bind(&persistence)
+            .bind(&name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_vm_version(&self, vm_hash: &str, owner: &str, current_version: &str, time: f64) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO vm_versions (vm_hash, original_hash, version, owner, current_version, last_updated, created_at) \
+             VALUES ($1, $1, 1, $2, $3, to_timestamp($4), NOW()) \
+             ON CONFLICT (vm_hash) DO UPDATE SET current_version = $3, last_updated = to_timestamp($4) \
+             WHERE vm_versions.last_updated < to_timestamp($4) OR vm_versions.last_updated IS NULL"
+        )
+        .bind(vm_hash)
+        .bind(owner)
+        .bind(current_version)
+        .bind(time)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn is_vm_amend_allowed(&self, vm_hash: &str) -> Result<Option<bool>, String> {
+        // Check the current version of the VM to see if it allows amendments
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT current_version FROM vm_versions WHERE vm_hash = $1"
+        )
+        .bind(vm_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        match row {
+            Some((Some(current_version),)) => {
+                // Check allow_amend on the current version in instances or programs
+                let instance_row: Option<(bool,)> = sqlx::query_as(
+                    "SELECT allow_amend FROM instances WHERE item_hash = $1"
+                )
+                .bind(&current_version)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                if let Some((allow,)) = instance_row {
+                    return Ok(Some(allow));
+                }
+
+                let program_row: Option<(bool,)> = sqlx::query_as(
+                    "SELECT allow_amend FROM programs WHERE item_hash = $1"
+                )
+                .bind(&current_version)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                Ok(program_row.map(|(allow,)| allow))
+            }
+            Some((None,)) => {
+                // No current_version set, fall back to checking the vm_hash directly
+                let row: Option<(bool,)> = sqlx::query_as(
+                    "SELECT allow_amend FROM instances WHERE item_hash = $1 \
+                     UNION SELECT allow_amend FROM programs WHERE item_hash = $1 LIMIT 1"
+                )
+                .bind(vm_hash)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(row.map(|(a,)| a))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn delete_vm_updates(&self, vm_hash: &str) -> Result<Vec<String>, String> {
+        // Delete all amendment instances/programs that reference this VM and return their hashes
+        let inst_rows: Vec<(String,)> = sqlx::query_as(
+            "DELETE FROM instances WHERE replaces = $1 RETURNING item_hash"
+        )
+        .bind(vm_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let prog_rows: Vec<(String,)> = sqlx::query_as(
+            "DELETE FROM programs WHERE replaces = $1 RETURNING item_hash"
+        )
+        .bind(vm_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(inst_rows.into_iter().chain(prog_rows).map(|(h,)| h).collect())
+    }
+
+    async fn check_volume_refs_exist(&self, refs: &[String], use_latest_refs: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
+        let mut missing_pins = Vec::new();
+        let mut missing_tags = Vec::new();
+
+        if !refs.is_empty() {
+            // Check file_pins for non-use_latest refs
+            let existing: Vec<(String,)> = sqlx::query_as(
+                "SELECT DISTINCT item_hash FROM file_pins WHERE item_hash = ANY($1)"
+            )
+            .bind(refs)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let existing_set: std::collections::HashSet<_> = existing.into_iter().map(|(h,)| h).collect();
+            for r in refs {
+                if !existing_set.contains(r) {
+                    missing_pins.push(r.clone());
+                }
+            }
+        }
+
+        if !use_latest_refs.is_empty() {
+            // Check file_tags for use_latest refs
+            let existing: Vec<(String,)> = sqlx::query_as(
+                "SELECT DISTINCT item_hash FROM file_tags WHERE item_hash = ANY($1)"
+            )
+            .bind(use_latest_refs)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let existing_set: std::collections::HashSet<_> = existing.into_iter().map(|(h,)| h).collect();
+            for r in use_latest_refs {
+                if !existing_set.contains(r) {
+                    missing_tags.push(r.clone());
+                }
+            }
+        }
+
+        Ok((missing_pins, missing_tags))
+    }
+
+    async fn get_total_cost_for_address(&self, address: &str, payment_type: &str) -> Result<rust_decimal::Decimal, String> {
+        let column = match payment_type {
+            "hold" | "holding" => "cost_hold",
+            "credit" => "cost_credit",
+            _ => "cost_hold",
+        };
+        let query = format!("SELECT COALESCE(SUM({}), 0) FROM account_costs WHERE owner = $1 AND payment_type = $2", column);
+        let row: (rust_decimal::Decimal,) = sqlx::query_as(&query)
+            .bind(address)
+            .bind(payment_type)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.0)
+    }
+
+    async fn store_account_costs(&self, costs: &[AccountCostRecord]) -> Result<(), String> {
+        for cost in costs {
+            sqlx::query(
+                "INSERT INTO account_costs (owner, item_hash, cost_type, name, ref_hash, payment_type, cost_hold, cost_stream, cost_credit) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 ON CONFLICT (owner, item_hash, cost_type, name) DO UPDATE SET \
+                 ref_hash = $5, payment_type = $6, cost_hold = $7, cost_stream = $8, cost_credit = $9"
+            )
+            .bind(&cost.owner)
+            .bind(&cost.item_hash)
+            .bind(&cost.cost_type)
+            .bind(&cost.name)
+            .bind(&cost.ref_hash)
+            .bind(&cost.payment_type)
+            .bind(cost.cost_hold)
+            .bind(cost.cost_stream)
+            .bind(cost.cost_credit)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }

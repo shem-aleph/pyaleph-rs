@@ -171,6 +171,19 @@ pub trait Database: Send + Sync {
     // Balance operations
     async fn get_balance(&self, address: &str, chain: &str) -> Result<Option<rust_decimal::Decimal>, String>;
     async fn get_credit_balance(&self, address: &str) -> Result<Option<rust_decimal::Decimal>, String>;
+
+    // VM operations (instances + programs)
+    async fn store_instance(&self, item_hash: &str, content: &crate::types::InstanceContent, sender: &str) -> Result<(), String>;
+    async fn store_program(&self, item_hash: &str, content: &crate::types::ProgramContent, sender: &str) -> Result<(), String>;
+    async fn get_instance(&self, item_hash: &str) -> Result<Option<VmRecord>, String>;
+    async fn get_program(&self, item_hash: &str) -> Result<Option<VmRecord>, String>;
+    async fn store_vm_volumes(&self, vm_hash: &str, volumes: &[crate::types::VolumeInfo]) -> Result<(), String>;
+    async fn upsert_vm_version(&self, vm_hash: &str, owner: &str, current_version: &str, time: f64) -> Result<(), String>;
+    async fn is_vm_amend_allowed(&self, vm_hash: &str) -> Result<Option<bool>, String>;
+    async fn delete_vm_updates(&self, vm_hash: &str) -> Result<Vec<String>, String>;
+    async fn check_volume_refs_exist(&self, refs: &[String], use_latest_refs: &[String]) -> Result<(Vec<String>, Vec<String>), String>;
+    async fn get_total_cost_for_address(&self, address: &str, payment_type: &str) -> Result<rust_decimal::Decimal, String>;
+    async fn store_account_costs(&self, costs: &[AccountCostRecord]) -> Result<(), String>;
 }
 
 /// Post record for database storage
@@ -195,6 +208,30 @@ pub struct FilePinRecord {
     pub size: u64,
     pub content_type: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// VM record for database lookups (instances and programs)
+#[derive(Debug, Clone)]
+pub struct VmRecord {
+    pub item_hash: String,
+    pub owner: String,
+    pub allow_amend: bool,
+    pub replaces: Option<String>,
+    pub time: f64,
+}
+
+/// Per-item cost breakdown record
+#[derive(Debug, Clone)]
+pub struct AccountCostRecord {
+    pub owner: String,
+    pub item_hash: String,
+    pub cost_type: String,
+    pub name: String,
+    pub ref_hash: Option<String>,
+    pub payment_type: String,
+    pub cost_hold: rust_decimal::Decimal,
+    pub cost_stream: rust_decimal::Decimal,
+    pub cost_credit: rust_decimal::Decimal,
 }
 
 /// IPFS service trait
