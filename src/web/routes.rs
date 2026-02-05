@@ -44,6 +44,7 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/messages/:hash", get(handlers::get_message))
         .route("/messages/:hash/status", get(handlers::get_message_status))
         .route("/messages/:hash/content", get(handlers::get_message_content))
+        .route("/messages/:hash/consumed_credits", get(handlers::get_consumed_credits))
         
         // Aggregates - use single route, handler can strip .json if needed
         // Aggregates - list endpoint (must come before :address route to match correctly)
@@ -128,6 +129,10 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         // Chain sync status - matches pyaleph /sync/status
         .route("/sync/status", get(handlers::get_sync_status))
         
+        // CCN/CRN node metrics
+        .route("/core/:node_id/metrics", get(handlers::get_ccn_metrics))
+        .route("/compute/:node_id/metrics", get(handlers::get_crn_metrics))
+
         // WebSocket - real-time message streaming
         .route("/ws", get(websocket::ws_handler))
 }
@@ -168,6 +173,9 @@ fn legacy_routes() -> Router<Arc<AppState>> {
         .route("/pending", get(handlers::get_pending_messages))
         .route("/sync/status", get(handlers::get_sync_status))
         
+        // Metrics JSON
+        .route("/metrics.json", get(handlers::metrics_json))
+
         // Health check
         .route("/", get(handlers::health_check))
         .route("/health", get(handlers::health_check))

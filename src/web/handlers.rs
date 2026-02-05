@@ -4580,3 +4580,425 @@ pub async fn get_programs_on_message(
 
     Json(json!(results))
 }
+
+// ===== Consumed Credits Endpoint =====
+
+/// Get consumed credits for a resource (message)
+/// Reference: aleph/web/controllers/accounts.py:get_resource_consumed_credits_controller
+///
+/// Returns the total credits consumed by a specific resource (item_hash).
+/// Aggregates credit_history entries where payment_method = 'credit_expense' and origin = item_hash.
+pub async fn get_consumed_credits(
+    State(state): State<Arc<AppState>>,
+    Path(item_hash): Path<String>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return Json(json!({
+            "item_hash": item_hash,
+            "consumed_credits": 0
+        }));
+    }
+
+    // Check if credit_history table exists
+    let table_exists: (bool,) = match sqlx::query_as(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'credit_history')"
+    )
+    .fetch_one(state.db())
+    .await {
+        Ok(r) => r,
+        Err(_) => {
+            return Json(json!({
+                "item_hash": item_hash,
+                "consumed_credits": 0
+            }));
+        }
+    };
+
+    if !table_exists.0 {
+        return Json(json!({
+            "item_hash": item_hash,
+            "consumed_credits": 0
+        }));
+    }
+
+    // Sum absolute amounts where payment_method = 'credit_expense' and origin = item_hash
+    let consumed: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(ABS(amount)), 0)::bigint FROM credit_history \
+         WHERE payment_method = 'credit_expense' AND origin = $1"
+    )
+    .bind(&item_hash)
+    .fetch_one(state.db())
+    .await
+    .unwrap_or(0);
+
+    Json(json!({
+        "item_hash": item_hash,
+        "consumed_credits": consumed
+    }))
+}
+
+// ===== Metrics JSON Endpoint =====
+
+/// JSON metrics endpoint - matches pyaleph /metrics.json
+/// Reference: aleph/web/controllers/main.py:metrics_json
+///
+/// Returns pyaleph-compatible metrics in JSON format with message counts,
+/// file counts, pending message counts, and build info.
+pub async fn metrics_json(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+
+    if !state.has_db() {
+        return Json(json!({
+            "pyaleph_build_info": {"version": version},
+            "pyaleph_status_peers_total": 0,
+            "pyaleph_status_sync_messages_total": 0,
+            "pyaleph_status_sync_permanent_files_total": 0,
+            "pyaleph_status_sync_pending_messages_total": 0,
+            "pyaleph_status_sync_pending_txs_total": 0
+        }));
+    }
+
+    // Use estimated counts from pg_class for performance (avoids full table scans)
+    let messages_count: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'messages'"
+    )
+    .fetch_optional(state.db())
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
+    let files_count: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'file_pins'"
+    )
+    .fetch_optional(state.db())
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
+    let pending_count: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'pending_messages'"
+    )
+    .fetch_optional(state.db())
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
+    let pending_txs_count: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'pending_txs'"
+    )
+    .fetch_optional(state.db())
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
+    let peers_count: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'peers'"
+    )
+    .fetch_optional(state.db())
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
+    Json(json!({
+        "pyaleph_build_info": {"version": version},
+        "pyaleph_status_peers_total": peers_count,
+        "pyaleph_status_sync_messages_total": messages_count,
+        "pyaleph_status_sync_permanent_files_total": files_count,
+        "pyaleph_status_sync_pending_messages_total": pending_count,
+        "pyaleph_status_sync_pending_txs_total": pending_txs_count
+    }))
+}
+
+// ===== CCN/CRN Node Metrics Endpoints =====
+
+/// Query parameters for CCN/CRN node metrics
+/// Reference: aleph/web/controllers/main.py:MetricsQueryParams
+#[derive(Debug, Deserialize)]
+pub struct NodeMetricsQuery {
+    pub start_date: Option<f64>,
+    pub end_date: Option<f64>,
+    pub sort: Option<String>,
+}
+
+/// Get CCN (Core Channel Node) metrics for a specific node
+/// Reference: aleph/web/controllers/main.py:ccn_metric
+///
+/// Queries the ccn_metric_view (database view over scoring messages)
+/// for a specific node_id. Returns time-series metrics data.
+pub async fn get_ccn_metrics(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    Query(params): Query<NodeMetricsQuery>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+
+    // Check if ccn_metric_view exists
+    let view_exists: (bool,) = match sqlx::query_as(
+        "SELECT EXISTS (SELECT FROM information_schema.views WHERE table_name = 'ccn_metric_view')"
+    )
+    .fetch_one(state.db())
+    .await {
+        Ok(r) => r,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, Json(json!({
+                "error": "CCN metrics view not available"
+            })));
+        }
+    };
+
+    if !view_exists.0 {
+        return (StatusCode::NOT_FOUND, Json(json!({
+            "error": "CCN metrics view not available"
+        })));
+    }
+
+    // Default to last 2 weeks if no dates provided
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let two_weeks = 60.0 * 60.0 * 24.0 * 14.0;
+
+    let start = params.start_date.unwrap_or_else(|| {
+        params.end_date.map(|e| e - two_weeks).unwrap_or(now - two_weeks)
+    });
+
+    let sort_order = match params.sort.as_deref() {
+        Some("1") | Some("asc") | Some("ASC") => "ASC",
+        _ => "DESC",
+    };
+
+    let query = if params.end_date.is_some() {
+        format!(
+            "SELECT item_hash, measured_at, base_latency, base_latency_ipv4, \
+             metrics_latency, aggregate_latency, file_download_latency, \
+             pending_messages, eth_height_remaining \
+             FROM ccn_metric_view \
+             WHERE node_id = $1 AND measured_at >= $2 AND measured_at <= $3 \
+             ORDER BY measured_at {}",
+            sort_order
+        )
+    } else {
+        format!(
+            "SELECT item_hash, measured_at, base_latency, base_latency_ipv4, \
+             metrics_latency, aggregate_latency, file_download_latency, \
+             pending_messages, eth_height_remaining \
+             FROM ccn_metric_view \
+             WHERE node_id = $1 AND measured_at >= $2 \
+             ORDER BY measured_at {}",
+            sort_order
+        )
+    };
+
+    let rows: Vec<(
+        Option<String>,   // item_hash
+        Option<f64>,      // measured_at
+        Option<f64>,      // base_latency
+        Option<f64>,      // base_latency_ipv4
+        Option<f64>,      // metrics_latency
+        Option<f64>,      // aggregate_latency
+        Option<f64>,      // file_download_latency
+        Option<i32>,      // pending_messages
+        Option<i32>,      // eth_height_remaining
+    )> = if let Some(end) = params.end_date {
+        sqlx::query_as(&query)
+            .bind(&node_id)
+            .bind(start)
+            .bind(end)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default()
+    } else {
+        sqlx::query_as(&query)
+            .bind(&node_id)
+            .bind(start)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default()
+    };
+
+    if rows.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(json!({
+            "error": "Not found"
+        })));
+    }
+
+    // Transpose rows into column arrays (matching pyaleph format)
+    let mut item_hashes: Vec<serde_json::Value> = Vec::new();
+    let mut measured_ats: Vec<serde_json::Value> = Vec::new();
+    let mut base_latencies: Vec<serde_json::Value> = Vec::new();
+    let mut base_latencies_ipv4: Vec<serde_json::Value> = Vec::new();
+    let mut metrics_latencies: Vec<serde_json::Value> = Vec::new();
+    let mut aggregate_latencies: Vec<serde_json::Value> = Vec::new();
+    let mut file_download_latencies: Vec<serde_json::Value> = Vec::new();
+    let mut pending_messages_list: Vec<serde_json::Value> = Vec::new();
+    let mut eth_height_remaining_list: Vec<serde_json::Value> = Vec::new();
+
+    for row in &rows {
+        item_hashes.push(json!(row.0));
+        measured_ats.push(json!(row.1));
+        base_latencies.push(json!(row.2));
+        base_latencies_ipv4.push(json!(row.3));
+        metrics_latencies.push(json!(row.4));
+        aggregate_latencies.push(json!(row.5));
+        file_download_latencies.push(json!(row.6));
+        pending_messages_list.push(json!(row.7));
+        eth_height_remaining_list.push(json!(row.8));
+    }
+
+    (StatusCode::OK, Json(json!({
+        "metrics": {
+            "item_hash": item_hashes,
+            "measured_at": measured_ats,
+            "base_latency": base_latencies,
+            "base_latency_ipv4": base_latencies_ipv4,
+            "metrics_latency": metrics_latencies,
+            "aggregate_latency": aggregate_latencies,
+            "file_download_latency": file_download_latencies,
+            "pending_messages": pending_messages_list,
+            "eth_height_remaining": eth_height_remaining_list,
+        }
+    })))
+}
+
+/// Get CRN (Compute Resource Node) metrics for a specific node
+/// Reference: aleph/web/controllers/main.py:crn_metric
+///
+/// Queries the crn_metric_view (database view over scoring messages)
+/// for a specific node_id. Returns time-series metrics data.
+pub async fn get_crn_metrics(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    Query(params): Query<NodeMetricsQuery>,
+) -> impl IntoResponse {
+    if !state.has_db() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": "Database not available"
+        })));
+    }
+
+    // Check if crn_metric_view exists
+    let view_exists: (bool,) = match sqlx::query_as(
+        "SELECT EXISTS (SELECT FROM information_schema.views WHERE table_name = 'crn_metric_view')"
+    )
+    .fetch_one(state.db())
+    .await {
+        Ok(r) => r,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, Json(json!({
+                "error": "CRN metrics view not available"
+            })));
+        }
+    };
+
+    if !view_exists.0 {
+        return (StatusCode::NOT_FOUND, Json(json!({
+            "error": "CRN metrics view not available"
+        })));
+    }
+
+    // Default to last 2 weeks if no dates provided
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let two_weeks = 60.0 * 60.0 * 24.0 * 14.0;
+
+    let start = params.start_date.unwrap_or_else(|| {
+        params.end_date.map(|e| e - two_weeks).unwrap_or(now - two_weeks)
+    });
+
+    let sort_order = match params.sort.as_deref() {
+        Some("1") | Some("asc") | Some("ASC") => "ASC",
+        _ => "DESC",
+    };
+
+    let query = if params.end_date.is_some() {
+        format!(
+            "SELECT item_hash, measured_at, base_latency, base_latency_ipv4, \
+             full_check_latency, diagnostic_vm_latency \
+             FROM crn_metric_view \
+             WHERE node_id = $1 AND measured_at >= $2 AND measured_at <= $3 \
+             ORDER BY measured_at {}",
+            sort_order
+        )
+    } else {
+        format!(
+            "SELECT item_hash, measured_at, base_latency, base_latency_ipv4, \
+             full_check_latency, diagnostic_vm_latency \
+             FROM crn_metric_view \
+             WHERE node_id = $1 AND measured_at >= $2 \
+             ORDER BY measured_at {}",
+            sort_order
+        )
+    };
+
+    let rows: Vec<(
+        Option<String>,   // item_hash
+        Option<f64>,      // measured_at
+        Option<f64>,      // base_latency
+        Option<f64>,      // base_latency_ipv4
+        Option<f64>,      // full_check_latency
+        Option<f64>,      // diagnostic_vm_latency
+    )> = if let Some(end) = params.end_date {
+        sqlx::query_as(&query)
+            .bind(&node_id)
+            .bind(start)
+            .bind(end)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default()
+    } else {
+        sqlx::query_as(&query)
+            .bind(&node_id)
+            .bind(start)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default()
+    };
+
+    if rows.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(json!({
+            "error": "Not found"
+        })));
+    }
+
+    // Transpose rows into column arrays (matching pyaleph format)
+    let mut item_hashes: Vec<serde_json::Value> = Vec::new();
+    let mut measured_ats: Vec<serde_json::Value> = Vec::new();
+    let mut base_latencies: Vec<serde_json::Value> = Vec::new();
+    let mut base_latencies_ipv4: Vec<serde_json::Value> = Vec::new();
+    let mut full_check_latencies: Vec<serde_json::Value> = Vec::new();
+    let mut diagnostic_vm_latencies: Vec<serde_json::Value> = Vec::new();
+
+    for row in &rows {
+        item_hashes.push(json!(row.0));
+        measured_ats.push(json!(row.1));
+        base_latencies.push(json!(row.2));
+        base_latencies_ipv4.push(json!(row.3));
+        full_check_latencies.push(json!(row.4));
+        diagnostic_vm_latencies.push(json!(row.5));
+    }
+
+    (StatusCode::OK, Json(json!({
+        "metrics": {
+            "item_hash": item_hashes,
+            "measured_at": measured_ats,
+            "base_latency": base_latencies,
+            "base_latency_ipv4": base_latencies_ipv4,
+            "full_check_latency": full_check_latencies,
+            "diagnostic_vm_latency": diagnostic_vm_latencies,
+        }
+    })))
+}
