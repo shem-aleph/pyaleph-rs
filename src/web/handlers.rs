@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -1446,38 +1447,52 @@ pub async fn get_credit_balances(
     }))
 }
 
-/// Get storage info
+/// Get storage content as base64 — matches pyaleph format
+/// Reference: aleph/web/controllers/storage.py:get_hash
 pub async fn get_storage(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    // Try to get from local storage first
+    // Determine engine from hash format (IPFS CID vs storage/inline hash)
+    let engine = if hash.starts_with("Qm") && (44..=46).contains(&hash.len()) {
+        "ipfs"
+    } else if hash.starts_with("bafy") && hash.len() == 59 {
+        "ipfs"
+    } else {
+        "storage"
+    };
+
+    // Try to get content from local storage first
     if let Some(ref storage) = state.storage {
-        if storage.exists(&hash).await {
-            let size = storage.get_size(&hash).await.unwrap_or(0);
+        if let Ok(bytes) = storage.get(&hash).await {
+            let content = base64::engine::general_purpose::STANDARD.encode(&bytes);
             return (StatusCode::OK, Json(json!({
-                "status": "available",
+                "status": "success",
                 "hash": hash,
-                "size": size,
+                "engine": engine,
+                "content": content,
             })));
         }
     }
-    
-    // Check if it exists on IPFS
-    if state.ipfs.exists(&hash).await {
-        let size = state.ipfs.get_size(&hash).await.unwrap_or(0);
-        return (StatusCode::OK, Json(json!({
-            "status": "available",
-            "hash": hash,
-            "size": size,
-            "location": "ipfs",
-        })));
+
+    // Try to get content from IPFS
+    match state.ipfs.get(&hash).await {
+        Ok(bytes) => {
+            let content = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            (StatusCode::OK, Json(json!({
+                "status": "success",
+                "hash": hash,
+                "engine": engine,
+                "content": content,
+            })))
+        }
+        Err(_) => {
+            (StatusCode::NOT_FOUND, Json(json!({
+                "status": "not_found",
+                "hash": hash,
+            })))
+        }
     }
-    
-    (StatusCode::NOT_FOUND, Json(json!({
-        "status": "not_found",
-        "hash": hash,
-    })))
 }
 
 /// Get programs for an address
