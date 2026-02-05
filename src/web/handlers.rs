@@ -3962,40 +3962,36 @@ pub async fn monitor_html() -> impl axum::response::IntoResponse {
 
 /// GET /api/v0/storage/count/{hash} - Get count of nodes storing a file
 /// Reference: aleph/web/controllers/storage.py:get_file_pins_count
-/// 
-/// Returns the number of nodes that have pinned/stored a file.
-/// Since we're a single node, we return 1 if we have the file, 0 otherwise.
+///
+/// Returns the number of nodes that have pinned/stored a file as a plain JSON integer.
 pub async fn get_storage_count(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    // Check if we have the file locally
     let mut count = 0i64;
-    
-    // Check in file_pins table
+
+    // Query count from file_pins table
     if state.has_db() {
-        let exists: (bool,) = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM file_pins WHERE item_hash = $1)"
+        let result: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM file_pins WHERE item_hash = $1"
         )
         .bind(&hash)
         .fetch_one(state.db())
         .await
-        .unwrap_or((false,));
-        
-        if exists.0 {
-            count = 1;
-        }
+        .unwrap_or((0,));
+
+        count = result.0;
     }
-    
+
     // Also check IPFS if not found in DB
     if count == 0 {
         if state.ipfs.exists(&hash).await {
             count = 1;
         }
     }
-    
-    // Return just the count number to match pyaleph format
-    count.to_string()
+
+    // Return plain JSON integer to match pyaleph format
+    Json(json!(count))
 }
 
 /// GET /api/v0/addresses/{address}/post_types - Get post types used by an address
