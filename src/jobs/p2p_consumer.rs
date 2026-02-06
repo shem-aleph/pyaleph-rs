@@ -72,18 +72,28 @@ impl P2pConsumerContext {
             std::num::NonZeroUsize::new(DEDUP_CACHE_SIZE).unwrap(),
         ));
 
-        // Try connecting to Redis
+        // Try connecting to Redis (with timeout — ConnectionManager::new can hang
+        // indefinitely if Redis is unreachable because it retries internally)
         let redis_client = match redis::Client::open(config.redis.url.as_str()) {
-            Ok(client) => match redis::aio::ConnectionManager::new(client).await {
-                Ok(mgr) => {
-                    info!("Connected to Redis at {}", config.redis.url);
-                    Some(mgr)
+            Ok(client) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    redis::aio::ConnectionManager::new(client),
+                ).await {
+                    Ok(Ok(mgr)) => {
+                        info!("Connected to Redis at {}", config.redis.url);
+                        Some(mgr)
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Failed to connect to Redis: {} — alive messages won't update api_servers", e);
+                        None
+                    }
+                    Err(_) => {
+                        warn!("Redis connection timed out ({}) — alive messages won't update api_servers", config.redis.url);
+                        None
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to connect to Redis: {} — alive messages won't update api_servers", e);
-                    None
-                }
-            },
+            }
             Err(e) => {
                 warn!("Invalid Redis URL '{}': {}", config.redis.url, e);
                 None
@@ -471,20 +481,12 @@ async fn insert_pending_message(pool: &PgPool, message: &Message) -> Result<(), 
     let now = chrono::Utc::now().timestamp() as f64;
 
     sqlx::query(
-        r#"
-        INSERT INTO pending_messages (item_hash, message_data, reception_time, fetched, check_message, retries, next_attempt, trusted_source)
-        VALUES ($1, $2, to_timestamp($3), $4, $5, $6, to_timestamp($7), $8)
-        ON CONFLICT (item_hash) DO NOTHING
-        "#,
+        "INSERT INTO pending_messages (item_hash, message, reception_time, retries, next_attempt) \
+         VALUES ($1, $2, $3, 0, $3) ON CONFLICT (item_hash) DO NOTHING",
     )
     .bind(&message.item_hash)
     .bind(&message_json)
     .bind(now)
-    .bind(message.item_type == crate::types::ItemType::Inline) // inline = already fetched
-    .bind(true) // check_message
-    .bind(0i32) // retries
-    .bind(now) // next_attempt = now (process immediately)
-    .bind(false) // not trusted (came from p2p)
     .execute(pool)
     .await?;
 
