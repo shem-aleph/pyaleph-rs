@@ -11,8 +11,9 @@
 
 use async_trait::async_trait;
 
-use crate::types::{Message, MessageType, ForgetContent, ErrorCode};
+use crate::types::{Message, MessageType, ForgetContent, StoreContent};
 use super::{HandlerContext, HandlerError, MessageHandler};
+use super::store::make_file_tag;
 
 /// Handler for forget messages
 pub struct ForgetHandler;
@@ -51,6 +52,68 @@ impl ForgetHandler {
         Ok(None)
     }
     
+    /// Handle forgetting a STORE message with grace period logic.
+    ///
+    /// Instead of immediately unpinning from IPFS, we:
+    /// 1. Delete the message-type pin for this file
+    /// 2. Refresh the file tag to point to the next newest pin
+    /// 3. If no active pins remain, insert a grace period pin (24h TTL)
+    ///    so the garbage collector can clean up later
+    async fn process_store_forget(
+        &self,
+        hash: &str,
+        address: &str,
+        target_message: &Option<Message>,
+        db: &dyn super::Database,
+    ) -> Result<(), HandlerError> {
+        // Parse the STORE content to get the file hash and ref for tag computation
+        let (file_hash, ref_) = if let Some(msg) = target_message {
+            if let Some(ref content_str) = msg.item_content {
+                if let Ok(store_content) = serde_json::from_str::<StoreContent>(content_str) {
+                    (store_content.item_hash.clone(), store_content.ref_.clone())
+                } else {
+                    (hash.to_string(), None)
+                }
+            } else {
+                (hash.to_string(), None)
+            }
+        } else {
+            (hash.to_string(), None)
+        };
+
+        // Delete the message-type pin for this forgotten message
+        db.delete_file_pin_by_message(hash).await
+            .map_err(|e| HandlerError::Database(e))?;
+
+        // Refresh the file tag to point to the next newest pin (or delete if none remain)
+        let tag = make_file_tag(address, ref_.as_deref(), &file_hash);
+        db.refresh_file_tag(&tag, address).await
+            .map_err(|e| HandlerError::Database(e))?;
+
+        // Check if any active (non-grace-period) pins remain for this file
+        let active_pins = db.count_active_pins(&file_hash).await
+            .map_err(|e| HandlerError::Database(e))?;
+
+        if active_pins == 0 {
+            // No active pins — schedule for garbage collection with 24h grace period
+            let delete_by = chrono::Utc::now() + chrono::Duration::hours(24);
+            db.insert_grace_period_pin(&file_hash, address, delete_by).await
+                .map_err(|e| HandlerError::Database(e))?;
+
+            tracing::info!(
+                "File {} has no active pins, grace period until {}",
+                file_hash, delete_by
+            );
+        } else {
+            tracing::debug!(
+                "File {} still has {} active pin(s), no grace period needed",
+                file_hash, active_pins
+            );
+        }
+
+        Ok(())
+    }
+
     /// Check ownership of content
     async fn check_ownership(
         &self,
@@ -163,25 +226,26 @@ impl MessageHandler for ForgetHandler {
     async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
         let content_str = message.item_content.as_deref()
             .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
-        
+
         let content: ForgetContent = serde_json::from_str(content_str)
             .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
-        
+
         tracing::info!(
             "Processing forget: address={}, hashes={}, reason={:?}",
             content.address,
             content.hashes.len(),
             content.reason
         );
-        
+
         for hash in &content.hashes {
             tracing::debug!("Forgetting hash: {}", hash);
 
             if let Some(ref db) = ctx.db {
                 // Look up the message to get its type for derived table cleanup
-                let message_type = db.get_message(hash).await
-                    .map_err(|e| HandlerError::Database(e))?
-                    .map(|m| m.message_type.to_string());
+                let target_message = db.get_message(hash).await
+                    .map_err(|e| HandlerError::Database(e))?;
+                let message_type = target_message.as_ref().map(|m| m.message_type.clone());
+                let message_type_str = message_type.as_ref().map(|t| t.to_string());
 
                 // Mark as forgotten (insert into forgotten_messages)
                 db.mark_forgotten(
@@ -190,12 +254,24 @@ impl MessageHandler for ForgetHandler {
                     content.reason.as_deref(),
                 ).await.map_err(|e| HandlerError::Database(e))?;
 
-                // Remove file pin if it exists
-                db.remove_file_pin(hash, &content.address).await
-                    .map_err(|e| HandlerError::Database(e))?;
+                // Handle STORE messages with grace period logic
+                if message_type == Some(MessageType::Store) {
+                    self.process_store_forget(hash, &content.address, &target_message, db.as_ref()).await?;
+                } else {
+                    // Non-STORE: remove file pin immediately
+                    db.remove_file_pin(hash, &content.address).await
+                        .map_err(|e| HandlerError::Database(e))?;
+
+                    // Unpin from IPFS immediately for non-STORE messages
+                    if let Some(ref ipfs) = ctx.ipfs {
+                        if let Err(e) = ipfs.unpin(hash).await {
+                            tracing::warn!("Failed to unpin {} from IPFS: {}", hash, e);
+                        }
+                    }
+                }
 
                 // Delete from derived tables based on message type
-                if let Some(ref msg_type) = message_type {
+                if let Some(ref msg_type) = message_type_str {
                     db.delete_derived_data(hash, msg_type).await
                         .map_err(|e| HandlerError::Database(e))?;
                 }
@@ -204,23 +280,15 @@ impl MessageHandler for ForgetHandler {
                 db.delete_message(hash).await
                     .map_err(|e| HandlerError::Database(e))?;
             }
-
-            // Unpin from IPFS
-            if let Some(ref ipfs) = ctx.ipfs {
-                if let Err(e) = ipfs.unpin(hash).await {
-                    // Log but don't fail - the content might not be pinned locally
-                    tracing::warn!("Failed to unpin {} from IPFS: {}", hash, e);
-                }
-            }
         }
-        
+
         // Update message status to show it's been processed
         if let Some(ref db) = ctx.db {
             db.update_message_status(&message.item_hash, &crate::types::ProcessingStatus::processed())
                 .await
                 .map_err(|e| HandlerError::Database(e))?;
         }
-        
+
         Ok(())
     }
 }

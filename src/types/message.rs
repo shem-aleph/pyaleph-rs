@@ -178,6 +178,10 @@ pub struct StoreContent {
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub ref_: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<PaymentInfo>,
     pub time: Timestamp,
 }
 

@@ -81,6 +81,15 @@ fn validate_store(content: &Value, errors: &mut Vec<SchemaError>) {
     require_string(content, "address", errors);
     require_string(content, "item_hash", errors);
     require_string(content, "item_type", errors);
+    // "ref" is optional but must be a string if present
+    if let Some(v) = content.get("ref") {
+        if !v.is_null() && !v.is_string() {
+            errors.push(SchemaError::InvalidType {
+                field: "ref".to_string(),
+                expected: "string".to_string(),
+            });
+        }
+    }
 }
 
 fn validate_program(content: &Value, errors: &mut Vec<SchemaError>) {

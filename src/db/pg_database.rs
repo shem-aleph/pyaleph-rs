@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use crate::handlers::{Database, PostRecord, FilePinRecord, VmRecord, AccountCostRecord};
+use crate::handlers::{Database, PostRecord, FilePinRecord, VmRecord, AccountCostRecord, FileRecord, FileType, FileTagRecord, PinType};
 use crate::types::{Message, MessageType, ItemType, Chain, ProcessingStatus, InstanceContent, ProgramContent, VolumeInfo, VolumeSource};
 
 /// Parse a MessageType from its DB string representation (UPPERCASE)
@@ -222,9 +222,11 @@ impl Database for PgDatabase {
     }
 
     async fn get_file_pin(&self, item_hash: &str) -> Result<Option<FilePinRecord>, String> {
-        let row: Option<(String, String, i64, Option<String>, chrono::DateTime<chrono::Utc>)> =
+        let row: Option<(String, String, i64, Option<String>, String, Option<String>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, chrono::DateTime<chrono::Utc>)> =
             sqlx::query_as(
-                "SELECT item_hash, owner, size, content_type, created_at FROM file_pins WHERE item_hash = $1"
+                "SELECT item_hash, owner, size, content_type, \
+                 COALESCE(pin_type, 'message'), ref_, delete_by, message_hash, created_at \
+                 FROM file_pins WHERE item_hash = $1"
             )
             .bind(item_hash)
             .fetch_optional(&self.pool)
@@ -232,12 +234,16 @@ impl Database for PgDatabase {
             .map_err(|e| e.to_string())?;
 
         match row {
-            Some((item_hash, owner, size, content_type, created_at)) => {
+            Some((item_hash, owner, size, content_type, pin_type, ref_, delete_by, message_hash, created_at)) => {
                 Ok(Some(FilePinRecord {
                     item_hash,
                     owner,
                     size: size as u64,
                     content_type,
+                    pin_type: PinType::from_str(&pin_type),
+                    ref_,
+                    delete_by,
+                    message_hash,
                     created_at,
                 }))
             }
@@ -247,13 +253,17 @@ impl Database for PgDatabase {
 
     async fn store_file_pin(&self, pin: &FilePinRecord) -> Result<(), String> {
         sqlx::query(
-            "INSERT INTO file_pins (item_hash, owner, size, content_type, created_at) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (item_hash) DO NOTHING"
+            "INSERT INTO file_pins (item_hash, owner, size, content_type, pin_type, ref_, delete_by, message_hash, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (item_hash, owner) DO NOTHING"
         )
         .bind(&pin.item_hash)
         .bind(&pin.owner)
         .bind(pin.size as i64)
         .bind(&pin.content_type)
+        .bind(pin.pin_type.as_str())
+        .bind(&pin.ref_)
+        .bind(pin.delete_by)
+        .bind(&pin.message_hash)
         .bind(pin.created_at)
         .execute(&self.pool)
         .await
@@ -277,6 +287,271 @@ impl Database for PgDatabase {
             .execute(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    // -- Files table --
+
+    async fn upsert_file(&self, hash: &str, size: u64, file_type: &FileType) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO files (hash, size, file_type, created_at) \
+             VALUES ($1, $2, $3, NOW()) \
+             ON CONFLICT (hash) DO UPDATE SET size = EXCLUDED.size, file_type = EXCLUDED.file_type"
+        )
+        .bind(hash)
+        .bind(size as i64)
+        .bind(file_type.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_file(&self, hash: &str) -> Result<Option<FileRecord>, String> {
+        let row: Option<(String, i64, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT hash, size, file_type, created_at FROM files WHERE hash = $1"
+        )
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(row.map(|(hash, size, file_type, created_at)| FileRecord {
+            hash,
+            size: size as u64,
+            file_type: FileType::from_str(&file_type),
+            created_at,
+        }))
+    }
+
+    // -- Typed file pins --
+
+    async fn insert_file_pin_typed(&self, pin: &FilePinRecord) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO file_pins (item_hash, owner, size, content_type, pin_type, ref_, delete_by, message_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT ON CONSTRAINT idx_file_pins_unique_typed DO UPDATE SET \
+               size = EXCLUDED.size, \
+               content_type = COALESCE(EXCLUDED.content_type, file_pins.content_type), \
+               ref_ = EXCLUDED.ref_, \
+               delete_by = EXCLUDED.delete_by, \
+               message_hash = EXCLUDED.message_hash"
+        )
+        .bind(&pin.item_hash)
+        .bind(&pin.owner)
+        .bind(pin.size as i64)
+        .bind(&pin.content_type)
+        .bind(pin.pin_type.as_str())
+        .bind(&pin.ref_)
+        .bind(pin.delete_by)
+        .bind(&pin.message_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_pins_for_file(&self, file_hash: &str) -> Result<Vec<FilePinRecord>, String> {
+        let rows: Vec<(String, String, i64, Option<String>, String, Option<String>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, chrono::DateTime<chrono::Utc>)> =
+            sqlx::query_as(
+                "SELECT item_hash, owner, size, content_type, \
+                 COALESCE(pin_type, 'message'), ref_, delete_by, message_hash, created_at \
+                 FROM file_pins WHERE item_hash = $1"
+            )
+            .bind(file_hash)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(rows.into_iter().map(|(item_hash, owner, size, content_type, pin_type, ref_, delete_by, message_hash, created_at)| {
+            FilePinRecord {
+                item_hash,
+                owner,
+                size: size as u64,
+                content_type,
+                pin_type: PinType::from_str(&pin_type),
+                ref_,
+                delete_by,
+                message_hash,
+                created_at,
+            }
+        }).collect())
+    }
+
+    async fn get_message_file_pin(&self, message_hash: &str) -> Result<Option<FilePinRecord>, String> {
+        let row: Option<(String, String, i64, Option<String>, String, Option<String>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, chrono::DateTime<chrono::Utc>)> =
+            sqlx::query_as(
+                "SELECT item_hash, owner, size, content_type, \
+                 COALESCE(pin_type, 'message'), ref_, delete_by, message_hash, created_at \
+                 FROM file_pins WHERE message_hash = $1"
+            )
+            .bind(message_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(row.map(|(item_hash, owner, size, content_type, pin_type, ref_, delete_by, message_hash, created_at)| {
+            FilePinRecord {
+                item_hash,
+                owner,
+                size: size as u64,
+                content_type,
+                pin_type: PinType::from_str(&pin_type),
+                ref_,
+                delete_by,
+                message_hash,
+                created_at,
+            }
+        }))
+    }
+
+    async fn delete_file_pin_by_message(&self, message_hash: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM file_pins WHERE message_hash = $1")
+            .bind(message_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn count_active_pins(&self, file_hash: &str) -> Result<i64, String> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM file_pins WHERE item_hash = $1 AND pin_type != 'grace_period'"
+        )
+        .bind(file_hash)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(row.0)
+    }
+
+    async fn insert_grace_period_pin(&self, file_hash: &str, owner: &str, delete_by: chrono::DateTime<chrono::Utc>) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO file_pins (item_hash, owner, size, pin_type, delete_by) \
+             VALUES ($1, $2, 0, 'grace_period', $3) \
+             ON CONFLICT ON CONSTRAINT idx_file_pins_unique_typed DO UPDATE SET delete_by = $3"
+        )
+        .bind(file_hash)
+        .bind(owner)
+        .bind(delete_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_expired_grace_pins(&self, limit: i64) -> Result<Vec<FilePinRecord>, String> {
+        let rows: Vec<(String, String, i64, Option<String>, String, Option<String>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, chrono::DateTime<chrono::Utc>)> =
+            sqlx::query_as(
+                "SELECT item_hash, owner, size, content_type, \
+                 pin_type, ref_, delete_by, message_hash, created_at \
+                 FROM file_pins WHERE pin_type = 'grace_period' AND delete_by < NOW() \
+                 LIMIT $1"
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(rows.into_iter().map(|(item_hash, owner, size, content_type, pin_type, ref_, delete_by, message_hash, created_at)| {
+            FilePinRecord {
+                item_hash,
+                owner,
+                size: size as u64,
+                content_type,
+                pin_type: PinType::from_str(&pin_type),
+                ref_,
+                delete_by,
+                message_hash,
+                created_at,
+            }
+        }).collect())
+    }
+
+    async fn delete_grace_period_pin(&self, item_hash: &str, owner: &str) -> Result<(), String> {
+        sqlx::query(
+            "DELETE FROM file_pins WHERE item_hash = $1 AND owner = $2 AND pin_type = 'grace_period'"
+        )
+        .bind(item_hash)
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    // -- File tags v2 --
+
+    async fn upsert_file_tag(&self, tag: &FileTagRecord) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO file_tags_v2 (tag, owner, file_hash, last_updated) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (tag) DO UPDATE SET \
+               file_hash = EXCLUDED.file_hash, \
+               last_updated = EXCLUDED.last_updated"
+        )
+        .bind(&tag.tag)
+        .bind(&tag.owner)
+        .bind(&tag.file_hash)
+        .bind(tag.last_updated)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_file_tag(&self, tag: &str) -> Result<Option<FileTagRecord>, String> {
+        let row: Option<(String, String, String, f64)> = sqlx::query_as(
+            "SELECT tag, owner, file_hash, last_updated FROM file_tags_v2 WHERE tag = $1"
+        )
+        .bind(tag)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(row.map(|(tag, owner, file_hash, last_updated)| FileTagRecord {
+            tag,
+            owner,
+            file_hash,
+            last_updated,
+        }))
+    }
+
+    async fn refresh_file_tag(&self, tag: &str, owner: &str) -> Result<(), String> {
+        // Find the newest remaining message-type pin for this owner and update the tag
+        // If no pins remain, delete the tag
+        let row: Option<(String, f64)> = sqlx::query_as(
+            "SELECT fp.item_hash, m.time \
+             FROM file_pins fp \
+             JOIN messages m ON m.item_hash = fp.message_hash \
+             WHERE fp.owner = $1 AND fp.pin_type = 'message' \
+             ORDER BY m.time DESC LIMIT 1"
+        )
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        match row {
+            Some((file_hash, time)) => {
+                sqlx::query(
+                    "UPDATE file_tags_v2 SET file_hash = $1, last_updated = $2 WHERE tag = $3"
+                )
+                .bind(&file_hash)
+                .bind(time)
+                .bind(tag)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+            None => {
+                sqlx::query("DELETE FROM file_tags_v2 WHERE tag = $1")
+                    .bind(tag)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
     }
 

@@ -22,6 +22,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Error> {
     create_credit_balances_table(pool).await?;
     create_file_pins_table(pool).await?;
     create_file_tags_table(pool).await?;
+    create_files_table(pool).await?;
+    alter_file_pins_v2(pool).await?;
+    create_file_tags_v2_table(pool).await?;
     create_programs_table(pool).await?;
     create_instances_table(pool).await?;
     create_vm_versions_table(pool).await?;
@@ -397,6 +400,109 @@ async fn create_pending_txs_table(pool: &PgPool) -> Result<(), Error> {
     "#)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Create files table — tracks known file metadata
+async fn create_files_table(pool: &PgPool) -> Result<(), Error> {
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS files (
+            hash VARCHAR(128) PRIMARY KEY,
+            size BIGINT NOT NULL DEFAULT 0,
+            file_type VARCHAR(20) NOT NULL DEFAULT 'file',
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    "#)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Add new columns to file_pins for typed pins, refs, and grace periods
+async fn alter_file_pins_v2(pool: &PgPool) -> Result<(), Error> {
+    // Add pin_type column
+    sqlx::query(
+        "ALTER TABLE file_pins ADD COLUMN IF NOT EXISTS pin_type VARCHAR(20) NOT NULL DEFAULT 'message'"
+    )
+    .execute(pool)
+    .await?;
+
+    // Add ref_ column for file versioning
+    sqlx::query(
+        "ALTER TABLE file_pins ADD COLUMN IF NOT EXISTS ref_ TEXT"
+    )
+    .execute(pool)
+    .await?;
+
+    // Add delete_by for grace period expiry
+    sqlx::query(
+        "ALTER TABLE file_pins ADD COLUMN IF NOT EXISTS delete_by TIMESTAMPTZ"
+    )
+    .execute(pool)
+    .await?;
+
+    // Add message_hash — the message that created this pin
+    sqlx::query(
+        "ALTER TABLE file_pins ADD COLUMN IF NOT EXISTS message_hash VARCHAR(128)"
+    )
+    .execute(pool)
+    .await?;
+
+    // Indexes for new columns
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_file_pins_pin_type ON file_pins(pin_type)"
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_file_pins_delete_by ON file_pins(delete_by) WHERE delete_by IS NOT NULL"
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_file_pins_message_hash ON file_pins(message_hash)"
+    )
+    .execute(pool)
+    .await?;
+
+    // Unique index for typed pins — allows multiple pin types per file+owner
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_file_pins_unique_typed ON file_pins(item_hash, owner, pin_type)"
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Create file_tags_v2 table — matches Python pyaleph file tag schema
+async fn create_file_tags_v2_table(pool: &PgPool) -> Result<(), Error> {
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS file_tags_v2 (
+            tag VARCHAR(512) PRIMARY KEY,
+            owner VARCHAR(256) NOT NULL,
+            file_hash VARCHAR(128) NOT NULL,
+            last_updated DOUBLE PRECISION NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    "#)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_file_tags_v2_owner ON file_tags_v2(owner)"
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_file_tags_v2_file_hash ON file_tags_v2(file_hash)"
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

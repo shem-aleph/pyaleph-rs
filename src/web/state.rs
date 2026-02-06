@@ -8,7 +8,9 @@ use crate::config::Config;
 use crate::services::{CryptoService, StorageService, CostService, Metrics};
 use crate::services::ipfs::IpfsService;
 use crate::services::redis::RedisService;
+use crate::services::sharding::ShardingService;
 use crate::network::rabbitmq::RabbitMQService;
+use crate::storage::tiered::TieredStorage;
 use crate::web::websocket::WsState;
 
 /// Shared application state
@@ -25,6 +27,10 @@ pub struct AppState {
     pub rabbitmq: Option<Arc<RwLock<RabbitMQService>>>,
     pub ws_state: Arc<WsState>,
     pub p2p_connected: bool,
+    /// Content sharding service (None if sharding is disabled)
+    pub sharding: Option<Arc<ShardingService>>,
+    /// Tiered content storage (None if not configured)
+    pub tiered_storage: Option<Arc<TieredStorage>>,
 }
 
 impl Clone for AppState {
@@ -41,6 +47,8 @@ impl Clone for AppState {
             rabbitmq: self.rabbitmq.clone(),
             ws_state: self.ws_state.clone(),
             p2p_connected: self.p2p_connected,
+            sharding: self.sharding.clone(),
+            tiered_storage: self.tiered_storage.clone(),
         }
     }
 }
@@ -73,6 +81,8 @@ impl AppState {
             rabbitmq: None,
             ws_state,
             p2p_connected: false,
+            sharding: None,
+            tiered_storage: None,
         }
     }
     
@@ -99,6 +109,18 @@ impl AppState {
     /// Set P2P connection status
     pub fn with_p2p_status(mut self, connected: bool) -> Self {
         self.p2p_connected = connected;
+        self
+    }
+
+    /// Set the sharding service
+    pub fn with_sharding(mut self, service: Arc<ShardingService>) -> Self {
+        self.sharding = Some(service);
+        self
+    }
+
+    /// Set the tiered storage
+    pub fn with_tiered_storage(mut self, storage: Arc<TieredStorage>) -> Self {
+        self.tiered_storage = Some(storage);
         self
     }
     

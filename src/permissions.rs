@@ -274,7 +274,7 @@ fn extract_content_fields(message: &Message) -> (Option<String>, Option<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::{Database, FilePinRecord, HandlerContext, PostRecord, VmRecord, AccountCostRecord};
+    use crate::handlers::{Database, FilePinRecord, FileRecord, FileType, FileTagRecord, HandlerContext, PostRecord, VmRecord, AccountCostRecord};
     use crate::types::{Chain, ItemType, Message, MessageType, ProcessingStatus};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -481,6 +481,25 @@ mod tests {
         async fn check_volume_refs_exist(&self, _refs: &[String], _use_latest_refs: &[String]) -> Result<(Vec<String>, Vec<String>), String> { Ok((vec![], vec![])) }
         async fn get_total_cost_for_address(&self, _address: &str, _payment_type: &str) -> Result<rust_decimal::Decimal, String> { Ok(rust_decimal::Decimal::ZERO) }
         async fn store_account_costs(&self, _costs: &[AccountCostRecord]) -> Result<(), String> { Ok(()) }
+
+        // Files table
+        async fn upsert_file(&self, _hash: &str, _size: u64, _file_type: &FileType) -> Result<(), String> { Ok(()) }
+        async fn get_file(&self, _hash: &str) -> Result<Option<FileRecord>, String> { Ok(None) }
+
+        // Typed file pins
+        async fn insert_file_pin_typed(&self, _pin: &FilePinRecord) -> Result<(), String> { Ok(()) }
+        async fn get_pins_for_file(&self, _file_hash: &str) -> Result<Vec<FilePinRecord>, String> { Ok(vec![]) }
+        async fn get_message_file_pin(&self, _message_hash: &str) -> Result<Option<FilePinRecord>, String> { Ok(None) }
+        async fn delete_file_pin_by_message(&self, _message_hash: &str) -> Result<(), String> { Ok(()) }
+        async fn count_active_pins(&self, _file_hash: &str) -> Result<i64, String> { Ok(0) }
+        async fn insert_grace_period_pin(&self, _file_hash: &str, _owner: &str, _delete_by: chrono::DateTime<chrono::Utc>) -> Result<(), String> { Ok(()) }
+        async fn get_expired_grace_pins(&self, _limit: i64) -> Result<Vec<FilePinRecord>, String> { Ok(vec![]) }
+        async fn delete_grace_period_pin(&self, _item_hash: &str, _owner: &str) -> Result<(), String> { Ok(()) }
+
+        // File tags (v2)
+        async fn upsert_file_tag(&self, _tag: &FileTagRecord) -> Result<(), String> { Ok(()) }
+        async fn get_file_tag(&self, _tag: &str) -> Result<Option<FileTagRecord>, String> { Ok(None) }
+        async fn refresh_file_tag(&self, _tag: &str, _owner: &str) -> Result<(), String> { Ok(()) }
     }
 
     /// Helper to create a test message

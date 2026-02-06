@@ -28,7 +28,7 @@ pub const PRICING_AGGREGATE_KEY: &str = "pricing";
 /// Default fallback prices (used if aggregate unavailable)
 /// 
 /// These use compile-time validated constants to avoid unwrap at runtime.
-mod defaults {
+pub mod defaults {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     

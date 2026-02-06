@@ -10,6 +10,7 @@ pub mod message;
 pub mod metrics;
 pub mod peers;
 pub mod redis;
+pub mod sharding;
 pub mod storage;
 
 pub use cost::CostService;

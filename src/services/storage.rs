@@ -199,17 +199,18 @@ mod tests {
             grace_period: 86400,
             garbage_collection: false,
             gc_period: 3600,
+            ..Default::default()
         };
-        
+
         let service = StorageService::new(&config).unwrap();
-        
+
         let content = b"Hello, Aleph!";
         let hash = service.store(content).await.unwrap();
-        
+
         let retrieved = service.get(&hash).await.unwrap();
         assert_eq!(retrieved, content);
     }
-    
+
     #[tokio::test]
     async fn test_file_too_large() {
         let temp_dir = tempdir().unwrap();
@@ -222,6 +223,7 @@ mod tests {
             grace_period: 86400,
             garbage_collection: false,
             gc_period: 3600,
+            ..Default::default()
         };
         
         let service = StorageService::new(&config).unwrap();

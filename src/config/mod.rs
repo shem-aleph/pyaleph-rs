@@ -173,6 +173,9 @@ pub struct NodeConfig {
     /// Whether this is a core channel node (CCN)
     #[serde(default = "default_true")]
     pub is_ccn: bool,
+
+    /// Our libp2p peer ID for the content hash ring (derived from keypair if not set)
+    pub peer_id: Option<String>,
 }
 
 fn default_node_name() -> String { "aleph-core".to_string() }
@@ -189,6 +192,7 @@ impl Default for NodeConfig {
             log_level: default_log_level(),
             operator_address: None,
             is_ccn: true,
+            peer_id: None,
         }
     }
 }
@@ -280,6 +284,26 @@ pub struct StorageConfig {
     /// Garbage collection period (seconds)
     #[serde(default = "default_gc_period")]
     pub gc_period: u64,
+
+    /// Enable content sharding across the network
+    #[serde(default)]
+    pub sharding_enabled: bool,
+
+    /// Number of replicas for content sharding (nodes responsible per content hash)
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: usize,
+
+    /// Virtual nodes per physical node in the consistent hash ring
+    #[serde(default = "default_virtual_nodes")]
+    pub virtual_nodes: usize,
+
+    /// TTL for warm cache entries in seconds (non-owned content)
+    #[serde(default = "default_warm_cache_ttl")]
+    pub warm_cache_ttl_secs: u64,
+
+    /// Maximum warm cache size in bytes
+    #[serde(default = "default_warm_cache_max_bytes")]
+    pub warm_cache_max_bytes: u64,
 }
 
 fn default_files_dir() -> PathBuf { PathBuf::from("./data/files") }
@@ -288,6 +312,10 @@ fn default_max_unauth_file_size() -> u64 { 25 * 1024 * 1024 } // 25MB
 fn default_cache_dir() -> PathBuf { PathBuf::from("./data/cache") }
 fn default_grace_period() -> u64 { 86400 } // 24 hours
 fn default_gc_period() -> u64 { 3600 } // 1 hour
+fn default_replication_factor() -> usize { 3 }
+fn default_virtual_nodes() -> usize { 64 }
+fn default_warm_cache_ttl() -> u64 { 3600 } // 1 hour
+fn default_warm_cache_max_bytes() -> u64 { 1024 * 1024 * 1024 } // 1 GB
 
 impl Default for StorageConfig {
     fn default() -> Self {
@@ -300,6 +328,11 @@ impl Default for StorageConfig {
             grace_period: default_grace_period(),
             garbage_collection: true,
             gc_period: default_gc_period(),
+            sharding_enabled: false,
+            replication_factor: default_replication_factor(),
+            virtual_nodes: default_virtual_nodes(),
+            warm_cache_ttl_secs: default_warm_cache_ttl(),
+            warm_cache_max_bytes: default_warm_cache_max_bytes(),
         }
     }
 }

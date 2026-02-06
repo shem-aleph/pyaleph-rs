@@ -156,11 +156,30 @@ pub trait Database: Send + Sync {
     async fn store_post(&self, post: &PostRecord) -> Result<(), String>;
     async fn update_post_latest_amend(&self, original_hash: &str, amend_hash: &str) -> Result<(), String>;
     
-    // Store operations
+    // Store operations (legacy)
     async fn get_file_pin(&self, item_hash: &str) -> Result<Option<FilePinRecord>, String>;
     async fn store_file_pin(&self, pin: &FilePinRecord) -> Result<(), String>;
     async fn update_file_pin(&self, item_hash: &str, owner: &str) -> Result<(), String>;
     async fn remove_file_pin(&self, item_hash: &str, owner: &str) -> Result<(), String>;
+
+    // Files table
+    async fn upsert_file(&self, hash: &str, size: u64, file_type: &FileType) -> Result<(), String>;
+    async fn get_file(&self, hash: &str) -> Result<Option<FileRecord>, String>;
+
+    // Typed file pins
+    async fn insert_file_pin_typed(&self, pin: &FilePinRecord) -> Result<(), String>;
+    async fn get_pins_for_file(&self, file_hash: &str) -> Result<Vec<FilePinRecord>, String>;
+    async fn get_message_file_pin(&self, message_hash: &str) -> Result<Option<FilePinRecord>, String>;
+    async fn delete_file_pin_by_message(&self, message_hash: &str) -> Result<(), String>;
+    async fn count_active_pins(&self, file_hash: &str) -> Result<i64, String>;
+    async fn insert_grace_period_pin(&self, file_hash: &str, owner: &str, delete_by: chrono::DateTime<chrono::Utc>) -> Result<(), String>;
+    async fn get_expired_grace_pins(&self, limit: i64) -> Result<Vec<FilePinRecord>, String>;
+    async fn delete_grace_period_pin(&self, item_hash: &str, owner: &str) -> Result<(), String>;
+
+    // File tags (v2)
+    async fn upsert_file_tag(&self, tag: &FileTagRecord) -> Result<(), String>;
+    async fn get_file_tag(&self, tag: &str) -> Result<Option<FileTagRecord>, String>;
+    async fn refresh_file_tag(&self, tag: &str, owner: &str) -> Result<(), String>;
     
     // Forget operations
     async fn get_forgotten_hashes(&self, hashes: &[String]) -> Result<Vec<String>, String>;
@@ -201,6 +220,46 @@ pub struct PostRecord {
     pub latest_amend: Option<String>,
 }
 
+/// Type of file pin
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinType {
+    /// Pin created by a STORE message
+    Message,
+    /// Pin created by a chain transaction
+    Tx,
+    /// Pin for message content itself
+    Content,
+    /// Temporary pin during grace period before deletion
+    GracePeriod,
+}
+
+impl PinType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            PinType::Message => "message",
+            PinType::Tx => "tx",
+            PinType::Content => "content",
+            PinType::GracePeriod => "grace_period",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "message" => PinType::Message,
+            "tx" => PinType::Tx,
+            "content" => PinType::Content,
+            "grace_period" => PinType::GracePeriod,
+            _ => PinType::Message,
+        }
+    }
+}
+
+impl std::fmt::Display for PinType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// File pin record for database storage
 #[derive(Debug, Clone)]
 pub struct FilePinRecord {
@@ -208,7 +267,52 @@ pub struct FilePinRecord {
     pub owner: String,
     pub size: u64,
     pub content_type: Option<String>,
+    pub pin_type: PinType,
+    pub ref_: Option<String>,
+    pub delete_by: Option<chrono::DateTime<chrono::Utc>>,
+    pub message_hash: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// File metadata record
+#[derive(Debug, Clone)]
+pub struct FileRecord {
+    pub hash: String,
+    pub size: u64,
+    pub file_type: FileType,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Type of stored file
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileType {
+    File,
+    Directory,
+}
+
+impl FileType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            FileType::File => "file",
+            FileType::Directory => "directory",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "directory" => FileType::Directory,
+            _ => FileType::File,
+        }
+    }
+}
+
+/// File tag record for file versioning
+#[derive(Debug, Clone)]
+pub struct FileTagRecord {
+    pub tag: String,
+    pub owner: String,
+    pub file_hash: String,
+    pub last_updated: f64,
 }
 
 /// VM record for database lookups (instances and programs)

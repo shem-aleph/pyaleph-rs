@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::services::ipfs::IpfsService;
 use crate::services::peers::ApiServers;
+use crate::services::sharding::ShardingService;
 
 /// Timeout for peer content fetch HTTP requests
 const PEER_FETCH_TIMEOUT_SECS: u64 = 10;
@@ -70,6 +71,8 @@ pub struct ContentFetchContext {
     pub ipfs: Arc<IpfsService>,
     pub http: Client,
     pub api_servers: ApiServers,
+    /// Optional sharding service for content-aware peer selection
+    pub sharding: Option<Arc<ShardingService>>,
 }
 
 impl ContentFetchContext {
@@ -90,7 +93,13 @@ impl ContentFetchContext {
             ipfs,
             http,
             api_servers,
+            sharding: None,
         }
+    }
+
+    pub fn with_sharding(mut self, sharding: Arc<ShardingService>) -> Self {
+        self.sharding = Some(sharding);
+        self
     }
 }
 
@@ -201,13 +210,43 @@ pub async fn run(ctx: Arc<ContentFetchContext>) {
 /// Fetch content from peers and verify hash integrity
 ///
 /// Matches: aleph/storage.py StorageService._fetch_content_from_network
+///
+/// When sharding is enabled, responsible nodes are tried first before falling
+/// back to random peers.
 async fn fetch_and_verify(
     ctx: &ContentFetchContext,
     item_hash: &str,
     item_type: &str,
     api_servers: &[String],
 ) -> anyhow::Result<String> {
-    // Try HTTP peers first (shuffled randomly)
+    // If sharding is enabled, try responsible nodes first
+    if let Some(ref sharding) = ctx.sharding {
+        let responsible = sharding.get_responsible_nodes(item_hash).await;
+        for peer in &responsible {
+            match fetch_from_peer(&ctx.http, &peer.http_address, item_hash).await {
+                Ok(content_bytes) => {
+                    if verify_hash(item_hash, item_type, &content_bytes) {
+                        let content_str = String::from_utf8(content_bytes)
+                            .map_err(|e| anyhow::anyhow!("Content not UTF-8: {}", e))?;
+                        return Ok(content_str);
+                    } else {
+                        warn!(
+                            "Hash mismatch for {} from responsible node {} (type={})",
+                            item_hash, peer.http_address, item_type
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Responsible node {} failed for {}: {}",
+                        peer.http_address, item_hash, e
+                    );
+                }
+            }
+        }
+    }
+
+    // Try HTTP peers (shuffled randomly) — fallback or non-sharding mode
     if !api_servers.is_empty() {
         let mut servers: Vec<&String> = api_servers.iter().collect();
         let mut rng = rand::rngs::StdRng::from_entropy();

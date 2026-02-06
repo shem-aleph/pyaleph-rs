@@ -1586,7 +1586,20 @@ pub async fn get_storage(
         "storage"
     };
 
-    // Try to get content from local storage first
+    // Try tiered storage first (if available)
+    if let Some(ref tiered) = state.tiered_storage {
+        if let Some(bytes) = tiered.get(&hash).await {
+            let content = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return (StatusCode::OK, Json(json!({
+                "status": "success",
+                "hash": hash,
+                "engine": engine,
+                "content": content,
+            })));
+        }
+    }
+
+    // Try to get content from local storage
     if let Some(ref storage) = state.storage {
         if let Ok(bytes) = storage.get(&hash).await {
             let content = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -1611,10 +1624,17 @@ pub async fn get_storage(
             })))
         }
         Err(_) => {
-            (StatusCode::NOT_FOUND, Json(json!({
+            // If sharding is enabled, include responsible node hints
+            let mut resp = json!({
                 "status": "not_found",
                 "hash": hash,
-            })))
+            });
+            if let Some(ref tiered) = state.tiered_storage {
+                if let Some(nodes) = tiered.get_responsible_nodes(&hash).await {
+                    resp["responsible_nodes"] = json!(nodes);
+                }
+            }
+            (StatusCode::NOT_FOUND, Json(resp))
         }
     }
 }

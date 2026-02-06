@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::db::accessors::PeerAccessor;
+use crate::services::sharding::{ShardingService, PeerNode, extract_peer_id_from_multiaddr};
 
 /// Check interval for HTTP peer health
 const TIDY_INTERVAL_SECS: u64 = 60;
@@ -112,9 +113,10 @@ struct CoreChannelNode {
 /// operators, extracts their IP addresses from multiaddresses, and constructs
 /// HTTP API URLs (port 4024 is the standard CCN HTTP API port).
 ///
-/// Returns the number of new peers discovered.
-async fn discover_peers_from_aggregate(pool: &PgPool, client: &Client) -> usize {
+/// Returns a list of discovered (peer_id, http_address) pairs and the count of new peers.
+async fn discover_peers_from_aggregate(pool: &PgPool, client: &Client) -> (usize, Vec<PeerNode>) {
     let mut discovered = 0;
+    let mut peer_nodes = Vec::new();
 
     // Try each discovery server until one works
     for api_server in DISCOVERY_API_SERVERS {
@@ -183,11 +185,14 @@ async fn discover_peers_from_aggregate(pool: &PgPool, client: &Client) -> usize 
                 continue;
             };
 
-            // Use multiaddress as peer_id for uniqueness (it includes the p2p ID)
-            let peer_id = &http_url;
+            // Extract p2p peer ID from multiaddress for hash ring identity
+            let node_peer_id = extract_peer_id_from_multiaddr(&node.multiaddress)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| http_url.clone());
+
             if let Err(e) = PeerAccessor::upsert(
                 pool,
-                peer_id,
+                &node_peer_id,
                 "HTTP",
                 &http_url,
                 "CORECHANNEL",
@@ -196,6 +201,10 @@ async fn discover_peers_from_aggregate(pool: &PgPool, client: &Client) -> usize 
             {
                 warn!("Failed to upsert discovered peer {}: {}", http_url, e);
             } else {
+                peer_nodes.push(PeerNode {
+                    node_id: node_peer_id,
+                    http_address: http_url,
+                });
                 discovered += 1;
             }
         }
@@ -204,7 +213,7 @@ async fn discover_peers_from_aggregate(pool: &PgPool, client: &Client) -> usize 
         break;
     }
 
-    discovered
+    (discovered, peer_nodes)
 }
 
 /// Extract IPv4 address from a multiaddress string.
@@ -229,7 +238,11 @@ fn extract_ip_from_multiaddr(multiaddr: &str) -> Option<&str> {
 /// Runs on `discovery_interval` (default 300s). Fetches the corechannel aggregate
 /// which lists all registered CCN nodes, extracts their HTTP API addresses, and
 /// seeds them into the peers table for the tidy job to health-check.
-pub async fn peer_discovery_job(pool: PgPool, config: Arc<Config>) {
+pub async fn peer_discovery_job(
+    pool: PgPool,
+    config: Arc<Config>,
+    sharding: Option<Arc<ShardingService>>,
+) {
     let client = Client::builder()
         .timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECS))
         .build()
@@ -244,19 +257,29 @@ pub async fn peer_discovery_job(pool: PgPool, config: Arc<Config>) {
     );
 
     // Initial discovery immediately
-    let count = discover_peers_from_aggregate(&pool, &client).await;
+    let (count, peer_nodes) = discover_peers_from_aggregate(&pool, &client).await;
     info!("Initial peer discovery: seeded {} peers from corechannel", count);
+
+    // Rebuild hash ring with discovered peers
+    if let Some(ref svc) = sharding {
+        svc.rebuild_from_peers(&peer_nodes).await;
+    }
 
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // consume first instant tick
 
     loop {
         ticker.tick().await;
-        let count = discover_peers_from_aggregate(&pool, &client).await;
+        let (count, peer_nodes) = discover_peers_from_aggregate(&pool, &client).await;
         if count > 0 {
             info!("Peer discovery: refreshed {} peers from corechannel", count);
         } else {
             debug!("Peer discovery: no new peers found");
+        }
+
+        // Rebuild hash ring when peers change
+        if let Some(ref svc) = sharding {
+            svc.rebuild_from_peers(&peer_nodes).await;
         }
     }
 }

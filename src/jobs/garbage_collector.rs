@@ -133,7 +133,14 @@ async fn run_gc_cycle(
     // Step 5: Clean up old rejected messages (keep for 7 days)
     let old_rejected = clean_old_rejected(db).await?;
     debug!("Cleaned {} old rejected messages", old_rejected);
-    
+
+    // Step 6: Process expired grace period pins
+    let grace_cleaned = clean_expired_grace_pins(db, ipfs).await?;
+    if grace_cleaned > 0 {
+        info!("Cleaned {} expired grace period pins", grace_cleaned);
+    }
+    stats.files_removed += grace_cleaned;
+
     Ok(stats)
 }
 
@@ -264,6 +271,93 @@ async fn clean_old_rejected(db: &PgPool) -> Result<u64, GcError> {
     .map_err(|e| GcError::Database(e.to_string()))?;
     
     Ok(result.rows_affected())
+}
+
+/// Process expired grace period pins.
+///
+/// When a STORE message is forgotten, the file gets a grace period pin instead of
+/// being immediately unpinned. This function checks for expired grace period pins,
+/// verifies no new active pins appeared during the grace period, and unpins+deletes
+/// files that are truly orphaned.
+async fn clean_expired_grace_pins(db: &PgPool, ipfs: &IpfsService) -> Result<u64, GcError> {
+    // Find grace period pins that have expired
+    let expired: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT item_hash, owner
+        FROM file_pins
+        WHERE pin_type = 'grace_period'
+          AND delete_by IS NOT NULL
+          AND delete_by < NOW()
+        LIMIT 100
+        "#
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| GcError::Database(e.to_string()))?;
+
+    if expired.is_empty() {
+        return Ok(0);
+    }
+
+    let mut cleaned = 0u64;
+
+    for (file_hash, owner) in &expired {
+        // Check if any non-grace-period pins appeared during the grace period
+        let active_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM file_pins
+            WHERE item_hash = $1 AND pin_type != 'grace_period'
+            "#
+        )
+        .bind(file_hash)
+        .fetch_one(db)
+        .await
+        .map_err(|e| GcError::Database(e.to_string()))?;
+
+        if active_count > 0 {
+            // New pins appeared — just remove the grace period pin, keep the file
+            debug!("File {} got re-pinned during grace period, keeping", file_hash);
+            sqlx::query(
+                "DELETE FROM file_pins WHERE item_hash = $1 AND owner = $2 AND pin_type = 'grace_period'"
+            )
+            .bind(file_hash)
+            .bind(owner)
+            .execute(db)
+            .await
+            .map_err(|e| GcError::Database(e.to_string()))?;
+        } else {
+            // No active pins — unpin from IPFS and clean up
+            if let Err(e) = ipfs.unpin(file_hash).await {
+                debug!("IPFS unpin failed for {}: {} (may not be pinned)", file_hash, e);
+            }
+
+            // Delete all pins for this file (including the grace period one)
+            sqlx::query("DELETE FROM file_pins WHERE item_hash = $1")
+                .bind(file_hash)
+                .execute(db)
+                .await
+                .map_err(|e| GcError::Database(e.to_string()))?;
+
+            // Delete from files table
+            sqlx::query("DELETE FROM files WHERE hash = $1")
+                .bind(file_hash)
+                .execute(db)
+                .await
+                .map_err(|e| GcError::Database(e.to_string()))?;
+
+            // Delete any remaining file tags for this file
+            sqlx::query("DELETE FROM file_tags_v2 WHERE file_hash = $1")
+                .bind(file_hash)
+                .execute(db)
+                .await
+                .map_err(|e| GcError::Database(e.to_string()))?;
+
+            info!("Garbage collected file {} after grace period", file_hash);
+            cleaned += 1;
+        }
+    }
+
+    Ok(cleaned)
 }
 
 /// Garbage collector errors

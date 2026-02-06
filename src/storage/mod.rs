@@ -4,6 +4,8 @@
 //! by their content hash under the configured data directory.
 //! This acts as a read-through cache in front of IPFS.
 
+pub mod tiered;
+
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;

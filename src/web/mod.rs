@@ -33,9 +33,28 @@ pub async fn start_server(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Start the web server with database
-pub async fn start_server_with_db(config: &Config, pool: sqlx::PgPool) -> anyhow::Result<()> {
+/// Start the web server with database and optional services
+pub async fn start_server_with_db(
+    config: &Config,
+    pool: sqlx::PgPool,
+) -> anyhow::Result<()> {
+    start_server_with_services(config, pool, None, None).await
+}
+
+/// Start the web server with database and optional sharding/tiered storage services
+pub async fn start_server_with_services(
+    config: &Config,
+    pool: sqlx::PgPool,
+    sharding: Option<Arc<crate::services::sharding::ShardingService>>,
+    tiered_storage: Option<Arc<crate::storage::tiered::TieredStorage>>,
+) -> anyhow::Result<()> {
     let mut app_state = AppState::new(config.clone()).with_db(pool.clone());
+    if let Some(svc) = sharding {
+        app_state = app_state.with_sharding(svc);
+    }
+    if let Some(ts) = tiered_storage {
+        app_state = app_state.with_tiered_storage(ts);
+    }
     if config.rabbitmq.enabled {
         app_state = app_state.with_p2p_status(true);
     }

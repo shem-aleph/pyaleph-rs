@@ -197,7 +197,51 @@ async fn main() -> anyhow::Result<()> {
                 // Start peer monitoring and content fetch services
                 // These always run — not gated on RabbitMQ
                 let api_servers = peers::new_api_servers();
-                
+
+                // Construct sharding service if enabled
+                let sharding: Option<Arc<services::sharding::ShardingService>> =
+                    if config.storage.sharding_enabled {
+                        let our_peer_id = config.node.peer_id.clone()
+                            .or_else(|| config.node.id.clone())
+                            .unwrap_or_else(|| {
+                                let id = format!("node-{}", uuid::Uuid::new_v4().as_simple());
+                                warn!("No peer_id configured, using generated ID: {}", id);
+                                id
+                            });
+                        info!(
+                            "Content sharding enabled: peer_id={}, replication_factor={}, vnodes={}",
+                            our_peer_id, config.storage.replication_factor, config.storage.virtual_nodes
+                        );
+                        Some(Arc::new(services::sharding::ShardingService::new(
+                            our_peer_id,
+                            config.storage.replication_factor,
+                            config.storage.virtual_nodes,
+                        )))
+                    } else {
+                        None
+                    };
+
+                // Construct tiered storage
+                let tiered_storage: Option<Arc<aleph_core::storage::tiered::TieredStorage>> =
+                    if config.storage.sharding_enabled {
+                        let mut ts = aleph_core::storage::tiered::TieredStorage::new(
+                            &config.storage.files_dir,
+                            &config.storage.cache_dir,
+                            config.storage.warm_cache_max_bytes,
+                            std::time::Duration::from_secs(config.storage.warm_cache_ttl_secs),
+                        );
+                        if let Some(ref svc) = sharding {
+                            ts = ts.with_sharding(svc.clone());
+                        }
+                        ts = ts.with_ipfs(ipfs.clone());
+                        if let Err(e) = ts.init().await {
+                            warn!("Failed to initialize tiered storage: {}", e);
+                        }
+                        Some(Arc::new(ts))
+                    } else {
+                        None
+                    };
+
                 {
                     info!("Starting peer tidy job (HTTP peer health checking)");
                     let pool_clone = pool.clone();
@@ -216,10 +260,12 @@ async fn main() -> anyhow::Result<()> {
                     info!("Starting peer discovery job (corechannel aggregate)");
                     let pool_clone = pool.clone();
                     let config_arc_disc = Arc::new(config.clone());
+                    let sharding_clone = sharding.clone();
                     tokio::spawn(async move {
                         peers::peer_discovery_job(
                             pool_clone,
                             config_arc_disc,
+                            sharding_clone,
                         ).await;
                     });
                 }
@@ -230,18 +276,20 @@ async fn main() -> anyhow::Result<()> {
                     let config_arc_cf = Arc::new(config.clone());
                     let ipfs_clone = ipfs.clone();
                     let api_servers_clone = api_servers.clone();
+                    let sharding_clone = sharding.clone();
                     tokio::spawn(async move {
                         // Small delay to let peer tidy job populate api_servers first
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        let ctx = Arc::new(
-                            services::content_fetch::ContentFetchContext::new(
-                                pool_clone,
-                                config_arc_cf,
-                                ipfs_clone,
-                                api_servers_clone,
-                            ),
+                        let mut ctx = services::content_fetch::ContentFetchContext::new(
+                            pool_clone,
+                            config_arc_cf,
+                            ipfs_clone,
+                            api_servers_clone,
                         );
-                        services::content_fetch::run(ctx).await;
+                        if let Some(svc) = sharding_clone {
+                            ctx = ctx.with_sharding(svc);
+                        }
+                        services::content_fetch::run(Arc::new(ctx)).await;
                     });
                 }
                 
@@ -266,7 +314,9 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 info!("Starting API server on {}:{}", config.api.host, config.api.port);
-                web::start_server_with_db(&config, pool).await?;
+                web::start_server_with_services(
+                    &config, pool, sharding, tiered_storage,
+                ).await?;
             }
             Err(e) => {
                 warn!("Database connection failed: {}", e);
