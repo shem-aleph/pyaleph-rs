@@ -35,11 +35,15 @@ pub async fn start_server(config: &Config) -> anyhow::Result<()> {
 
 /// Start the web server with database
 pub async fn start_server_with_db(config: &Config, pool: sqlx::PgPool) -> anyhow::Result<()> {
-    let state = Arc::new(AppState::new(config.clone()).with_db(pool.clone()));
-    
+    let mut app_state = AppState::new(config.clone()).with_db(pool.clone());
+    if config.rabbitmq.enabled {
+        app_state = app_state.with_p2p_status(true);
+    }
+    let state = Arc::new(app_state);
+
     // Create RabbitMQ service and WebSocket connection if enabled
     let ws_state = state.ws_state.clone();
-    
+
     if config.rabbitmq.enabled {
         // Create RabbitMQ config
         let rabbitmq_config = RabbitMQConfig {

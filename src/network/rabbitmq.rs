@@ -73,15 +73,19 @@ impl Default for RabbitMQConfig {
     }
 }
 
-/// P2P message envelope from RabbitMQ
+/// P2P message from RabbitMQ
+///
+/// Messages from p2p-service are URL-encoded raw JSON strings, not wrapped
+/// in an envelope. We store the decoded content and extract routing info
+/// from the delivery metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct P2PMessage {
-    /// Message content (serialized Aleph message)
+    /// Message content (the raw JSON, URL-decoded)
     pub content: String,
-    /// Source peer ID
+    /// Source peer ID (extracted from routing key)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_peer: Option<String>,
-    /// Topic
+    /// Topic (extracted from routing key, e.g., "ALEPH-TEST" or "ALIVE")
     pub topic: String,
 }
 
@@ -157,24 +161,24 @@ impl RabbitMQService {
     
     /// Set up exchanges matching pyaleph configuration
     async fn setup_exchanges(&self, channel: &Channel) -> Result<(), lapin::Error> {
-        // Publishing exchange (to p2p network)
+        // Publishing exchange (to p2p network) - non-durable to match p2p-service
         channel.exchange_declare(
             &self.config.pub_exchange,
             lapin::ExchangeKind::Topic,
             ExchangeDeclareOptions {
-                durable: true,
+                durable: false,
                 ..Default::default()
             },
             FieldTable::default(),
         ).await?;
         info!("Declared exchange: {}", self.config.pub_exchange);
-        
-        // Subscribe exchange (from p2p network)
+
+        // Subscribe exchange (from p2p network) - non-durable to match p2p-service
         channel.exchange_declare(
             &self.config.sub_exchange,
             lapin::ExchangeKind::Topic,
             ExchangeDeclareOptions {
-                durable: true,
+                durable: false,
                 ..Default::default()
             },
             FieldTable::default(),
@@ -405,18 +409,34 @@ pub async fn run_consumer(
         while let Some(delivery) = consumer.next().await {
             match delivery {
                 Ok(delivery) => {
-                    // Parse message
-                    match serde_json::from_slice::<P2PMessage>(&delivery.data) {
-                        Ok(msg) => {
-                            debug!("Received P2P message from {:?} on topic {}", msg.from_peer, msg.topic);
-                            if message_tx.send(msg).await.is_err() {
-                                warn!("Message channel closed");
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse P2P message: {}", e);
-                        }
+                    // Messages from p2p-service are URL-encoded raw JSON
+                    // Routing key format: p2p.{topic}.{peer_id}
+                    let routing_key = delivery.routing_key.as_str();
+                    let parts: Vec<&str> = routing_key.split('.').collect();
+                    let (topic, from_peer) = if parts.len() >= 3 {
+                        (parts[1].to_string(), Some(parts[2..].join(".")))
+                    } else if parts.len() == 2 {
+                        (parts[1].to_string(), None)
+                    } else {
+                        ("unknown".to_string(), None)
+                    };
+
+                    // URL-decode the content
+                    let raw = String::from_utf8_lossy(&delivery.data);
+                    let content = urlencoding::decode(&raw)
+                        .unwrap_or_else(|_| raw.to_string().into())
+                        .to_string();
+
+                    let msg = P2PMessage {
+                        content,
+                        from_peer,
+                        topic,
+                    };
+
+                    debug!("Received P2P message from {:?} on topic {}", msg.from_peer, msg.topic);
+                    if message_tx.send(msg).await.is_err() {
+                        warn!("Message channel closed");
+                        break;
                     }
 
                     // Acknowledge

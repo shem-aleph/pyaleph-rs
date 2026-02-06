@@ -150,13 +150,13 @@ async fn run_consumer_loop(
         .await?;
 
     // Declare the subscribe exchange (should already exist from p2p-service, but
-    // declare idempotently to be safe)
+    // declare idempotently to be safe) - non-durable to match p2p-service
     channel
         .exchange_declare(
             &ctx.config.rabbitmq.sub_exchange,
             lapin::ExchangeKind::Topic,
             ExchangeDeclareOptions {
-                durable: true,
+                durable: false,
                 ..Default::default()
             },
             FieldTable::default(),
