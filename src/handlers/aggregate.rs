@@ -1,4 +1,9 @@
 //! Aggregate message handler - optimized version
+//!
+//! Handles out-of-order aggregate messages by detecting timestamp inversions
+//! and rebuilding the aggregate from all stored elements in chronological order.
+//!
+//! Reference: aleph/handlers/content/aggregate.py
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -21,6 +26,67 @@ impl AggregateHandler {
                 *base = update.clone();
             }
         }
+    }
+
+    /// Rebuild an aggregate from all stored elements in chronological order.
+    ///
+    /// This is called when out-of-order messages are detected. It fetches all
+    /// aggregate_elements for (address, key), sorts by time ASC, and deep merges
+    /// them chronologically to produce the correct final state.
+    ///
+    /// Reference: aleph/handlers/content/aggregate.py rebuild_aggregate()
+    pub(crate) async fn rebuild_aggregate_from_elements(
+        pool: &sqlx::PgPool,
+        address: &str,
+        key: &str,
+    ) -> Result<(), HandlerError> {
+        // Fetch all elements ordered chronologically
+        let elements: Vec<(String, Value, f64)> = sqlx::query_as(
+            "SELECT item_hash, content, time FROM aggregate_elements
+             WHERE address = $1 AND key = $2
+             ORDER BY time ASC, item_hash ASC"
+        )
+        .bind(address)
+        .bind(key)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+        if elements.is_empty() {
+            return Ok(());
+        }
+
+        // Deep merge all elements in order
+        let mut merged = Value::Object(serde_json::Map::new());
+        let mut latest_hash = String::new();
+        let mut latest_time = 0.0_f64;
+
+        for (hash, content, time) in &elements {
+            Self::deep_merge(&mut merged, content);
+            latest_hash = hash.clone();
+            latest_time = *time;
+        }
+
+        // Update the aggregate with the rebuilt content
+        sqlx::query(
+            "UPDATE aggregates SET content = $1, time = $2, last_revision_hash = $3, dirty = false
+             WHERE address = $4 AND key = $5"
+        )
+        .bind(&merged)
+        .bind(latest_time)
+        .bind(&latest_hash)
+        .bind(address)
+        .bind(key)
+        .execute(pool)
+        .await
+        .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+        tracing::info!(
+            "Rebuilt aggregate {}/{} from {} elements",
+            address, key, elements.len()
+        );
+
+        Ok(())
     }
 }
 
@@ -50,11 +116,26 @@ impl MessageHandler for AggregateHandler {
     async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
         let content_str = message.item_content.as_deref()
             .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
-        
+
         let content: AggregateContent = serde_json::from_str(content_str)
             .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
-        
+
         if let Some(ref pool) = ctx.pool {
+            // Insert into aggregate_elements first (always, for tracking and rebuild)
+            sqlx::query(
+                "INSERT INTO aggregate_elements (address, key, item_hash, content, time)
+                 SELECT $1, $2, $3, $4, $5
+                 WHERE NOT EXISTS (SELECT 1 FROM aggregate_elements WHERE item_hash = $3)"
+            )
+            .bind(&content.address)
+            .bind(&content.key)
+            .bind(&message.item_hash)
+            .bind(&content.content)
+            .bind(content.time)
+            .execute(pool)
+            .await
+            .map_err(|e| HandlerError::Database(e.to_string()))?;
+
             // Optimistic insert - try INSERT first, skip SELECT for new keys
             let insert_result = sqlx::query(
                 "INSERT INTO aggregates (address, key, content, time, last_revision_hash, dirty)
@@ -69,10 +150,10 @@ impl MessageHandler for AggregateHandler {
             .execute(pool)
             .await
             .map_err(|e| HandlerError::Database(e.to_string()))?;
-            
-            // If no rows affected, key exists - need to merge
+
+            // If no rows affected, key exists - need to merge or rebuild
             if insert_result.rows_affected() == 0 {
-                // Fetch existing and merge
+                // Fetch existing timestamp
                 let existing_row: Option<(Value, f64)> = sqlx::query_as(
                     "SELECT content, time FROM aggregates WHERE address = $1 AND key = $2"
                 )
@@ -81,46 +162,41 @@ impl MessageHandler for AggregateHandler {
                 .fetch_optional(pool)
                 .await
                 .map_err(|e| HandlerError::Database(e.to_string()))?;
-                
+
                 if let Some((existing_content, existing_time)) = existing_row {
-                    let mut merged = existing_content;
-                    Self::deep_merge(&mut merged, &content.content);
-                    let final_time = if content.time >= existing_time { content.time } else { existing_time };
-                    
-                    sqlx::query(
-                        "UPDATE aggregates SET content = $1, time = $2, last_revision_hash = $3, dirty = false
-                         WHERE address = $4 AND key = $5"
-                    )
-                    .bind(&merged)
-                    .bind(final_time)
-                    .bind(&message.item_hash)
-                    .bind(&content.address)
-                    .bind(&content.key)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| HandlerError::Database(e.to_string()))?;
+                    if content.time >= existing_time {
+                        // Normal case: new message is newer, deep merge on top
+                        let mut merged = existing_content;
+                        Self::deep_merge(&mut merged, &content.content);
+
+                        sqlx::query(
+                            "UPDATE aggregates SET content = $1, time = $2, last_revision_hash = $3, dirty = false
+                             WHERE address = $4 AND key = $5"
+                        )
+                        .bind(&merged)
+                        .bind(content.time)
+                        .bind(&message.item_hash)
+                        .bind(&content.address)
+                        .bind(&content.key)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| HandlerError::Database(e.to_string()))?;
+                    } else {
+                        // Out-of-order: new message is older than existing aggregate.
+                        // Must rebuild from all elements in chronological order.
+                        // Reference: aleph/handlers/content/aggregate.py — mark dirty + rebuild
+                        tracing::info!(
+                            "Out-of-order aggregate {}/{}: new_time={} < existing_time={}, rebuilding",
+                            content.address, content.key, content.time, existing_time
+                        );
+                        Self::rebuild_aggregate_from_elements(pool, &content.address, &content.key).await?;
+                    }
                 }
             }
-            
 
-            // Insert into aggregate_elements for tracking and duplicate detection
-            sqlx::query(
-                "INSERT INTO aggregate_elements (address, key, item_hash, content, time)
-                 SELECT $1, $2, $3, $4, $5
-                 WHERE NOT EXISTS (SELECT 1 FROM aggregate_elements WHERE item_hash = $3)"
-            )
-            .bind(&content.address)
-            .bind(&content.key)
-            .bind(&message.item_hash)
-            .bind(&content.content)
-            .bind(content.time)
-            .execute(pool)
-            .await
-            .map_err(|e| HandlerError::Database(e.to_string()))?;
-            
             tracing::debug!("Stored aggregate: {}/{}", content.address, content.key);
         }
-        
+
         Ok(())
     }
 }

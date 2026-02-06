@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 
-use crate::types::{Message, MessageType, PostContent, ErrorCode};
+use crate::types::{Message, MessageType, PostContent};
 use super::{HandlerContext, HandlerError, MessageHandler, PostRecord};
 
 /// Handler for post messages

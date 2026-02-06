@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use crate::types::{Message, MessageType, ForgetContent, StoreContent};
 use super::{HandlerContext, HandlerError, MessageHandler};
 use super::store::make_file_tag;
+use super::aggregate::AggregateHandler;
 
 /// Handler for forget messages
 pub struct ForgetHandler;
@@ -109,6 +110,106 @@ impl ForgetHandler {
                 "File {} still has {} active pin(s), no grace period needed",
                 file_hash, active_pins
             );
+        }
+
+        Ok(())
+    }
+
+    /// Cascade forget to related data based on message type.
+    ///
+    /// - Post: forget all amends pointing to this post
+    /// - Aggregate: delete from aggregate_elements, rebuild or delete parent aggregate
+    /// - Program/Instance: delete VM versions and cost records
+    ///
+    /// Reference: aleph/handlers/content/forget.py _forget_by_type()
+    async fn cascade_forget(
+        &self,
+        hash: &str,
+        message_type: &MessageType,
+        pool: &sqlx::PgPool,
+        db: &dyn super::Database,
+    ) -> Result<(), HandlerError> {
+        match message_type {
+            MessageType::Post => {
+                // Forget all amends pointing to this original post
+                let amend_hashes: Vec<(String,)> = sqlx::query_as(
+                    "SELECT item_hash FROM posts WHERE original_item_hash = $1"
+                )
+                .bind(hash)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+                for (amend_hash,) in &amend_hashes {
+                    db.mark_forgotten(amend_hash, hash, Some("parent post forgotten")).await
+                        .map_err(|e| HandlerError::Database(e))?;
+                    db.delete_derived_data(amend_hash, "POST").await
+                        .map_err(|e| HandlerError::Database(e))?;
+                    db.delete_message(amend_hash).await
+                        .map_err(|e| HandlerError::Database(e))?;
+                    tracing::debug!("Cascade-forgot amend post: {}", amend_hash);
+                }
+            }
+            MessageType::Aggregate => {
+                // Find which aggregate this element belongs to
+                let agg_info: Option<(String, String)> = sqlx::query_as(
+                    "SELECT address, key FROM aggregate_elements WHERE item_hash = $1"
+                )
+                .bind(hash)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+                // Delete the aggregate element
+                sqlx::query("DELETE FROM aggregate_elements WHERE item_hash = $1")
+                    .bind(hash)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+                // Rebuild or delete the parent aggregate
+                if let Some((address, key)) = agg_info {
+                    let remaining: (i64,) = sqlx::query_as(
+                        "SELECT COUNT(*) FROM aggregate_elements WHERE address = $1 AND key = $2"
+                    )
+                    .bind(&address)
+                    .bind(&key)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+                    if remaining.0 == 0 {
+                        // No elements left — delete the aggregate entirely
+                        sqlx::query("DELETE FROM aggregates WHERE address = $1 AND key = $2")
+                            .bind(&address)
+                            .bind(&key)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| HandlerError::Database(e.to_string()))?;
+                        tracing::info!("Deleted empty aggregate {}/{}", address, key);
+                    } else {
+                        // Rebuild from remaining elements
+                        AggregateHandler::rebuild_aggregate_from_elements(pool, &address, &key).await?;
+                    }
+                }
+            }
+            MessageType::Program | MessageType::Instance => {
+                // Delete VM versions for this item
+                db.delete_vm_updates(hash).await
+                    .map_err(|e| HandlerError::Database(e))?;
+
+                // Delete cost records for this item
+                sqlx::query("DELETE FROM account_costs WHERE item_hash = $1")
+                    .bind(hash)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+                tracing::debug!("Deleted VM versions and costs for {}", hash);
+            }
+            _ => {
+                // Store, Forget — no additional cascade needed
+            }
         }
 
         Ok(())
@@ -268,6 +369,11 @@ impl MessageHandler for ForgetHandler {
                             tracing::warn!("Failed to unpin {} from IPFS: {}", hash, e);
                         }
                     }
+                }
+
+                // Message-type-specific cascade (forget amends, rebuild aggregates, delete costs)
+                if let (Some(ref msg_type), Some(ref pool)) = (&message_type, &ctx.pool) {
+                    self.cascade_forget(hash, msg_type, pool, db.as_ref()).await?;
                 }
 
                 // Delete from derived tables based on message type
