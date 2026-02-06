@@ -10,11 +10,11 @@
 //! Reference: aleph/services/p2p/protocol.py, aleph/jobs/process_pending_messages.py
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lapin::{
-    options::*, types::FieldTable, BasicProperties, Channel, Connection,
-    ConnectionProperties, Consumer,
+    options::*, types::FieldTable, Connection, ConnectionProperties, Consumer,
 };
 use futures::StreamExt;
 use lru::LruCache;
@@ -29,8 +29,15 @@ use crate::types::Message;
 /// Dedup cache capacity — matches pyaleph's 200K entry LRU
 const DEDUP_CACHE_SIZE: usize = 200_000;
 
-/// Reconnect delay on RabbitMQ connection failure
+/// Reconnect delay after connection loss (fast reconnect)
 const RECONNECT_DELAY_SECS: u64 = 5;
+
+/// AMQP heartbeat interval in seconds — server will close the connection
+/// if it doesn't hear from us within 2x this interval, and vice versa.
+const HEARTBEAT_SECS: u16 = 60;
+
+/// Interval for logging consumer activity stats
+const ACTIVITY_LOG_INTERVAL_SECS: u64 = 300;
 
 /// Dedup key: (sender, item_hash, signature)
 type DedupKey = (String, String, String);
@@ -53,6 +60,10 @@ pub struct P2pConsumerContext {
     pub config: Arc<Config>,
     pub dedup_cache: Mutex<LruCache<DedupKey, ()>>,
     pub redis_client: Option<redis::aio::ConnectionManager>,
+    /// Counter for messages received since last activity log
+    pub messages_received: AtomicU64,
+    /// Counter for messages inserted into pending_messages since last activity log
+    pub messages_inserted: AtomicU64,
 }
 
 impl P2pConsumerContext {
@@ -84,6 +95,8 @@ impl P2pConsumerContext {
             config,
             dedup_cache,
             redis_client,
+            messages_received: AtomicU64::new(0),
+            messages_inserted: AtomicU64::new(0),
         }
     }
 }
@@ -114,21 +127,33 @@ pub async fn run(ctx: Arc<P2pConsumerContext>) {
     loop {
         match run_consumer_loop(&ctx, &queue_topic, &alive_topic).await {
             Ok(()) => {
-                // Clean exit (shouldn't happen normally)
-                warn!("P2P consumer loop exited cleanly, restarting...");
+                // Stream ended — consumer cancelled or connection dropped
+                warn!("P2P consumer stream ended, reconnecting in {}s...", RECONNECT_DELAY_SECS);
                 has_connected = true;
             }
             Err(e) => {
                 if !has_connected {
-                    warn!("RabbitMQ not available, P2P consumer disabled ({}). Will retry every 5 minutes.", e);
+                    warn!("RabbitMQ not available, P2P consumer disabled ({}). Will retry in {}s.", e, LONG_RECONNECT_DELAY_SECS);
                 } else {
-                    warn!("P2P consumer connection lost: {}. Retrying in 5 minutes...", e);
+                    warn!("P2P consumer connection lost: {}. Reconnecting in {}s...", e, RECONNECT_DELAY_SECS);
                 }
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(LONG_RECONNECT_DELAY_SECS)).await;
+        // Fast reconnect (5s) once we know RabbitMQ is reachable;
+        // slow retry (300s) only while waiting for initial availability
+        let delay = if has_connected { RECONNECT_DELAY_SECS } else { LONG_RECONNECT_DELAY_SECS };
+        tokio::time::sleep(Duration::from_secs(delay)).await;
     }
+}
+
+/// Ensure the AMQP URI includes a heartbeat parameter.
+fn url_with_heartbeat(url: &str, heartbeat: u16) -> String {
+    if url.contains("heartbeat=") {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{}{sep}heartbeat={heartbeat}", url)
 }
 
 /// Inner consumer loop — connects, declares queues, and consumes.
@@ -137,12 +162,19 @@ async fn run_consumer_loop(
     queue_topic: &str,
     alive_topic: &str,
 ) -> anyhow::Result<()> {
+    let url = url_with_heartbeat(&ctx.config.rabbitmq.url, HEARTBEAT_SECS);
     let conn = Connection::connect(
-        &ctx.config.rabbitmq.url,
+        &url,
         ConnectionProperties::default(),
     )
     .await?;
-    info!("Connected to RabbitMQ: {}", ctx.config.rabbitmq.url);
+
+    // Log connection errors proactively so we don't have to wait for stream EOF
+    conn.on_error(|err| {
+        error!("RabbitMQ connection error (callback): {}", err);
+    });
+
+    info!("Connected to RabbitMQ: {} (heartbeat={}s)", ctx.config.rabbitmq.url, HEARTBEAT_SECS);
 
     let channel = conn.create_channel().await?;
     channel
@@ -241,13 +273,38 @@ async fn run_consumer_loop(
 
     info!("P2P consumers started, waiting for messages...");
 
-    // Process both streams concurrently
+    // Reset counters for this connection
+    ctx.messages_received.store(0, Ordering::Relaxed);
+    ctx.messages_inserted.store(0, Ordering::Relaxed);
+
+    // Periodic activity logger — so we can tell from logs whether the consumer is alive
+    let activity_ctx_received = &ctx.messages_received;
+    let activity_ctx_inserted = &ctx.messages_inserted;
+    let activity_logger = async {
+        let mut interval = tokio::time::interval(Duration::from_secs(ACTIVITY_LOG_INTERVAL_SECS));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            let received = activity_ctx_received.swap(0, Ordering::Relaxed);
+            let inserted = activity_ctx_inserted.swap(0, Ordering::Relaxed);
+            info!(
+                "P2P consumer activity: received={}, inserted={} (last {}s)",
+                received, inserted, ACTIVITY_LOG_INTERVAL_SECS
+            );
+        }
+    };
+
+    // Process both streams concurrently; also monitor connection health
     tokio::select! {
         _ = process_message_stream(ctx, msg_consumer) => {
-            warn!("Message consumer stream ended");
+            warn!("Message consumer stream ended — will reconnect");
         }
         _ = process_alive_stream(ctx, alive_consumer) => {
-            warn!("Alive consumer stream ended");
+            warn!("Alive consumer stream ended — will reconnect");
+        }
+        _ = activity_logger => {
+            // Activity logger never returns, but just in case
+            unreachable!();
         }
     }
 
@@ -281,6 +338,8 @@ async fn process_message_stream(
                 // Parse as Aleph Message
                 match serde_json::from_str::<Message>(&decoded) {
                     Ok(message) => {
+                        ctx.messages_received.fetch_add(1, Ordering::Relaxed);
+
                         // Dedup check
                         let dedup_key = (
                             message.sender.clone(),
@@ -305,12 +364,14 @@ async fn process_message_stream(
                         // Insert into pending_messages
                         if let Err(e) = insert_pending_message(&ctx.db, &message).await
                         {
-                            // ON CONFLICT is handled — duplicates are fine
-                            debug!(
-                                "Insert pending {} result: {}",
+                            // ON CONFLICT DO NOTHING is expected for duplicates,
+                            // but real errors (connection issues, etc.) should be visible
+                            warn!(
+                                "Failed to insert pending message {}: {}",
                                 message.item_hash, e
                             );
                         } else {
+                            ctx.messages_inserted.fetch_add(1, Ordering::Relaxed);
                             debug!(
                                 "Queued pending message: {} (type={}, sender={})",
                                 message.item_hash, message.message_type, message.sender
@@ -457,5 +518,22 @@ mod tests {
             std::num::NonZeroUsize::new(DEDUP_CACHE_SIZE).unwrap(),
         );
         assert_eq!(cache.cap().get(), DEDUP_CACHE_SIZE);
+    }
+
+    #[test]
+    fn test_url_with_heartbeat() {
+        assert_eq!(
+            url_with_heartbeat("amqp://localhost:5672", 60),
+            "amqp://localhost:5672?heartbeat=60"
+        );
+        assert_eq!(
+            url_with_heartbeat("amqp://localhost:5672?foo=bar", 60),
+            "amqp://localhost:5672?foo=bar&heartbeat=60"
+        );
+        // Don't double-add if already present
+        assert_eq!(
+            url_with_heartbeat("amqp://localhost:5672?heartbeat=30", 60),
+            "amqp://localhost:5672?heartbeat=30"
+        );
     }
 }
