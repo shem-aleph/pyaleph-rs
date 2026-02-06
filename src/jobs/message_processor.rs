@@ -259,30 +259,16 @@ async fn process_single_message(
     }
 
     // Step 3: Fetch content if needed
-    // For storage/IPFS messages without content, defer to content_fetch service
-    // rather than trying to fetch here (avoids race conditions and wasted retries)
+    // Try to fetch directly (IPFS/peer), defer only if fetch fails
     let message = if needs_content_fetch(&message) {
-        if pending.fetched {
-            // content_fetch has filled the content — reload from messages table
-            match reload_message_content(&ctx.db, &pending.item_hash).await {
-                Ok(Some(content)) => {
-                    let mut msg = message.clone();
-                    msg.item_content = Some(content);
-                    msg
-                }
-                Ok(None) => {
-                    // Content still not in messages table despite fetched=true, defer
-                    return Ok(ProcessResult::Retry("Content marked fetched but not found in messages table".to_string()));
-                }
-                Err(e) => {
-                    return Ok(ProcessResult::Retry(format!("Failed to reload content: {}", e)));
-                }
+        match fetch_message_content(ctx, &message).await {
+            Ok(msg_with_content) => msg_with_content,
+            Err(e) => {
+                // Fetch failed — defer and let content_fetch service try later
+                defer_pending(&ctx.db, &pending.item_hash, 30.0).await?;
+                debug!("Deferring {} — content fetch failed: {}", pending.item_hash, e);
+                return Ok(ProcessResult::Deferred);
             }
-        } else {
-            // Content not yet fetched by content_fetch — defer without wasting retries
-            defer_pending(&ctx.db, &pending.item_hash, 30.0).await?;
-            debug!("Deferring {} — waiting for content_fetch to provide content", pending.item_hash);
-            return Ok(ProcessResult::Deferred);
         }
     } else {
         message
