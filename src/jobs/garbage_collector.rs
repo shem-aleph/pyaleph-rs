@@ -80,9 +80,12 @@ async fn run_gc_cycle(
         FROM file_pins fp
         WHERE NOT EXISTS (
             -- No STORE message references this file
-            SELECT 1 FROM messages m 
-            WHERE m.message_type = 'STORE' 
-            AND m.item_content::json->>'item_hash' = fp.item_hash
+            SELECT 1 FROM messages m
+            WHERE m.message_type = 'STORE'
+            AND m.item_content IS NOT NULL
+            AND m.item_content != ''
+            AND m.item_content LIKE '{%'
+            AND (replace(m.item_content, '\u0000', '')::jsonb->>'item_hash') = fp.item_hash
         )
         AND NOT EXISTS (
             -- No active programs or instances use this file
@@ -150,9 +153,12 @@ async fn remove_file(db: &PgPool, ipfs: &IpfsService, hash: &str) -> Result<bool
     let still_orphaned: bool = sqlx::query_scalar(
         r#"
         SELECT NOT EXISTS (
-            SELECT 1 FROM messages m 
-            WHERE m.message_type = 'STORE' 
-            AND m.item_content::json->>'item_hash' = $1
+            SELECT 1 FROM messages m
+            WHERE m.message_type = 'STORE'
+            AND m.item_content IS NOT NULL
+            AND m.item_content != ''
+            AND m.item_content LIKE '{%'
+            AND (replace(m.item_content, '\u0000', '')::jsonb->>'item_hash') = $1
         )
         "#
     )
