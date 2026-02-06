@@ -13,9 +13,11 @@ use sqlx::PgPool;
 use chrono::Utc;
 
 use crate::config::Config;
-use crate::types::{Message, MessageType, ItemType, ProcessingStatus, ErrorCode};
+use crate::types::{Message, ItemType, ErrorCode};
 use crate::services::crypto::CryptoService;
+use crate::services::cost::CostService;
 use crate::services::ipfs::IpfsService;
+use crate::network::rabbitmq::RabbitMQService;
 use crate::handlers::{self, HandlerContext};
 use crate::db::models::PendingMessageDb;
 use futures::stream::{self, StreamExt};
@@ -42,11 +44,25 @@ pub struct ProcessorContext {
     pub crypto: Arc<CryptoService>,
     pub ipfs: Arc<IpfsService>,
     pub config: Arc<Config>,
+    /// RabbitMQ for publishing processed messages to the network
+    pub rabbitmq: Option<Arc<RabbitMQService>>,
+    /// Cost service for balance checking
+    pub cost: Option<Arc<CostService>>,
 }
 
 impl ProcessorContext {
     pub fn new(db: PgPool, crypto: Arc<CryptoService>, ipfs: Arc<IpfsService>, config: Arc<Config>) -> Self {
-        Self { db, crypto, ipfs, config }
+        Self { db, crypto, ipfs, config, rabbitmq: None, cost: None }
+    }
+
+    pub fn with_rabbitmq(mut self, rabbitmq: Arc<RabbitMQService>) -> Self {
+        self.rabbitmq = Some(rabbitmq);
+        self
+    }
+
+    pub fn with_cost(mut self, cost: Arc<CostService>) -> Self {
+        self.cost = Some(cost);
+        self
     }
 }
 
@@ -224,6 +240,11 @@ async fn process_single_message(
     // Step 2: Check for duplicate (already processed)
     if is_duplicate(&ctx.db, &message.item_hash).await? {
         debug!("Message {} is a duplicate, skipping", message.item_hash);
+
+        // Record chain confirmation if the duplicate came from chain sync
+        // The pending message JSON may contain chain tx metadata from store_chain_message()
+        record_chain_confirmation_if_present(&ctx.db, &message.item_hash, &pending.message).await;
+
         return Ok(ProcessResult::Processed); // Just remove from pending
     }
 
@@ -321,6 +342,19 @@ async fn process_single_message(
         "processed" => {
             // Store in messages table
             store_processed_message(&ctx.db, &message).await?;
+
+            // Publish to RabbitMQ (fire-and-forget: log warnings but don't block processing)
+            if let Some(ref rmq) = ctx.rabbitmq {
+                // Announce to local consumers (aleph-messages exchange)
+                if let Err(e) = rmq.publish_processed(&message).await {
+                    warn!("Failed to publish processed message {} to aleph-messages: {}", message.item_hash, e);
+                }
+                // Relay to p2p-service for network propagation (p2p-publish exchange)
+                if let Err(e) = rmq.publish_to_network(&message).await {
+                    warn!("Failed to publish message {} to p2p network: {}", message.item_hash, e);
+                }
+            }
+
             Ok(ProcessResult::Processed)
         }
         "rejected" => {
@@ -420,6 +454,53 @@ async fn is_duplicate(db: &PgPool, item_hash: &str) -> Result<bool, ProcessorErr
     .map_err(|e| ProcessorError::Database(e.to_string()))?;
     
     Ok(has_derived)
+}
+
+/// Record a chain confirmation for a duplicate message if chain tx metadata is present.
+///
+/// When chain_sync inserts a message that's already processed, we still want to record
+/// the chain transaction as a confirmation. The pending message JSON may contain
+/// `tx_hash`, `chain`, and `height` fields from the chain sync path.
+///
+/// Reference: aleph/jobs/process_pending_messages.py — record_chain_confirmation
+async fn record_chain_confirmation_if_present(
+    db: &PgPool,
+    item_hash: &str,
+    pending_json: &serde_json::Value,
+) {
+    // Extract chain metadata from the pending message envelope
+    let tx_hash = pending_json.get("tx_hash").and_then(|v| v.as_str());
+    let chain = pending_json.get("chain").and_then(|v| v.as_str());
+    let height = pending_json.get("height").and_then(|v| v.as_i64());
+
+    if let (Some(tx_hash), Some(chain), Some(height)) = (tx_hash, chain, height) {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO chain_txs (item_hash, tx_hash, chain, height, confirmed_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (item_hash, tx_hash) DO NOTHING
+            "#,
+        )
+        .bind(item_hash)
+        .bind(tx_hash)
+        .bind(chain)
+        .bind(height)
+        .execute(db)
+        .await;
+
+        match result {
+            Ok(r) if r.rows_affected() > 0 => {
+                debug!(
+                    "Recorded chain confirmation for duplicate {}: tx={} chain={} height={}",
+                    item_hash, tx_hash, chain, height
+                );
+            }
+            Ok(_) => {} // Already had this confirmation
+            Err(e) => {
+                warn!("Failed to record chain confirmation for {}: {}", item_hash, e);
+            }
+        }
+    }
 }
 
 /// Check if a message has already been forgotten
@@ -588,6 +669,7 @@ fn create_handler_context(ctx: &ProcessorContext, trusted_source: bool) -> Handl
     handler_ctx.pool = Some(ctx.db.clone());
     handler_ctx.db = Some(Arc::new(crate::db::PgDatabase::new(ctx.db.clone())));
     handler_ctx.trusted_source = trusted_source;
+    handler_ctx.cost = ctx.cost.clone();
     handler_ctx
 }
 

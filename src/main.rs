@@ -158,21 +158,59 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
                 
-                // Start message processor (processes pending messages into derived tables)
+                // Create shared services used by both processor and API
                 let crypto = Arc::new(CryptoService::new());
                 let ipfs = Arc::new(IpfsService::new(&config.ipfs));
+                let cost_service = Arc::new(services::cost::CostService::new());
+
+                // Create RabbitMQ service for publishing processed messages
+                // This is shared between the message processor (for publish) and AppState
+                let rabbitmq: Option<Arc<aleph_core::network::rabbitmq::RabbitMQService>> =
+                    if config.rabbitmq.enabled {
+                        let rmq_config = aleph_core::network::rabbitmq::RabbitMQConfig {
+                            url: config.rabbitmq.url.clone(),
+                            pub_exchange: config.rabbitmq.pub_exchange.clone(),
+                            sub_exchange: config.rabbitmq.sub_exchange.clone(),
+                            message_exchange: config.rabbitmq.message_exchange.clone(),
+                            pending_message_exchange: config.rabbitmq.pending_message_exchange.clone(),
+                            pending_tx_exchange: config.rabbitmq.pending_tx_exchange.clone(),
+                            queue_incoming: "aleph-incoming".to_string(),
+                            queue_outgoing: "aleph-outgoing".to_string(),
+                            routing_key: "#".to_string(),
+                        };
+                        let mut svc = aleph_core::network::rabbitmq::RabbitMQService::new(rmq_config);
+                        match svc.connect().await {
+                            Ok(()) => {
+                                info!("RabbitMQ connected for message publishing");
+                                Some(Arc::new(svc))
+                            }
+                            Err(e) => {
+                                warn!("RabbitMQ not available for publishing ({}), continuing without P2P relay", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                // Start message processor (processes pending messages into derived tables)
                 {
                     info!("Starting message processor");
                     let pool_clone = pool.clone();
                     let config_arc_proc = Arc::new(config.clone());
-                    
-                    let processor_ctx = Arc::new(ProcessorContext::new(
+
+                    let mut processor_ctx = ProcessorContext::new(
                         pool_clone,
                         crypto.clone(),
                         ipfs.clone(),
                         config_arc_proc,
-                    ));
-                    
+                    );
+                    processor_ctx.cost = Some(cost_service.clone());
+                    if let Some(ref rmq) = rabbitmq {
+                        processor_ctx.rabbitmq = Some(rmq.clone());
+                    }
+                    let processor_ctx = Arc::new(processor_ctx);
+
                     tokio::spawn(async move {
                         jobs::message_processor::run(processor_ctx).await;
                     });
