@@ -44,6 +44,13 @@ impl MessageHandler for InstanceHandler {
         }
         vm_common::validate_volume_refs(&pin_refs, &tag_refs, ctx).await?;
 
+        // Validate parent volume size: rootfs size_mib must be >= parent file size
+        vm_common::validate_parent_volume_size(
+            &content.rootfs.parent.ref_,
+            content.rootfs.size_mib,
+            ctx,
+        ).await?;
+
         // Validate amendment if replaces is set
         if let Some(ref replaces) = content.replaces {
             vm_common::validate_amendment(replaces, ctx, true).await?;

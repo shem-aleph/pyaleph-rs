@@ -48,6 +48,30 @@ pub async fn validate_volume_refs(
     Ok(())
 }
 
+/// Validate that the rootfs size_mib is >= the parent file's actual size.
+///
+/// Reference: aleph/handlers/content/vm.py check_parent_volume_size()
+pub async fn validate_parent_volume_size(
+    parent_ref: &str,
+    requested_size_mib: u32,
+    ctx: &HandlerContext,
+) -> Result<(), HandlerError> {
+    if let Some(ref db) = ctx.db {
+        if let Some(file_record) = db.get_file(parent_ref).await.map_err(HandlerError::Database)? {
+            let parent_size_mib = (file_record.size + (1024 * 1024 - 1)) / (1024 * 1024); // round up
+            if (requested_size_mib as u64) < parent_size_mib {
+                return Err(HandlerError::InvalidContent(format!(
+                    "Rootfs size_mib ({}) is smaller than parent file size ({} MiB). \
+                     The rootfs must be at least as large as its parent.",
+                    requested_size_mib, parent_size_mib
+                )));
+            }
+        }
+        // If file not found, skip the check — the file may not have been stored yet
+    }
+    Ok(())
+}
+
 /// Validate amendment (replaces) constraints.
 /// Reference: aleph/handlers/content/vm.py check_dependencies()
 pub async fn validate_amendment(
