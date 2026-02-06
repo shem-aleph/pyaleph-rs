@@ -34,6 +34,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Error> {
     create_chain_sync_state_table(pool).await?;
     create_pending_txs_table(pool).await?;
     create_peers_table(pool).await?;
+    widen_narrow_columns(pool).await?;
     create_indexes(pool).await?;
     
     info!("Database migrations completed");
@@ -503,6 +504,23 @@ async fn create_file_tags_v2_table(pool: &PgPool) -> Result<(), Error> {
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Widen columns that are too narrow for real-world data.
+/// Some Aleph messages have ref fields, addresses, or post types that exceed
+/// the original VARCHAR limits (e.g., IPFS CIDs, long post types).
+async fn widen_narrow_columns(pool: &PgPool) -> Result<(), Error> {
+    // Posts: ref_ and original_item_hash can be IPFS CIDs (>128 chars)
+    sqlx::query("ALTER TABLE posts ALTER COLUMN ref_ TYPE TEXT")
+        .execute(pool).await.ok();
+    sqlx::query("ALTER TABLE posts ALTER COLUMN original_item_hash TYPE TEXT")
+        .execute(pool).await.ok();
+    sqlx::query("ALTER TABLE posts ALTER COLUMN post_type TYPE VARCHAR(256)")
+        .execute(pool).await.ok();
+    // Note: messages.item_hash is VARCHAR(128) PRIMARY KEY — widening it requires
+    // an exclusive lock and full table rewrite on a huge table. Skip for now;
+    // 128 chars is sufficient for all known hash formats (SHA256 hex = 64 chars).
     Ok(())
 }
 
