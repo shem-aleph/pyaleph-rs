@@ -209,23 +209,32 @@ async fn backfill_posts(pool: &PgPool) -> Result<(u64, u64, u64), String> {
         // We process in time order to handle amend→original dependencies correctly.
         let result = sqlx::query(
             r#"
-            WITH batch AS (
+            WITH raw_batch AS (
                 SELECT
                     m.item_hash,
-                    m.item_content::jsonb->>'address' AS address,
-                    m.item_content::jsonb->>'type' AS post_type,
-                    m.item_content::jsonb->'content' AS content,
-                    m.item_content::jsonb->>'ref' AS ref_,
                     m.channel,
-                    COALESCE((m.item_content::jsonb->>'time')::double precision, m.time) AS content_time,
-                    m.time AS msg_time
+                    m.time AS msg_time,
+                    replace(m.item_content, '\u0000', '')::jsonb AS jb
                 FROM messages m
                 WHERE m.message_type = 'POST'
                 AND m.item_content IS NOT NULL
+                AND m.item_content != ''
                 AND m.time > $1
                 AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.item_hash = m.item_hash)
                 ORDER BY m.time ASC
                 LIMIT $2
+            ),
+            batch AS (
+                SELECT
+                    item_hash,
+                    jb->>'address' AS address,
+                    jb->>'type' AS post_type,
+                    jb->'content' AS content,
+                    jb->>'ref' AS ref_,
+                    channel,
+                    COALESCE((jb->>'time')::double precision, msg_time) AS content_time,
+                    msg_time
+                FROM raw_batch
             )
             INSERT INTO posts (item_hash, address, post_type, content, ref_, channel, time, original_item_hash)
             SELECT
@@ -370,24 +379,33 @@ async fn backfill_aggregates(pool: &PgPool) -> Result<(u64, u64), String> {
         // Insert aggregate elements
         let result = sqlx::query(
             r#"
-            WITH batch AS (
+            WITH raw_batch AS (
                 SELECT
                     m.item_hash,
-                    m.item_content::jsonb->>'key' AS agg_key,
-                    m.item_content::jsonb->>'address' AS owner,
-                    m.item_content::jsonb->'content' AS content,
-                    COALESCE(
-                        to_timestamp((m.item_content::jsonb->>'time')::double precision),
-                        m.created_at
-                    ) AS creation_datetime,
-                    m.time AS msg_time
+                    m.created_at,
+                    m.time AS msg_time,
+                    replace(m.item_content, '\u0000', '')::jsonb AS jb
                 FROM messages m
                 WHERE m.message_type = 'AGGREGATE'
                 AND m.item_content IS NOT NULL
+                AND m.item_content != ''
                 AND m.time > $1
                 AND NOT EXISTS (SELECT 1 FROM aggregate_elements ae WHERE ae.item_hash = m.item_hash)
                 ORDER BY m.time ASC
                 LIMIT $2
+            ),
+            batch AS (
+                SELECT
+                    item_hash,
+                    jb->>'key' AS agg_key,
+                    jb->>'address' AS owner,
+                    jb->'content' AS content,
+                    COALESCE(
+                        to_timestamp((jb->>'time')::double precision),
+                        created_at
+                    ) AS creation_datetime,
+                    msg_time
+                FROM raw_batch
             )
             INSERT INTO aggregate_elements (item_hash, key, owner, content, creation_datetime)
             SELECT
@@ -516,39 +534,43 @@ async fn backfill_instances(pool: &PgPool) -> Result<(u64, u64), String> {
 
     let result = sqlx::query(
         r#"
+        WITH parsed AS (
+            SELECT m.item_hash, m.sender, m.time AS msg_time,
+                   replace(m.item_content, '\u0000', '')::jsonb AS jb
+            FROM messages m
+            WHERE m.message_type = 'INSTANCE'
+            AND m.item_content IS NOT NULL AND m.item_content != ''
+            AND NOT EXISTS (SELECT 1 FROM instances i WHERE i.item_hash = m.item_hash)
+        )
         INSERT INTO instances (item_hash, owner, rootfs_ref, memory, vcpus, payment_type, payment_chain,
             allow_amend, replaces, environment_reproducible, environment_internet, environment_aleph_api,
             environment_shared_cache, environment_hypervisor, resources_seconds, metadata, variables,
             authorized_keys, rootfs_use_latest, rootfs_persistence, rootfs_size_mib, node_hash, time, created_at)
         SELECT
-            m.item_hash,
-            m.sender,
-            m.item_content::jsonb->'rootfs'->'parent'->>'ref',
-            COALESCE((m.item_content::jsonb->'resources'->>'memory')::integer, 0),
-            COALESCE((m.item_content::jsonb->'resources'->>'vcpus')::integer, 0),
-            m.item_content::jsonb->'payment'->>'type',
-            m.item_content::jsonb->'payment'->>'chain',
-            COALESCE((m.item_content::jsonb->>'allow_amend')::boolean, true),
-            m.item_content::jsonb->>'replaces',
-            COALESCE((m.item_content::jsonb->'environment'->>'reproducible')::boolean, false),
-            COALESCE((m.item_content::jsonb->'environment'->>'internet')::boolean, true),
-            COALESCE((m.item_content::jsonb->'environment'->>'aleph_api')::boolean, true),
-            COALESCE((m.item_content::jsonb->'environment'->>'shared_cache')::boolean, false),
-            m.item_content::jsonb->'environment'->>'hypervisor',
-            COALESCE((m.item_content::jsonb->'resources'->>'seconds')::integer, 30),
-            m.item_content::jsonb->'metadata',
-            m.item_content::jsonb->'variables',
-            m.item_content::jsonb->'authorized_keys',
-            COALESCE((m.item_content::jsonb->'rootfs'->'parent'->>'use_latest')::boolean, true),
-            m.item_content::jsonb->'rootfs'->>'persistence',
-            (m.item_content::jsonb->'rootfs'->>'size_mib')::integer,
-            m.item_content::jsonb->'requirements'->'node'->>'node_hash',
-            COALESCE((m.item_content::jsonb->>'time')::double precision, m.time),
+            p.item_hash, p.sender,
+            p.jb->'rootfs'->'parent'->>'ref',
+            COALESCE((p.jb->'resources'->>'memory')::integer, 0),
+            COALESCE((p.jb->'resources'->>'vcpus')::integer, 0),
+            p.jb->'payment'->>'type',
+            p.jb->'payment'->>'chain',
+            COALESCE((p.jb->>'allow_amend')::boolean, true),
+            p.jb->>'replaces',
+            COALESCE((p.jb->'environment'->>'reproducible')::boolean, false),
+            COALESCE((p.jb->'environment'->>'internet')::boolean, true),
+            COALESCE((p.jb->'environment'->>'aleph_api')::boolean, true),
+            COALESCE((p.jb->'environment'->>'shared_cache')::boolean, false),
+            p.jb->'environment'->>'hypervisor',
+            COALESCE((p.jb->'resources'->>'seconds')::integer, 30),
+            p.jb->'metadata',
+            p.jb->'variables',
+            p.jb->'authorized_keys',
+            COALESCE((p.jb->'rootfs'->'parent'->>'use_latest')::boolean, true),
+            p.jb->'rootfs'->>'persistence',
+            (p.jb->'rootfs'->>'size_mib')::integer,
+            p.jb->'requirements'->'node'->>'node_hash',
+            COALESCE((p.jb->>'time')::double precision, p.msg_time),
             NOW()
-        FROM messages m
-        WHERE m.message_type = 'INSTANCE'
-        AND m.item_content IS NOT NULL
-        AND NOT EXISTS (SELECT 1 FROM instances i WHERE i.item_hash = m.item_hash)
+        FROM parsed p
         ON CONFLICT (item_hash) DO NOTHING
         "#
     )
@@ -567,36 +589,40 @@ async fn backfill_programs(pool: &PgPool) -> Result<(u64, u64), String> {
 
     let result = sqlx::query(
         r#"
+        WITH parsed AS (
+            SELECT m.item_hash, m.sender, m.time AS msg_time,
+                   replace(m.item_content, '\u0000', '')::jsonb AS jb
+            FROM messages m
+            WHERE m.message_type = 'PROGRAM'
+            AND m.item_content IS NOT NULL AND m.item_content != ''
+            AND NOT EXISTS (SELECT 1 FROM programs p WHERE p.item_hash = m.item_hash)
+        )
         INSERT INTO programs (item_hash, owner, code_ref, runtime_ref, memory, vcpus, allow_amend,
             replaces, environment_reproducible, environment_internet, environment_aleph_api,
             environment_shared_cache, environment_hypervisor, resources_seconds, metadata, variables,
             payment_type, payment_chain, node_hash, time, created_at)
         SELECT
-            m.item_hash,
-            m.sender,
-            m.item_content::jsonb->'code'->>'ref',
-            m.item_content::jsonb->'runtime'->>'ref',
-            COALESCE((m.item_content::jsonb->'resources'->>'memory')::integer, 0),
-            COALESCE((m.item_content::jsonb->'resources'->>'vcpus')::integer, 0),
-            COALESCE((m.item_content::jsonb->>'allow_amend')::boolean, true),
-            m.item_content::jsonb->>'replaces',
-            COALESCE((m.item_content::jsonb->'environment'->>'reproducible')::boolean, false),
-            COALESCE((m.item_content::jsonb->'environment'->>'internet')::boolean, true),
-            COALESCE((m.item_content::jsonb->'environment'->>'aleph_api')::boolean, true),
-            COALESCE((m.item_content::jsonb->'environment'->>'shared_cache')::boolean, false),
-            m.item_content::jsonb->'environment'->>'hypervisor',
-            COALESCE((m.item_content::jsonb->'resources'->>'seconds')::integer, 30),
-            m.item_content::jsonb->'metadata',
-            m.item_content::jsonb->'variables',
-            m.item_content::jsonb->'payment'->>'type',
-            m.item_content::jsonb->'payment'->>'chain',
-            m.item_content::jsonb->'requirements'->'node'->>'node_hash',
-            COALESCE((m.item_content::jsonb->>'time')::double precision, m.time),
+            p.item_hash, p.sender,
+            p.jb->'code'->>'ref',
+            p.jb->'runtime'->>'ref',
+            COALESCE((p.jb->'resources'->>'memory')::integer, 0),
+            COALESCE((p.jb->'resources'->>'vcpus')::integer, 0),
+            COALESCE((p.jb->>'allow_amend')::boolean, true),
+            p.jb->>'replaces',
+            COALESCE((p.jb->'environment'->>'reproducible')::boolean, false),
+            COALESCE((p.jb->'environment'->>'internet')::boolean, true),
+            COALESCE((p.jb->'environment'->>'aleph_api')::boolean, true),
+            COALESCE((p.jb->'environment'->>'shared_cache')::boolean, false),
+            p.jb->'environment'->>'hypervisor',
+            COALESCE((p.jb->'resources'->>'seconds')::integer, 30),
+            p.jb->'metadata',
+            p.jb->'variables',
+            p.jb->'payment'->>'type',
+            p.jb->'payment'->>'chain',
+            p.jb->'requirements'->'node'->>'node_hash',
+            COALESCE((p.jb->>'time')::double precision, p.msg_time),
             NOW()
-        FROM messages m
-        WHERE m.message_type = 'PROGRAM'
-        AND m.item_content IS NOT NULL
-        AND NOT EXISTS (SELECT 1 FROM programs p WHERE p.item_hash = m.item_hash)
+        FROM parsed p
         ON CONFLICT (item_hash) DO NOTHING
         "#
     )
