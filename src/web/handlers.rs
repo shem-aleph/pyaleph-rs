@@ -4270,11 +4270,6 @@ pub async fn get_monitor_stats(
     let pending: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_messages")
         .fetch_one(db).await.unwrap_or((0,));
     
-    // Use pg_class for fast approximate counts on large tables
-    let messages: (i64,) = sqlx::query_as(
-        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'messages'"
-    ).fetch_one(db).await.unwrap_or((0,));
-    
     let rejected: (i64,) = sqlx::query_as(
         "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'rejected_messages'"
     ).fetch_one(db).await.unwrap_or((0,));
@@ -4329,7 +4324,9 @@ pub async fn get_monitor_stats(
     });
     
     let mut types_map = serde_json::Map::new();
+    let mut messages_total: i64 = 0;
     for (t, count) in by_type {
+        messages_total += count;
         types_map.insert(t, json!(count));
     }
 
@@ -4360,7 +4357,7 @@ pub async fn get_monitor_stats(
         "uptime_secs": state.metrics.uptime_secs(),
         "counts": {
             "pending_messages": pending.0,
-            "messages": messages.0,
+            "messages": messages_total,
             "rejected_messages": rejected.0,
             "posts": posts.0,
             "aggregates": aggregates.0,
