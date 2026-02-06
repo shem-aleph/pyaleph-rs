@@ -57,6 +57,30 @@ impl MessageHandler for ProgramHandler {
         Ok(())
     }
 
+    async fn check_balance(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        let content = parse_content(message)?;
+
+        let payment = match content.payment {
+            Some(ref p) => p,
+            None => return Ok(()), // No payment info = no balance check
+        };
+
+        let cost_service = match ctx.cost.as_ref() {
+            Some(c) => c,
+            None => return Ok(()), // No cost service configured
+        };
+
+        let costs = cost_service.calculate_program_costs(&message.item_hash, &content);
+        let total_cost: rust_decimal::Decimal = costs.iter().map(|c| c.cost_hold).sum();
+
+        vm_common::validate_balance(
+            &content.address,
+            payment.payment_type.clone(),
+            total_cost,
+            ctx,
+        ).await
+    }
+
     async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
         let content = parse_content(message)?;
 
@@ -79,6 +103,15 @@ impl MessageHandler for ProgramHandler {
                 &message.item_hash,
                 content.time,
             ).await.map_err(HandlerError::Database)?;
+
+            // Store cost records
+            if let Some(ref cost_service) = ctx.cost {
+                let costs = cost_service.calculate_program_costs(&message.item_hash, &content);
+                if !costs.is_empty() {
+                    db.store_account_costs(&costs).await
+                        .map_err(HandlerError::Database)?;
+                }
+            }
         }
 
         tracing::info!(

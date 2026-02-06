@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::types::{Message, MessageType, ProcessingStatus, ErrorCode};
 use crate::services::crypto::CryptoService;
+use crate::services::cost::CostService;
 
 
 #[derive(Debug, Error)]
@@ -85,7 +86,7 @@ impl From<HandlerError> for ProcessingStatus {
 }
 
 /// Context for message processing
-/// 
+///
 /// Contains all services needed by handlers.
 pub struct HandlerContext {
     /// Database for persistence (abstract trait)
@@ -96,6 +97,8 @@ pub struct HandlerContext {
     pub ipfs: Option<Arc<dyn IpfsService>>,
     /// Storage service for cost calculation
     pub storage: Option<Arc<dyn StorageService>>,
+    /// Cost service for balance checking and cost calculation
+    pub cost: Option<Arc<CostService>>,
     /// Direct PostgreSQL pool for handlers that need it
     pub pool: Option<sqlx::PgPool>,
     /// Whether this message comes from a trusted source (indexer) - skip permission checks
@@ -109,11 +112,12 @@ impl HandlerContext {
             crypto: None,
             ipfs: None,
             storage: None,
+            cost: None,
             pool: None,
             trusted_source: false,
         }
     }
-    
+
     /// Create a context with all services
     pub fn with_services(
         db: Arc<dyn Database>,
@@ -124,6 +128,7 @@ impl HandlerContext {
             crypto: Some(crypto),
             ipfs: None,
             storage: None,
+            cost: None,
             pool: None,
             trusted_source: false,
         }
@@ -391,6 +396,15 @@ pub trait MessageHandler: Send + Sync {
         Ok(())
     }
     
+    /// Check if the message sender has sufficient balance for the operation.
+    ///
+    /// Called between check_permissions() and process() in the pipeline.
+    /// Default implementation does nothing (free message types like Aggregate, Post).
+    /// Override for Store, Program, Instance which have resource costs.
+    async fn check_balance(&self, _message: &Message, _ctx: &HandlerContext) -> Result<(), HandlerError> {
+        Ok(())
+    }
+
     /// Process the message
     async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError>;
 }
@@ -421,7 +435,13 @@ pub async fn process_message(message: &Message, ctx: &HandlerContext) -> Process
             return e.into();
         }
     }
-    
+
+    // Check balance (resource accounting for Store, Program, Instance)
+    if let Err(e) = handler.check_balance(message, ctx).await {
+        tracing::warn!("Message balance check failed: {}", e);
+        return e.into();
+    }
+
     // Process
     match handler.process(message, ctx).await {
         Ok(()) => ProcessingStatus::processed(),

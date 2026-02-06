@@ -52,6 +52,30 @@ impl MessageHandler for InstanceHandler {
         Ok(())
     }
 
+    async fn check_balance(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        let content = parse_content(message)?;
+
+        let payment = match content.payment {
+            Some(ref p) => p,
+            None => return Ok(()),
+        };
+
+        let cost_service = match ctx.cost.as_ref() {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        let costs = cost_service.calculate_instance_costs(&message.item_hash, &content);
+        let total_cost: rust_decimal::Decimal = costs.iter().map(|c| c.cost_hold).sum();
+
+        vm_common::validate_balance(
+            &content.address,
+            payment.payment_type.clone(),
+            total_cost,
+            ctx,
+        ).await
+    }
+
     async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
         let content = parse_content(message)?;
 
@@ -75,6 +99,15 @@ impl MessageHandler for InstanceHandler {
                 &message.item_hash,
                 content.time,
             ).await.map_err(HandlerError::Database)?;
+
+            // Store cost records
+            if let Some(ref cost_service) = ctx.cost {
+                let costs = cost_service.calculate_instance_costs(&message.item_hash, &content);
+                if !costs.is_empty() {
+                    db.store_account_costs(&costs).await
+                        .map_err(HandlerError::Database)?;
+                }
+            }
         }
 
         tracing::info!(

@@ -9,7 +9,8 @@
 use async_trait::async_trait;
 
 use crate::types::{Message, MessageType, StoreContent, ItemType};
-use super::{HandlerContext, HandlerError, MessageHandler, FilePinRecord, PinType, FileType, FileTagRecord};
+use crate::services::cost::defaults;
+use super::{HandlerContext, HandlerError, MessageHandler, FilePinRecord, PinType, FileType, FileTagRecord, AccountCostRecord};
 
 pub struct StoreHandler;
 
@@ -181,6 +182,70 @@ impl MessageHandler for StoreHandler {
         Ok(())
     }
 
+    async fn check_balance(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
+        let content_str = message.item_content.as_deref()
+            .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
+        let content: StoreContent = serde_json::from_str(content_str)
+            .map_err(|e| HandlerError::InvalidContent(e.to_string()))?;
+
+        let file_size = content.size.unwrap_or(0);
+
+        // Files under the free threshold don't need balance checking
+        if file_size <= MAX_FREE_FILE_SIZE {
+            return Ok(());
+        }
+
+        // Check if payment info is provided
+        let payment = match content.payment {
+            Some(ref p) => p,
+            None => return Ok(()), // No payment info = no balance check (legacy behavior)
+        };
+
+        let db = match ctx.db.as_ref() {
+            Some(db) => db,
+            None => return Ok(()),
+        };
+
+        let payment_type = match payment.payment_type {
+            crate::types::PaymentType::Hold => "hold",
+            crate::types::PaymentType::Credit => "credit",
+            crate::types::PaymentType::Superfluid => return Ok(()), // On-chain validation
+        };
+
+        let size_mib = rust_decimal::Decimal::from(file_size / (1024 * 1024));
+        let cost_hold = defaults::storage_holding() * size_mib;
+        let cost_credit = defaults::storage_credit() * size_mib;
+
+        let chain = payment.chain.to_string();
+        match payment_type {
+            "hold" => {
+                if let Some(balance) = db.get_balance(&content.address, &chain).await
+                    .map_err(|e| HandlerError::Database(e))?
+                {
+                    let total_existing = db.get_total_cost_for_address(&content.address, "hold").await
+                        .map_err(|e| HandlerError::Database(e))?;
+                    if balance < total_existing + cost_hold {
+                        return Err(HandlerError::InsufficientBalance);
+                    }
+                }
+            }
+            "credit" => {
+                if let Some(balance) = db.get_credit_balance(&content.address).await
+                    .map_err(|e| HandlerError::Database(e))?
+                {
+                    let total_existing = db.get_total_cost_for_address(&content.address, "credit").await
+                        .map_err(|e| HandlerError::Database(e))?;
+                    if balance < total_existing + cost_credit {
+                        return Err(HandlerError::InsufficientCredit);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     async fn process(&self, message: &Message, ctx: &HandlerContext) -> Result<(), HandlerError> {
         let content_str = message.item_content.as_deref()
             .ok_or_else(|| HandlerError::InvalidContent("Missing item_content".to_string()))?;
@@ -221,63 +286,33 @@ impl MessageHandler for StoreHandler {
             db.upsert_file_tag(&file_tag).await
                 .map_err(|e| HandlerError::Database(e))?;
 
-            // 4. Cost validation for large files
-            if file_size > MAX_FREE_FILE_SIZE {
-                // Calculate and store costs if payment info is provided
-                if let Some(ref payment) = content.payment {
-                    let payment_type = match payment.payment_type {
-                        crate::types::PaymentType::Hold => "hold",
-                        crate::types::PaymentType::Credit => "credit",
-                        crate::types::PaymentType::Superfluid => "superfluid",
-                    };
+            // 4. Store cost records for files with payment info
+            // Balance validation already happened in check_balance()
+            if let Some(ref payment) = content.payment {
+                let payment_type = match payment.payment_type {
+                    crate::types::PaymentType::Hold => "hold",
+                    crate::types::PaymentType::Credit => "credit",
+                    crate::types::PaymentType::Superfluid => "superfluid",
+                };
 
-                    let size_mib = rust_decimal::Decimal::from(file_size / (1024 * 1024));
-                    let cost_hold = crate::services::cost::defaults::storage_holding() * size_mib;
-                    let cost_credit = crate::services::cost::defaults::storage_credit() * size_mib;
+                let size_mib = rust_decimal::Decimal::from(file_size / (1024 * 1024));
+                let cost_hold = defaults::storage_holding() * size_mib;
+                let cost_credit = defaults::storage_credit() * size_mib;
 
-                    let cost_record = crate::handlers::AccountCostRecord {
-                        owner: content.address.clone(),
-                        item_hash: message.item_hash.clone(),
-                        cost_type: "STORAGE".to_string(),
-                        name: "storage".to_string(),
-                        ref_hash: Some(content.item_hash.clone()),
-                        payment_type: payment_type.to_string(),
-                        cost_hold,
-                        cost_stream: rust_decimal::Decimal::ZERO,
-                        cost_credit,
-                    };
+                let cost_record = AccountCostRecord {
+                    owner: content.address.clone(),
+                    item_hash: message.item_hash.clone(),
+                    cost_type: "STORAGE".to_string(),
+                    name: "storage".to_string(),
+                    ref_hash: Some(content.item_hash.clone()),
+                    payment_type: payment_type.to_string(),
+                    cost_hold,
+                    cost_stream: rust_decimal::Decimal::ZERO,
+                    cost_credit,
+                };
 
-                    // Validate balance covers cost
-                    let chain = payment.chain.to_string();
-                    match payment_type {
-                        "hold" => {
-                            if let Some(balance) = db.get_balance(&content.address, &chain).await
-                                .map_err(|e| HandlerError::Database(e))?
-                            {
-                                let total_existing = db.get_total_cost_for_address(&content.address, "hold").await
-                                    .map_err(|e| HandlerError::Database(e))?;
-                                if balance < total_existing + cost_hold {
-                                    return Err(HandlerError::InsufficientBalance);
-                                }
-                            }
-                        }
-                        "credit" => {
-                            if let Some(balance) = db.get_credit_balance(&content.address).await
-                                .map_err(|e| HandlerError::Database(e))?
-                            {
-                                let total_existing = db.get_total_cost_for_address(&content.address, "credit").await
-                                    .map_err(|e| HandlerError::Database(e))?;
-                                if balance < total_existing + cost_credit {
-                                    return Err(HandlerError::InsufficientCredit);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    db.store_account_costs(&[cost_record]).await
-                        .map_err(|e| HandlerError::Database(e))?;
-                }
+                db.store_account_costs(&[cost_record]).await
+                    .map_err(|e| HandlerError::Database(e))?;
             }
 
             tracing::debug!(
