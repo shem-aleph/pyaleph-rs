@@ -113,15 +113,18 @@ async fn main() -> anyhow::Result<()> {
             Ok(pool) => {
                 info!("Database connected and migrated");
 
-                // Run startup backfill (populate derived tables from messages)
-                match jobs::backfill::run_startup_backfill(&pool).await {
-                    Ok(result) => {
-                        info!("Startup backfill: {}", result);
+                // Run startup backfill in background (don't block API startup)
+                let backfill_pool = pool.clone();
+                tokio::spawn(async move {
+                    match jobs::backfill::run_startup_backfill(&backfill_pool).await {
+                        Ok(result) => {
+                            info!("Startup backfill: {}", result);
+                        }
+                        Err(e) => {
+                            warn!("Startup backfill failed (continuing anyway): {}", e);
+                        }
                     }
-                    Err(e) => {
-                        warn!("Startup backfill failed (continuing anyway): {}", e);
-                    }
-                }
+                });
 
                 let config_arc = Arc::new(config.clone());
                 
