@@ -4229,20 +4229,18 @@ pub async fn get_posts_v1(
 pub async fn get_metrics(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let messages_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
-        .fetch_one(state.db())
-        .await
-        .unwrap_or(0);
+    // Use pg_class for fast approximate counts (avoid full table scans)
+    let messages_count: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'messages'"
+    ).fetch_one(state.db()).await.unwrap_or(0);
 
-    let posts_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
-        .fetch_one(state.db())
-        .await
-        .unwrap_or(0);
+    let posts_count: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'posts'"
+    ).fetch_one(state.db()).await.unwrap_or(0);
 
-    let aggregates_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM aggregates")
-        .fetch_one(state.db())
-        .await
-        .unwrap_or(0);
+    let aggregates_count: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'aggregates'"
+    ).fetch_one(state.db()).await.unwrap_or(0);
 
     let metrics = format!(
         "# HELP aleph_messages_total Total messages in database\n# TYPE aleph_messages_total gauge\naleph_messages_total {}\n# HELP aleph_posts_total Total posts in database\n# TYPE aleph_posts_total gauge\naleph_posts_total {}\n# HELP aleph_aggregates_total Total aggregates in database\n# TYPE aleph_aggregates_total gauge\naleph_aggregates_total {}\n",
@@ -4281,22 +4279,29 @@ pub async fn get_monitor_stats(
         "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'rejected_messages'"
     ).fetch_one(db).await.unwrap_or((0,));
     
-    let posts: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts")
-        .fetch_one(db).await.unwrap_or((0,));
-    
-    let aggregates: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM aggregates")
-        .fetch_one(db).await.unwrap_or((0,));
-    
-    let programs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM programs")
-        .fetch_one(db).await.unwrap_or((0,));
-    
-    let instances: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM instances")
-        .fetch_one(db).await.unwrap_or((0,));
-    
-    let files: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM file_pins")
-        .fetch_one(db).await.unwrap_or((0,));
-    
-    // Messages by type for breakdown
+    // Use pg_class for fast approximate counts on large tables
+    let posts: (i64,) = sqlx::query_as(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'posts'"
+    ).fetch_one(db).await.unwrap_or((0,));
+
+    let aggregates: (i64,) = sqlx::query_as(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'aggregates'"
+    ).fetch_one(db).await.unwrap_or((0,));
+
+    let programs: (i64,) = sqlx::query_as(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'programs'"
+    ).fetch_one(db).await.unwrap_or((0,));
+
+    let instances: (i64,) = sqlx::query_as(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'instances'"
+    ).fetch_one(db).await.unwrap_or((0,));
+
+    let files: (i64,) = sqlx::query_as(
+        "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE relname = 'file_pins'"
+    ).fetch_one(db).await.unwrap_or((0,));
+
+    // Messages by type - use the index on message_type for a faster breakdown
+    // (still not instant on huge tables, but idx_messages_type helps)
     let by_type: Vec<(String, i64)> = sqlx::query_as(
         "SELECT message_type, COUNT(*) FROM messages GROUP BY message_type ORDER BY COUNT(*) DESC"
     ).fetch_all(db).await.unwrap_or_default();
@@ -4328,22 +4333,21 @@ pub async fn get_monitor_stats(
         types_map.insert(t, json!(count));
     }
 
-    // Content fetch stats — messages missing item_content
-    let missing_content: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM messages WHERE item_content IS NULL AND item_type IN ('storage', 'ipfs')"
-    ).fetch_one(db).await.unwrap_or((0,));
+    // Content fetch stats — single query with conditional counts (uses idx_messages_item_type)
+    let content_stats: (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE item_content IS NULL) AS missing,
+            COUNT(*) FILTER (WHERE item_content = '') AS unfetchable
+        FROM messages WHERE item_type IN ('storage', 'ipfs')"#
+    ).fetch_one(db).await.unwrap_or((0, 0, 0));
 
-    let total_non_inline: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM messages WHERE item_type IN ('storage', 'ipfs')"
-    ).fetch_one(db).await.unwrap_or((0,));
-
-    let marked_unfetchable: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM messages WHERE item_content = '' AND item_type IN ('storage', 'ipfs')"
-    ).fetch_one(db).await.unwrap_or((0,));
-
-    let fetched_content = total_non_inline.0 - missing_content.0 - marked_unfetchable.0;
-    let fetch_pct = if total_non_inline.0 > 0 {
-        (fetched_content as f64 / total_non_inline.0 as f64 * 100.0)
+    let total_non_inline = content_stats.0;
+    let missing_content = content_stats.1;
+    let marked_unfetchable = content_stats.2;
+    let fetched_content = total_non_inline - missing_content - marked_unfetchable;
+    let fetch_pct = if total_non_inline > 0 {
+        (fetched_content as f64 / total_non_inline as f64 * 100.0)
     } else { 0.0 };
 
     // Peer stats
@@ -4373,10 +4377,10 @@ pub async fn get_monitor_stats(
             "eta_human": eta_human
         },
         "content_fetch": {
-            "total_non_inline": total_non_inline.0,
+            "total_non_inline": total_non_inline,
             "fetched": fetched_content,
-            "missing": missing_content.0,
-            "unfetchable": marked_unfetchable.0,
+            "missing": missing_content,
+            "unfetchable": marked_unfetchable,
             "percent_complete": (fetch_pct * 10.0).round() / 10.0,
             "online_peers": online_peers.0
         }

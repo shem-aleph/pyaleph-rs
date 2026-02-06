@@ -583,6 +583,12 @@ async fn create_indexes(pool: &PgPool) -> Result<(), Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_forgotten_forget_hash ON forgotten_messages(forget_hash)")
         .execute(pool).await?;
     
+    // Messages additional indexes for monitoring queries
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_item_type ON messages(item_type)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC)")
+        .execute(pool).await?;
+
     // Peers indexes
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_peers_type ON peers(peer_type)")
         .execute(pool).await?;
