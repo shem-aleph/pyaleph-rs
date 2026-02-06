@@ -26,8 +26,9 @@
 ### Live Deployment
 
 A test node is running on Aleph Cloud:
-- **API**: `http://[2a01:240:ad00:2503:3:c670:f33c:c131]:8080/api/v0/`
-- **Status**: Syncing ~33k+ messages from multichain indexer
+- **API**: `https://stuff-column-mechanic-monitor.2n6.me/api/v0/`
+- **Health**: `https://stuff-column-mechanic-monitor.2n6.me/api/v0/health`
+- **Status**: Fully synced with P2P enabled (~1.9M+ messages)
 
 ## Performance
 

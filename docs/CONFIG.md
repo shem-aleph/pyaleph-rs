@@ -16,10 +16,10 @@ Configuration is loaded in order (later sources override earlier):
 All configuration options can be set via environment variables:
 
 ```bash
-# Format: ALEPH_{SECTION}_{KEY}
-export ALEPH_API_PORT=8080
-export ALEPH_DATABASE_URL="postgres://localhost/aleph"
-export ALEPH_CHAINS_ETHEREUM_RPC_URL="https://eth.llamarpc.com"
+# Format: ALEPH__{SECTION}__{KEY} (double underscore separator)
+export ALEPH__API__PORT=8080
+export ALEPH__DATABASE__URL="postgres://localhost/aleph"
+export ALEPH__CHAINS__ETHEREUM__RPC_URL="https://eth.llamarpc.com"
 ```
 
 ## Full Configuration Reference
@@ -318,6 +318,10 @@ dsn = "https://..."
 
 ## Docker Compose Example
 
+For a full deployment with P2P support, see `docker-compose.yml` in the repo root.
+
+Basic example without P2P:
+
 ```yaml
 version: '3.8'
 
@@ -325,9 +329,9 @@ services:
   aleph-core:
     image: aleph-core:latest
     environment:
-      - ALEPH_DATABASE_URL=postgres://aleph:password@postgres/aleph
-      - ALEPH_REDIS_URL=redis://redis:6379
-      - ALEPH_API_PORT=8080
+      - ALEPH__DATABASE__URL=postgres://aleph:password@postgres/aleph
+      - ALEPH__REDIS__URL=redis://redis:6379
+      - ALEPH__API__PORT=8080
     ports:
       - "8080:8080"
     depends_on:
@@ -351,4 +355,107 @@ services:
 volumes:
   pgdata:
   redisdata:
+```
+
+### Full Stack with P2P
+
+For P2P integration, you need RabbitMQ and the p2p-service:
+
+```yaml
+version: '3.8'
+
+services:
+  aleph-core:
+    image: aleph-core:latest
+    environment:
+      - ALEPH__DATABASE__URL=postgres://aleph:password@postgres/aleph
+      - ALEPH__REDIS__URL=redis://redis:6379
+      - ALEPH__RABBITMQ__URL=amqp://guest:guest@rabbitmq:5672
+      - ALEPH__RABBITMQ__ENABLED=true
+      - ALEPH__P2P__DAEMON_HOST=p2p-service
+      - ALEPH__P2P__CONTROL_PORT=4030
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+      - p2p-service
+
+  p2p-service:
+    image: alephim/p2p-service:0.1.4
+    volumes:
+      - ./config.yml:/etc/p2p-service/config.yml:ro
+      - ./keys/node-secret.pkcs8.der:/etc/p2p-service/node-secret.pkcs8.der:ro
+    command:
+      - "--config"
+      - "/etc/p2p-service/config.yml"
+      - "--private-key-file"
+      - "/etc/p2p-service/node-secret.pkcs8.der"
+    ports:
+      - "4025:4025"  # libp2p swarm
+      - "4030:4030"  # control port
+    depends_on:
+      - rabbitmq
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=aleph
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=aleph
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:
+```
+
+The p2p-service requires a `config.yml` with RabbitMQ and bootstrap peer settings:
+
+```yaml
+p2p:
+  port: 4025
+  control_port: 4030
+  peers:
+    - /dns/api2.aleph.im/tcp/4025/p2p/QmZkurbY2G2hWay59yiTgQNaQxHSNzKZFt2jbnwJhQcKgV
+    - /dns/api3.aleph.im/tcp/4025/p2p/Qmb5b2ZwJm9pVWrppf3D3iMF1bXbjZhbJTwGvKEBMZNxa2
+
+aleph:
+  queue_topic: ALEPH-TEST
+
+rabbitmq:
+  host: rabbitmq
+  port: 5672
+  username: guest
+  password: guest
+```
+
+Generate the node key (RSA 2048-bit PKCS8 DER format):
+
+```bash
+mkdir -p keys
+python3 -c "
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+der = key.private_bytes(
+    encoding=serialization.Encoding.DER,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption()
+)
+open('keys/node-secret.pkcs8.der', 'wb').write(der)
+"
 ```
