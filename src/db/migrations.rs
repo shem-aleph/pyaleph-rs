@@ -338,14 +338,14 @@ async fn create_vm_machine_volumes_table(pool: &PgPool) -> Result<(), Error> {
 async fn create_chain_txs_table(pool: &PgPool) -> Result<(), Error> {
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS chain_txs (
-            hash VARCHAR(100) NOT NULL,
+            hash VARCHAR(256) NOT NULL,
             chain VARCHAR(10) NOT NULL,
             height BIGINT NOT NULL,
             item_hash VARCHAR(128) NOT NULL,
             publisher VARCHAR(256),
             protocol VARCHAR(50) NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (hash, chain)
+            PRIMARY KEY (hash, item_hash)
         )
     "#)
     .execute(pool)

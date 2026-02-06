@@ -1035,6 +1035,14 @@ async fn rpc_sync_cycle(
     // Semaphore for limiting concurrent IPFS fetches
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IPFS));
 
+    // Build CID → event metadata mapping (for chain_txs confirmation records)
+    let mut cid_event_map: HashMap<String, &crate::chains::rpc_sync::DecodedAlephSyncEvent> = HashMap::new();
+    for event in &events {
+        if let Ok(parsed) = serde_json::from_str::<crate::chains::indexer::SyncMessageContent>(&event.message) {
+            cid_event_map.insert(parsed.content.clone(), event);
+        }
+    }
+
     // Parallel IPFS fetches for batch files
     let fetch_futures: Vec<_> = cids_to_fetch.iter().map(|(cid, _block)| {
         let sem = Arc::clone(&semaphore);
@@ -1047,24 +1055,38 @@ async fn rpc_sync_cycle(
             let _permit = sem.acquire().await.ok()?;
             // Try local IPFS first, then gateway
             match fetch_ipfs_with_retry(&client, &url, &cid, 2).await {
-                Ok(content) => Some(content),
+                Ok(content) => Some((cid, content)),
                 Err(_) => {
                     // Fallback to gateway
-                    fetch_from_gateway(&client, &gw, &cid, 2).await.ok()
+                    fetch_from_gateway(&client, &gw, &cid, 2).await.ok().map(|c| (cid, c))
                 }
             }
         }
     }).collect();
 
-    let ipfs_results: Vec<Option<String>> = futures::future::join_all(fetch_futures).await;
+    let ipfs_results: Vec<Option<(String, String)>> = futures::future::join_all(fetch_futures).await;
 
-    // Collect all messages from IPFS batches
+    // Collect all messages from IPFS batches, tracking CID provenance
     let mut all_messages: Vec<crate::types::Message> = Vec::new();
+    // Map item_hash → (tx_hash, block_number, publisher, timestamp_ms) for chain_txs
+    let mut confirmation_data: Vec<(String, String, u64, String, u64)> = Vec::new();
     let mut successful_fetches = 0;
 
     for result in ipfs_results.into_iter() {
-        if let Some(content) = result {
+        if let Some((cid, content)) = result {
             if let Ok(batch) = serde_json::from_str::<IpfsBatchContent>(&content) {
+                // Record confirmation data for each message in this batch
+                if let Some(event) = cid_event_map.get(&cid) {
+                    for msg in &batch.content.messages {
+                        confirmation_data.push((
+                            msg.item_hash.clone(),
+                            event.tx_hash.clone(),
+                            event.block_number,
+                            event.addr.clone(),
+                            event.timestamp,
+                        ));
+                    }
+                }
                 all_messages.extend(batch.content.messages);
                 successful_fetches += 1;
             }
@@ -1134,6 +1156,31 @@ async fn rpc_sync_cycle(
                 ).await;
             });
             info!("RPC sync: spawned background content resolution for {} messages", storage_count);
+        }
+    }
+
+    // Record chain_txs confirmations for all messages
+    if !confirmation_data.is_empty() {
+        let mut confirmed = 0u64;
+        for (item_hash, tx_hash, block_number, publisher, _timestamp_ms) in &confirmation_data {
+            let result = sqlx::query(
+                "INSERT INTO chain_txs (hash, chain, height, item_hash, publisher, protocol, created_at)
+                 VALUES ($1, 'ETH', $2, $3, $4, 'aleph-offchain', NOW())
+                 ON CONFLICT (hash, item_hash) DO NOTHING"
+            )
+            .bind(tx_hash)
+            .bind(*block_number as i64)
+            .bind(item_hash)
+            .bind(publisher)
+            .execute(pool)
+            .await;
+
+            if let Ok(r) = result {
+                confirmed += r.rows_affected();
+            }
+        }
+        if confirmed > 0 {
+            info!("RPC sync: recorded {} chain confirmations", confirmed);
         }
     }
 
