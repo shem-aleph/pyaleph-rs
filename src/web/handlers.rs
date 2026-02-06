@@ -82,10 +82,15 @@ pub struct MessageResponse {
     pub item_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_content: Option<String>,
+    /// Parsed item_content as JSON (pyaleph compat)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
     /// Timestamp as Unix timestamp (seconds)
     pub time: f64,
+    /// Size of item_content in bytes
+    pub size: i64,
     /// Chain confirmations
     pub confirmations: Vec<ConfirmationResponse>,
     /// Whether message has any confirmations
@@ -103,6 +108,9 @@ pub struct ConfirmationResponse {
 impl MessageResponse {
     fn from_db(msg: &crate::db::models::MessageDb, confirmations: Vec<ConfirmationResponse>) -> Self {
         let confirmed = !confirmations.is_empty();
+        let size = msg.item_content.as_ref().map(|c| c.len() as i64).unwrap_or(0);
+        let content = msg.item_content.as_ref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
         Self {
             message_type: msg.message_type.clone(),
             chain: msg.chain.clone(),
@@ -111,8 +119,10 @@ impl MessageResponse {
             item_type: msg.item_type.clone(),
             item_hash: msg.item_hash.clone(),
             item_content: msg.item_content.clone(),
+            content,
             channel: msg.channel.clone(),
             time: msg.time,
+            size,
             confirmations,
             confirmed,
         }

@@ -640,7 +640,7 @@ async fn store_processed_message(db: &PgPool, message: &Message) -> Result<(), P
     .bind(format!("{:?}", message.item_type).to_lowercase())
     .bind(&message.item_content)
     .bind(&message.channel)
-    .bind(message.time)
+    .bind(normalize_timestamp(message.time))
     .execute(db)
     .await
     .map_err(|e| ProcessorError::Database(e.to_string()))?;
@@ -673,6 +673,12 @@ pub enum ProcessorError {
     
     #[error("Handler error: {0}")]
     Handler(String),
+}
+
+/// Normalize a timestamp to seconds.  Some messages arrive with time in
+/// milliseconds (> year 2286 in seconds).  Threshold: 10_000_000_000.
+fn normalize_timestamp(t: f64) -> f64 {
+    if t > 10_000_000_000.0 { t / 1000.0 } else { t }
 }
 
 /// Job statistics
