@@ -37,8 +37,19 @@ All notable changes to pyaleph-rs will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Ethereum sync hash queuing - IPFS batch CIDs from sync events now queued to pending_messages for processing
+- Tezos signature acceptance - tz1/tz2/tz3 addresses now accepted (full verification pending)
+- Real TCP P2P networking with length-prefixed JSON framing
+- Local storage module with disk-backed content cache and two-level directory sharding
+- Schema validation module for message content (validates all 6 message types before handler dispatch)
+- Monitor dashboard with real-time stats (`/api/v0/monitor`)
+
+### Fixed
+- Orphaned file pins now cleaned up by garbage collector
+- Query filtering for accessor functions
+
 ### Planned
-- P2P network discovery and federation
 - Full balance tracking from staking contracts
 - Metrics dashboard
 - Docker compose deployment template
