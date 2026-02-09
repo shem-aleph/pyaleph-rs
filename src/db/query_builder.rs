@@ -248,9 +248,9 @@ impl QueryBuilder {
     }
     
     /// Add ORDER BY clause
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `column` - Column to order by (must be a valid column name)
     /// * `ascending` - true for ASC, false for DESC
     pub fn order_by(&mut self, column: &str, ascending: bool) -> &mut Self {
@@ -258,9 +258,18 @@ impl QueryBuilder {
         if !column.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
             panic!("Invalid column name: {}", column);
         }
-        
+
         let direction = if ascending { "ASC" } else { "DESC" };
         self.query.push_str(&format!(" ORDER BY {} {}", column, direction));
+        self
+    }
+
+    /// Add a raw ORDER BY clause for complex multi-column sorting
+    ///
+    /// The clause should NOT include "ORDER BY" — just the column expressions.
+    /// Only safe for static/hardcoded clauses, not user input.
+    pub fn order_by_raw(&mut self, clause: &str) -> &mut Self {
+        self.query.push_str(&format!(" ORDER BY {}", clause));
         self
     }
     

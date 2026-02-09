@@ -242,8 +242,26 @@ pub async fn list_messages(
         }));
     }
     
+    // Determine if we need a LEFT JOIN for tx-time sorting
+    let needs_tx_time_join = matches!(params.sort_by, Some(SortBy::TxTime))
+        || params.start_block.is_some()
+        || params.end_block.is_some();
+
     // Build query with safe parameterized filters
-    let mut builder = crate::db::QueryBuilder::new("SELECT * FROM messages WHERE 1=1");
+    // When sort_by=tx-time or block filters are present, LEFT JOIN chain_txs
+    // to get the earliest confirmation time (matching pyaleph behavior).
+    // Note: our chain_txs.created_at is the insertion time, not the blockchain
+    // datetime (which pyaleph stores as chain_txs.datetime). This is the best
+    // approximation we have.
+    let base_query = if needs_tx_time_join {
+        "SELECT messages.* FROM messages \
+         LEFT JOIN (SELECT item_hash, MIN(created_at) as earliest_confirmation \
+         FROM chain_txs GROUP BY item_hash) ct \
+         ON ct.item_hash = messages.item_hash WHERE 1=1"
+    } else {
+        "SELECT * FROM messages WHERE 1=1"
+    };
+    let mut builder = crate::db::QueryBuilder::new(base_query);
 
     // Exclude forgotten messages unless explicitly requested via msgStatuses=forgotten
     let include_forgotten = status_list.iter().any(|s| s == "forgotten");
@@ -372,23 +390,38 @@ pub async fn list_messages(
         builder.and_raw(&block_filter);
     }
     
-    // Order and pagination - use sortBy to determine column
-    let order_column = match params.sort_by {
-        Some(SortBy::TxTime) => "created_at",
-        Some(SortBy::Time) | None => "time",
-    };
+    // Order and pagination
     // Support both order and sortOrder params (sortOrder takes precedence)
     let order_value = params.sort_order.or(params.order);
     let ascending = order_value.map(|o| o == 1).unwrap_or(false);
-    builder.order_by(order_column, ascending);
+
+    if needs_tx_time_join {
+        // Sort by earliest chain confirmation time, with NULLS handling
+        // and secondary sorts for deterministic ordering (matches pyaleph)
+        if ascending {
+            builder.order_by_raw("ct.earliest_confirmation ASC NULLS LAST, messages.time ASC, messages.item_hash ASC");
+        } else {
+            builder.order_by_raw("ct.earliest_confirmation DESC NULLS FIRST, messages.time DESC, messages.item_hash ASC");
+        }
+    } else {
+        // Sort by message time with secondary sort on item_hash for determinism
+        if ascending {
+            builder.order_by_raw("time ASC, item_hash ASC");
+        } else {
+            builder.order_by_raw("time DESC, item_hash ASC");
+        }
+    }
     builder.limit(per_page as i64);
     builder.offset(offset);
     
-    // Get total count first (before consuming args)
-    let count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
-    // Re-apply the same filters for count
+    // Get total count - re-apply the same filters for count query
     let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
-    
+
+    // Exclude forgotten messages (must match the data query filter)
+    if !include_forgotten {
+        count_builder.and_raw("NOT EXISTS (SELECT 1 FROM forgotten_messages WHERE forgotten_messages.item_hash = messages.item_hash)");
+    }
+
     if let Some(ref addresses) = params.addresses {
         let addr_list = crate::db::parse_csv_param(addresses);
         if !addr_list.is_empty() {
