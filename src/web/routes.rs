@@ -166,7 +166,7 @@ pub fn api_ws0() -> Router<Arc<AppState>> {
 }
 
 /// Legacy routes for backwards compatibility
-fn legacy_routes() -> Router<Arc<AppState>> {
+pub fn legacy_routes() -> Router<Arc<AppState>> {
     Router::new()
         // PubSub publish endpoints (legacy root-level paths)
         .route("/ipfs/pubsub/pub", post(handlers::pub_json))
@@ -185,14 +185,11 @@ fn legacy_routes() -> Router<Arc<AppState>> {
         .route("/metrics", get(handlers::prometheus_metrics))
         // Metrics JSON
         .route("/metrics.json", get(handlers::metrics_json))
-
-        // Health check
-        .route("/", get(handlers::health_check))
-        .route("/health", get(handlers::health_check))
+        // Note: / and /health are registered directly in web/mod.rs::create_router
 }
 
 /// Internal/admin routes
-fn internal_routes() -> Router<Arc<AppState>> {
+pub fn internal_routes() -> Router<Arc<AppState>> {
     Router::new()
         // Prometheus metrics
         .route("/metrics", get(handlers::prometheus_metrics))

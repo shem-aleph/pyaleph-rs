@@ -179,19 +179,25 @@ pub fn create_router(config: &Config, state: Arc<AppState>) -> Router {
         .route("/", axum::routing::get(handlers::health_check))
         .route("/health", axum::routing::get(handlers::health_check))
         .route("/monitor.html", axum::routing::get(handlers::monitor_html))
-        
+
         // WebSocket endpoint
         .route("/ws", axum::routing::get(websocket::ws_handler))
-        
+
         // API v0 routes (compatibility with pyaleph)
         .nest("/api/v0", routes::api_v0())
-        
+
         // API v1 routes
         .nest("/api/v1", routes::api_v1())
-        
+
         // API ws0 routes (WebSocket compatibility)
         .nest("/api/ws0", routes::api_ws0())
-        
+
+        // Legacy routes (backwards compatibility with pyaleph root-level paths)
+        .merge(routes::legacy_routes())
+
+        // Internal/admin routes
+        .nest("/_internal", routes::internal_routes())
+
         // State and middleware
         .with_state(state)
         .layer(cors)
