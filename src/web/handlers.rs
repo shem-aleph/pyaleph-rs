@@ -546,27 +546,29 @@ pub async fn list_messages(
     let mut confirmations_map: HashMap<String, Vec<ConfirmationResponse>> = HashMap::new();
     
     if !item_hashes.is_empty() {
-        // Build parameterized IN query for confirmations
-        let placeholders: Vec<String> = (1..=item_hashes.len())
-            .map(|i| format!("${}", i))
-            .collect();
-        let query = format!(
-            "SELECT item_hash, chain, hash, height FROM chain_txs WHERE item_hash IN ({})",
-            placeholders.join(", ")
-        );
-        
-        let mut q = sqlx::query_as::<_, (String, String, String, i64)>(&query);
-        for hash in &item_hashes {
-            q = q.bind(hash);
-        }
-        
-        let confirmations = q.fetch_all(state.db()).await.unwrap_or_default();
-        
-        for (item_hash, chain, hash, height) in confirmations {
-            confirmations_map
-                .entry(item_hash)
-                .or_insert_with(Vec::new)
-                .push(ConfirmationResponse { chain, hash, height: height as u64 });
+        // Batch fetch confirmations in chunks to avoid exceeding PostgreSQL's u16::MAX param limit
+        for chunk in item_hashes.chunks(10_000) {
+            let placeholders: Vec<String> = (1..=chunk.len())
+                .map(|i| format!("${}", i))
+                .collect();
+            let query = format!(
+                "SELECT item_hash, chain, hash, height FROM chain_txs WHERE item_hash IN ({})",
+                placeholders.join(", ")
+            );
+
+            let mut q = sqlx::query_as::<_, (String, String, String, i64)>(&query);
+            for hash in chunk {
+                q = q.bind(hash);
+            }
+
+            let confirmations = q.fetch_all(state.db()).await.unwrap_or_default();
+
+            for (item_hash, chain, hash, height) in confirmations {
+                confirmations_map
+                    .entry(item_hash)
+                    .or_insert_with(Vec::new)
+                    .push(ConfirmationResponse { chain, hash, height: height as u64 });
+            }
         }
     }
     
@@ -1426,26 +1428,29 @@ pub async fn get_posts(
     let mut confirmations_map: HashMap<String, Vec<ConfirmationResponse>> = HashMap::new();
 
     if !coalesced_hashes.is_empty() {
-        let placeholders: Vec<String> = (1..=coalesced_hashes.len())
-            .map(|i| format!("${}", i))
-            .collect();
-        let conf_query = format!(
-            "SELECT item_hash, chain, hash, height FROM chain_txs WHERE item_hash IN ({})",
-            placeholders.join(", ")
-        );
+        // Batch in chunks to avoid exceeding PostgreSQL's u16::MAX param limit
+        for chunk in coalesced_hashes.chunks(10_000) {
+            let placeholders: Vec<String> = (1..=chunk.len())
+                .map(|i| format!("${}", i))
+                .collect();
+            let conf_query = format!(
+                "SELECT item_hash, chain, hash, height FROM chain_txs WHERE item_hash IN ({})",
+                placeholders.join(", ")
+            );
 
-        let mut q = sqlx::query_as::<_, (String, String, String, i64)>(&conf_query);
-        for hash in &coalesced_hashes {
-            q = q.bind(hash);
-        }
+            let mut q = sqlx::query_as::<_, (String, String, String, i64)>(&conf_query);
+            for hash in chunk {
+                q = q.bind(hash);
+            }
 
-        let confirmations = q.fetch_all(state.db()).await.unwrap_or_default();
+            let confirmations = q.fetch_all(state.db()).await.unwrap_or_default();
 
-        for (item_hash, chain, hash, height) in confirmations {
-            confirmations_map
-                .entry(item_hash)
-                .or_insert_with(Vec::new)
-                .push(ConfirmationResponse { chain, hash, height: height as u64 });
+            for (item_hash, chain, hash, height) in confirmations {
+                confirmations_map
+                    .entry(item_hash)
+                    .or_insert_with(Vec::new)
+                    .push(ConfirmationResponse { chain, hash, height: height as u64 });
+            }
         }
     }
     
