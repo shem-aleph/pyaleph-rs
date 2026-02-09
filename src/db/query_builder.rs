@@ -145,7 +145,65 @@ impl QueryBuilder {
         self
     }
 
-    
+    /// Add an AND < condition (strict less-than)
+    pub fn and_lt<T: sqlx::Encode<'static, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> + Send + 'static>(
+        &mut self,
+        column: &str,
+        value: T,
+    ) -> &mut Self {
+        let clause = format!(" AND {} < ${}", column, self.param_index);
+        self.query.push_str(&clause);
+        self.count_query.push_str(&clause);
+        let _ = self.args.add(value);
+        self.param_index += 1;
+        self
+    }
+
+    /// Add an AND condition checking if JSONB array contains ANY of the given values (OR logic)
+    /// Uses the `?|` operator: `(column::jsonb->'path') ?| ARRAY[$1, $2, ...]`
+    /// Supports nested paths like "content.tags"
+    pub fn and_jsonb_has_any(&mut self, column: &str, json_path: &str, values: &[String]) -> &mut Self {
+        if values.is_empty() {
+            return self;
+        }
+
+        // Validate column and path names
+        if !column.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            panic!("Invalid column name: {}", column);
+        }
+        if !json_path.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            panic!("Invalid json path: {}", json_path);
+        }
+
+        let placeholders: Vec<String> = (0..values.len())
+            .map(|i| format!("${}", self.param_index + i as i32))
+            .collect();
+
+        // Handle nested paths - convert "content.tags" to path array
+        let path_parts: Vec<&str> = json_path.split('.').collect();
+        let clause = if path_parts.len() > 1 {
+            let path_array = path_parts.join(",");
+            format!(
+                " AND ({}::jsonb #> '{{{}}}') ?| ARRAY[{}]",
+                column, path_array, placeholders.join(", ")
+            )
+        } else {
+            format!(
+                " AND ({}::jsonb->'{}') ?| ARRAY[{}]",
+                column, json_path, placeholders.join(", ")
+            )
+        };
+        self.query.push_str(&clause);
+        self.count_query.push_str(&clause);
+
+        for value in values {
+            let _ = self.args.add(value.clone());
+            self.param_index += 1;
+        }
+
+        self
+    }
+
     /// Add a raw AND condition (use carefully - values in the clause are NOT parameterized)
     ///
     /// This is intended for subqueries or complex conditions that cannot be expressed

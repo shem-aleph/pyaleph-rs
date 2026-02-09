@@ -204,11 +204,12 @@ pub async fn list_messages(
 ) -> impl IntoResponse {
     let page = params.page.unwrap_or(1);
     // Support both 'limit' and 'pagination' parameters (limit takes precedence)
-    // pagination=0 means "no limit" (pyaleph compat) — cap at 10,000
+    // pagination=0 means "no limit" (pyaleph compat)
     let raw_pagination = params.limit.or(params.pagination).unwrap_or(20);
-    let per_page = if raw_pagination == 0 { 10_000 } else { raw_pagination.min(1000) };
-    let offset = ((page - 1) * per_page) as i64;
-    
+    let unlimited = raw_pagination == 0;
+    let per_page = if unlimited { 0 } else { raw_pagination.min(1000) };
+    let offset = if unlimited { 0 } else { ((page - 1) * per_page) as i64 };
+
     // Merge msgType and msgTypes (msgType takes precedence)
     let message_type_filter = params.message_type.or(params.message_types);
     
@@ -277,9 +278,14 @@ pub async fn list_messages(
         }
     }
     
-    // Parse message type filter (parameterized)
+    // Parse message type filter (parameterized) - supports comma-separated list
     if let Some(ref msg_type) = message_type_filter {
-        builder.and_eq("message_type", msg_type.to_uppercase());
+        let type_list: Vec<String> = crate::db::parse_csv_param(msg_type).iter().map(|t| t.to_uppercase()).collect();
+        if type_list.len() == 1 {
+            builder.and_eq("message_type", type_list[0].clone());
+        } else if !type_list.is_empty() {
+            builder.and_in("message_type", &type_list);
+        }
     }
     
     // Parse channels filter (parameterized)
@@ -314,11 +320,11 @@ pub async fn list_messages(
         }
     }
     
-    // Parse tags filter (content.content.tags array - requires JSONB containment)
+    // Parse tags filter (content.content.tags array - OR logic matching pyaleph ?| operator)
     if let Some(ref tags) = params.tags {
         let tag_list = crate::db::parse_csv_param(tags);
-        for tag in tag_list {
-            builder.and_jsonb_array_contains("item_content", "content.tags", tag);
+        if !tag_list.is_empty() {
+            builder.and_jsonb_has_any("item_content", "content.tags", &tag_list);
         }
     }
     
@@ -361,12 +367,12 @@ pub async fn list_messages(
         }
     }
 
-    // Time filters (parameterized)
+    // Time filters (parameterized) - endDate uses strict less-than to match pyaleph
     if let Some(start) = params.start_date {
         builder.and_gte("time", start);
     }
     if let Some(end) = params.end_date {
-        builder.and_lte("time", end);
+        builder.and_lt("time", end);
     }
     
     // Block number filters (via chain_txs JOIN)
@@ -411,9 +417,11 @@ pub async fn list_messages(
             builder.order_by_raw("time DESC, item_hash ASC");
         }
     }
-    builder.limit(per_page as i64);
-    builder.offset(offset);
-    
+    if !unlimited {
+        builder.limit(per_page as i64);
+        builder.offset(offset);
+    }
+
     // Get total count - re-apply the same filters for count query
     let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
 
@@ -429,7 +437,12 @@ pub async fn list_messages(
         }
     }
     if let Some(ref msg_type) = message_type_filter {
-        count_builder.and_eq("message_type", msg_type.to_uppercase());
+        let type_list: Vec<String> = crate::db::parse_csv_param(msg_type).iter().map(|t| t.to_uppercase()).collect();
+        if type_list.len() == 1 {
+            count_builder.and_eq("message_type", type_list[0].clone());
+        } else if !type_list.is_empty() {
+            count_builder.and_in("message_type", &type_list);
+        }
     }
     if let Some(ref channels) = params.channels {
         let channel_list = crate::db::parse_csv_param(channels);
@@ -458,8 +471,8 @@ pub async fn list_messages(
     }
     if let Some(ref tags) = params.tags {
         let tag_list = crate::db::parse_csv_param(tags);
-        for tag in tag_list {
-            count_builder.and_jsonb_array_contains("item_content", "content.tags", tag.clone());
+        if !tag_list.is_empty() {
+            count_builder.and_jsonb_has_any("item_content", "content.tags", &tag_list);
         }
     }
     if let Some(ref content_types) = params.content_types {
@@ -496,7 +509,7 @@ pub async fn list_messages(
         count_builder.and_gte("time", start);
     }
     if let Some(end) = params.end_date {
-        count_builder.and_lte("time", end);
+        count_builder.and_lt("time", end);
     }
 
     // Block number filters for count query
@@ -572,7 +585,7 @@ pub async fn list_messages(
         "messages": message_responses,
         "pagination_total": total.0,
         "pagination_page": page,
-        "pagination_per_page": per_page,
+        "pagination_per_page": if unlimited { raw_pagination } else { per_page },
         "pagination_item": "messages",
     }))
 }
@@ -627,26 +640,62 @@ pub async fn get_message(
             })))
         }
         Ok(None) => {
-            // Check if it's pending and get reception_time
-            let pending = sqlx::query_as::<_, (String, f64)>(
-                "SELECT item_hash, reception_time FROM pending_messages WHERE item_hash = $1 LIMIT 1"
+            // Check if it's pending - include message content in response
+            let pending = sqlx::query_as::<_, (String, f64, serde_json::Value)>(
+                "SELECT item_hash, reception_time, message FROM pending_messages WHERE item_hash = $1 LIMIT 1"
             )
             .bind(&hash)
             .fetch_optional(state.db())
             .await
             .unwrap_or(None);
 
-            if let Some((_item_hash, reception_time)) = pending {
-                (StatusCode::OK, Json(json!({
+            if let Some((_item_hash, reception_time, message)) = pending {
+                return (StatusCode::OK, Json(json!({
                     "status": "pending",
                     "item_hash": hash,
                     "reception_time": reception_time,
-                })))
-            } else {
-                (StatusCode::NOT_FOUND, Json(json!({
-                    "error": "Message not found"
-                })))
+                    "messages": [message],
+                })));
             }
+
+            // Check forgotten messages
+            let forgotten = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM forgotten_messages WHERE item_hash = $1)"
+            )
+            .bind(&hash)
+            .fetch_one(state.db())
+            .await
+            .unwrap_or(false);
+
+            if forgotten {
+                return (StatusCode::OK, Json(json!({
+                    "status": "forgotten",
+                    "item_hash": hash,
+                })));
+            }
+
+            // Check rejected messages
+            let rejected = sqlx::query_as::<_, (i32, Option<String>)>(
+                "SELECT error_code, error_message FROM rejected_messages WHERE item_hash = $1"
+            )
+            .bind(&hash)
+            .fetch_optional(state.db())
+            .await
+            .ok()
+            .flatten();
+
+            if let Some((code, message)) = rejected {
+                return (StatusCode::OK, Json(json!({
+                    "status": "rejected",
+                    "item_hash": hash,
+                    "error_code": code,
+                    "error_message": message,
+                })));
+            }
+
+            (StatusCode::NOT_FOUND, Json(json!({
+                "error": "Message not found"
+            })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
             "status": "error",
@@ -667,35 +716,40 @@ pub async fn get_message_status(
         })));
     }
     
-    // Check processed messages
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM messages WHERE item_hash = $1)"
+    // Check processed messages - include reception_time (created_at)
+    let processed = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>,)>(
+        "SELECT created_at FROM messages WHERE item_hash = $1"
     )
     .bind(&hash)
-    .fetch_one(state.db())
+    .fetch_optional(state.db())
     .await
-    .unwrap_or(false);
-    
-    if exists {
+    .ok()
+    .flatten();
+
+    if let Some((created_at,)) = processed {
+        let reception_time = created_at.timestamp() as f64;
         return (StatusCode::OK, Json(json!({
             "status": "processed",
             "item_hash": hash,
+            "reception_time": reception_time,
         })));
     }
-    
-    // Check pending messages
-    let pending = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM pending_messages WHERE item_hash = $1)"
+
+    // Check pending messages - include reception_time
+    let pending = sqlx::query_as::<_, (f64,)>(
+        "SELECT reception_time FROM pending_messages WHERE item_hash = $1 LIMIT 1"
     )
     .bind(&hash)
-    .fetch_one(state.db())
+    .fetch_optional(state.db())
     .await
-    .unwrap_or(false);
-    
-    if pending {
+    .ok()
+    .flatten();
+
+    if let Some((reception_time,)) = pending {
         return (StatusCode::OK, Json(json!({
             "status": "pending",
             "item_hash": hash,
+            "reception_time": reception_time,
         })));
     }
     
@@ -907,9 +961,12 @@ pub struct AggregateQuery {
 /// - value_only: return just the aggregate values (only if single key requested)
 pub async fn get_aggregates(
     State(state): State<Arc<AppState>>,
-    Path(address): Path<String>,
+    Path(raw_address): Path<String>,
     Query(params): Query<AggregateQuery>,
 ) -> impl IntoResponse {
+    // Strip .json suffix if present (pyaleph compat: /aggregates/0xaddr.json)
+    let address = raw_address.strip_suffix(".json").unwrap_or(&raw_address).to_string();
+
     if !state.has_db() {
         return (StatusCode::OK, Json(json!({
             "address": address,
@@ -1047,11 +1104,10 @@ pub async fn get_aggregates(
             })));
         }
 
-        // Handle value_only - only works for single key
+        // Handle value_only - works regardless of with_info (3.1.4)
         if value_only {
             if let Some(ref keys) = key_list {
                 if keys.len() == 1 {
-                    // Find the matching aggregate and return just its value
                     for (key, content) in &aggregates {
                         if key == &keys[0] {
                             return (StatusCode::OK, Json(content.clone()));
@@ -1067,9 +1123,11 @@ pub async fn get_aggregates(
             data.insert(key, content);
         }
 
+        // Always include info key (empty object when with_info=false) to match pyaleph
         (StatusCode::OK, Json(json!({
             "address": address,
             "data": data,
+            "info": {},
         })))
     }
 }
@@ -1140,14 +1198,11 @@ pub struct PostResponseV0 {
     pub sender: String,
     pub signature: String,
     pub item_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub item_content: Option<String>,
     pub size: i64,
     pub confirmed: bool,
     pub confirmations: Vec<ConfirmationResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub original_signature: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub original_type: Option<String>,
 }
 
@@ -1159,10 +1214,11 @@ pub async fn get_posts(
 ) -> impl IntoResponse {
     let page = params.page.unwrap_or(1);
     // Support both limit and pagination parameters (limit takes precedence)
-    // pagination=0 means "no limit" (pyaleph compat) — cap at 10,000
+    // pagination=0 means "no limit" (pyaleph compat)
     let raw_pagination = params.limit.or(params.pagination).unwrap_or(20);
-    let per_page = if raw_pagination == 0 { 10_000 } else { raw_pagination.min(1000) };
-    let offset = ((page - 1) * per_page) as i64;
+    let posts_unlimited = raw_pagination == 0;
+    let per_page = if posts_unlimited { 0 } else { raw_pagination.min(1000) };
+    let offset = if posts_unlimited { 0 } else { ((page - 1) * per_page) as i64 };
 
     // Merge order and sort_order (order takes precedence)
     let order_param = params.order.or(params.sort_order);
@@ -1172,15 +1228,40 @@ pub async fn get_posts(
             "posts": [],
             "pagination_total": 0,
             "pagination_page": page,
-            "pagination_per_page": per_page,
+            "pagination_per_page": if posts_unlimited { raw_pagination } else { per_page },
         }));
     }
-    
+
+    // Determine if we need tx-time join for posts
+    let posts_needs_tx_time = matches!(params.sort_by.as_deref(), Some("tx-time"));
+
     // Build merged post query matching Python pyaleph's make_select_merged_post_with_message_info_stmt()
     // - Only return originals (p.amends IS NULL)
     // - LEFT JOIN latest amend for content/type coalescing
     // - LEFT JOIN messages for both original and amend message-level fields
-    let mut builder = crate::db::QueryBuilder::new(
+    let base_posts_query = if posts_needs_tx_time {
+        "SELECT p.item_hash AS original_item_hash, \
+         COALESCE(a.item_hash, p.item_hash) AS item_hash, \
+         p.address, \
+         COALESCE(a.post_type, p.post_type) AS post_type, \
+         COALESCE(a.content, p.content) AS content, \
+         p.ref_, p.channel, \
+         COALESCE(a.time, p.time) AS time, \
+         om.chain, om.sender, \
+         COALESCE(am.signature, om.signature) AS signature, \
+         COALESCE(am.item_type, om.item_type) AS item_type, \
+         CASE WHEN am.item_content IS NOT NULL THEN am.item_content ELSE om.item_content END AS item_content, \
+         om.signature AS original_signature, \
+         p.post_type AS original_type \
+         FROM posts p \
+         LEFT JOIN posts a ON p.latest_amend = a.item_hash \
+         LEFT JOIN messages om ON p.item_hash = om.item_hash \
+         LEFT JOIN messages am ON a.item_hash = am.item_hash \
+         LEFT JOIN (SELECT item_hash, MIN(created_at) as earliest_confirmation \
+         FROM chain_txs GROUP BY item_hash) ct \
+         ON ct.item_hash = COALESCE(a.item_hash, p.item_hash) \
+         WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
+    } else {
         "SELECT p.item_hash AS original_item_hash, \
          COALESCE(a.item_hash, p.item_hash) AS item_hash, \
          p.address, \
@@ -1199,7 +1280,8 @@ pub async fn get_posts(
          LEFT JOIN messages om ON p.item_hash = om.item_hash \
          LEFT JOIN messages am ON a.item_hash = am.item_hash \
          WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
-    );
+    };
+    let mut builder = crate::db::QueryBuilder::new(base_posts_query);
     let mut count_builder = crate::db::QueryBuilder::new(
         "SELECT COUNT(*) FROM posts p \
          LEFT JOIN posts a ON p.latest_amend = a.item_hash \
@@ -1251,45 +1333,54 @@ pub async fn get_posts(
         }
     }
     
-    // Time filters
+    // Time filters - use COALESCE(a.created_at, p.created_at) for date filtering (matches pyaleph)
     if let Some(start) = params.start_date {
-        builder.and_gte("p.time", start);
-        count_builder.and_gte("p.time", start);
+        builder.and_raw(&format!("COALESCE(a.time, p.time) >= {}", start));
+        count_builder.and_raw(&format!("COALESCE(a.time, p.time) >= {}", start));
     }
     if let Some(end) = params.end_date {
-        builder.and_lte("p.time", end);
-        count_builder.and_lte("p.time", end);
+        builder.and_raw(&format!("COALESCE(a.time, p.time) < {}", end));
+        count_builder.and_raw(&format!("COALESCE(a.time, p.time) < {}", end));
     }
-    
-    // Filter by tags - checks posts.content (inner content) for tags array
-    // Matching Python pyaleph: content->'tags' has_any ARRAY[tag values]
+
+    // Filter by tags - OR logic matching pyaleph's ?| operator
     if let Some(ref tags) = params.tags {
         let tag_list = crate::db::parse_csv_param(tags);
-        for tag in tag_list {
-            let check_obj = serde_json::json!({"tags": [&tag]});
-            let check_str = check_obj.to_string().replace('\'', "''");
-            let clause = format!("COALESCE(a.content, p.content) @> '{}'::jsonb", check_str);
+        if !tag_list.is_empty() {
+            let keys_array: Vec<String> = tag_list.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect();
+            let clause = format!(
+                "(COALESCE(a.content, p.content)->'tags') ?| ARRAY[{}]",
+                keys_array.join(", ")
+            );
             builder.and_raw(&clause);
             count_builder.and_raw(&clause);
         }
     }
     
     // Determine sort column (validate against allowed columns)
+    let needs_tx_time = matches!(params.sort_by.as_deref(), Some("tx-time"));
     let sort_column = match params.sort_by.as_deref() {
         Some("time") | None => "COALESCE(a.time, p.time)".to_string(),
         Some("address") => "p.address".to_string(),
         Some("post_type") => "p.post_type".to_string(),
         Some("channel") => "p.channel".to_string(),
-        Some("tx-time") => "om.created_at".to_string(),
+        Some("tx-time") => "ct.earliest_confirmation".to_string(),
         _ => "COALESCE(a.created_at, p.created_at)".to_string(),
     };
-    
+
     // Order: 1 = ascending, -1 = descending (default)
     let ascending = order_param.map(|o| o == 1).unwrap_or(false);
-    
-    // Add raw ORDER BY since we have table prefix
+
+    // Add raw ORDER BY with secondary sort on original_item_hash for determinism
     let order_dir = if ascending { "ASC" } else { "DESC" };
-    builder.and_raw(&format!("1=1 ORDER BY {} {} LIMIT {} OFFSET {}", sort_column, order_dir, per_page, offset));
+    let nulls = if ascending { "NULLS LAST" } else { "NULLS FIRST" };
+    let limit_clause = if posts_unlimited { String::new() } else { format!(" LIMIT {} OFFSET {}", per_page, offset) };
+    let order_clause = if needs_tx_time {
+        format!("1=1 ORDER BY {} {} {}, p.item_hash ASC{}", sort_column, order_dir, nulls, limit_clause)
+    } else {
+        format!("1=1 ORDER BY {} {}, p.item_hash ASC{}", sort_column, order_dir, limit_clause)
+    };
+    builder.and_raw(&order_clause);
     
     // Get total count first
     let (count_query, count_args) = count_builder.build();
@@ -1330,26 +1421,26 @@ pub async fn get_posts(
         }
     };
     
-    // Get original item_hashes for confirmation lookup
-    let item_hashes: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+    // Get coalesced item_hashes for confirmation lookup (uses amend hash when available)
+    let coalesced_hashes: Vec<String> = rows.iter().map(|r| r.1.clone()).collect();
     let mut confirmations_map: HashMap<String, Vec<ConfirmationResponse>> = HashMap::new();
-    
-    if !item_hashes.is_empty() {
-        let placeholders: Vec<String> = (1..=item_hashes.len())
+
+    if !coalesced_hashes.is_empty() {
+        let placeholders: Vec<String> = (1..=coalesced_hashes.len())
             .map(|i| format!("${}", i))
             .collect();
         let conf_query = format!(
             "SELECT item_hash, chain, hash, height FROM chain_txs WHERE item_hash IN ({})",
             placeholders.join(", ")
         );
-        
+
         let mut q = sqlx::query_as::<_, (String, String, String, i64)>(&conf_query);
-        for hash in &item_hashes {
+        for hash in &coalesced_hashes {
             q = q.bind(hash);
         }
-        
+
         let confirmations = q.fetch_all(state.db()).await.unwrap_or_default();
-        
+
         for (item_hash, chain, hash, height) in confirmations {
             confirmations_map
                 .entry(item_hash)
@@ -1361,7 +1452,7 @@ pub async fn get_posts(
     // Build response — merged post format matching Python pyaleph
     let posts: Vec<PostResponseV0> = rows.iter().map(|row| {
         let confirmations = confirmations_map
-            .get(&row.0)
+            .get(&row.1)
             .cloned()
             .unwrap_or_default();
         let confirmed = !confirmations.is_empty();
@@ -1395,9 +1486,16 @@ pub async fn get_posts(
         "posts": posts,
         "pagination_total": total.0,
         "pagination_page": page,
-        "pagination_per_page": per_page,
+        "pagination_per_page": if posts_unlimited { raw_pagination } else { per_page },
         "pagination_item": "posts",
     }))
+}
+
+/// Query parameters for single address balance
+#[derive(Debug, Deserialize)]
+pub struct BalanceQuery {
+    /// Filter by chain (e.g. "ETH", "AVAX")
+    pub chain: Option<String>,
 }
 
 /// Get balance for an address - matches pyaleph GetAccountBalanceResponse format
@@ -1406,6 +1504,7 @@ pub async fn get_posts(
 pub async fn get_balance(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
+    Query(params): Query<BalanceQuery>,
 ) -> impl IntoResponse {
     if !state.has_db() {
         return Json(json!({
@@ -1417,14 +1516,25 @@ pub async fn get_balance(
         }));
     }
 
-    // Query all per-chain balances for this address
-    let chain_balances: Vec<(String, rust_decimal::Decimal)> = sqlx::query_as(
-        "SELECT chain, balance FROM balances WHERE address = $1"
-    )
-    .bind(&address)
-    .fetch_all(state.db())
-    .await
-    .unwrap_or_default();
+    // Query per-chain balances for this address (optionally filtered by chain)
+    let chain_balances: Vec<(String, rust_decimal::Decimal)> = if let Some(ref chain) = params.chain {
+        sqlx::query_as(
+            "SELECT chain, balance FROM balances WHERE address = $1 AND chain = $2"
+        )
+        .bind(&address)
+        .bind(chain)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as(
+            "SELECT chain, balance FROM balances WHERE address = $1"
+        )
+        .bind(&address)
+        .fetch_all(state.db())
+        .await
+        .unwrap_or_default()
+    };
 
     // Build details map and compute total
     let mut details = serde_json::Map::new();
@@ -1436,9 +1546,9 @@ pub async fn get_balance(
     }
     let total_f64: f64 = total.to_string().parse().unwrap_or(0.0);
 
-    // Query locked_amount from account_costs (total_cost for the address)
+    // Query locked_amount from account_costs (cost_hold for the address, matching pyaleph)
     let locked: rust_decimal::Decimal = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(total_cost), 0) FROM account_costs WHERE address = $1"
+        "SELECT COALESCE(SUM(cost_hold), 0) FROM account_costs WHERE address = $1"
     )
     .bind(&address)
     .fetch_one(state.db())
@@ -2871,8 +2981,9 @@ pub async fn list_aggregates(
         }
     }
 
-    // Determine sort column - only last_modified is supported (matching pyaleph)
+    // Determine sort column
     let sort_column = match params.sort_by.as_deref() {
+        Some("creation_time") => "a.time",
         Some("last_modified") | _ => "COALESCE(ae.time, a.time)",
     };
 
@@ -3345,7 +3456,7 @@ pub struct AddressFilesQuery {
     pub pagination: Option<u32>,
     pub page: Option<u32>,
     /// Sort order: 1 for ascending, -1 for descending (default: -1)
-    #[serde(rename = "sortOrder")]
+    #[serde(alias = "sortOrder")]
     pub sort_order: Option<i8>,
 }
 
@@ -3455,8 +3566,7 @@ pub struct CreditHistoryQuery {
 #[derive(Debug, Clone, Serialize)]
 pub struct CreditHistoryItem {
     pub amount: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub price: Option<String>,
+    pub price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bonus_amount: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3473,13 +3583,11 @@ pub struct CreditHistoryItem {
     pub origin_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payment_method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_index: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expiration_date: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub message_timestamp: Option<String>,
 }
 
@@ -3609,7 +3717,7 @@ pub async fn get_address_credit_history(
     // Format response
     let history_items: Vec<CreditHistoryItem> = history.into_iter().map(|h| CreditHistoryItem {
         amount: h.0,
-        price: h.1.map(|p: rust_decimal::Decimal| p.to_string()),
+        price: h.1.map(|p: rust_decimal::Decimal| p.to_string().parse::<f64>().unwrap_or(0.0)),
         bonus_amount: h.2,
         tx_hash: h.3,
         token: h.4,
@@ -4060,6 +4168,16 @@ pub async fn list_messages_page(
     list_messages(State(state), Query(params)).await
 }
 
+/// GET /api/v1/posts/page/{page} - Paginated v1 posts
+pub async fn list_posts_v1_page(
+    State(state): State<Arc<AppState>>,
+    Path(page): Path<u32>,
+    Query(mut params): Query<PostsQuery>,
+) -> impl IntoResponse {
+    params.page = Some(page);
+    get_posts_v1(State(state), Query(params)).await
+}
+
 /// GET /api/v0/posts/page/{page}.json - Paginated posts
 pub async fn list_posts_page(
     State(state): State<Arc<AppState>>,
@@ -4111,10 +4229,23 @@ pub async fn get_posts_v1(
     }
 
     // V1 query: simpler than v0, no messages join needed
-    // Returns: original_item_hash, item_hash (coalesced), content (coalesced),
-    //          address, ref_, channel, created (original created_at), last_updated (coalesced),
-    //          original_type
-    let mut builder = crate::db::QueryBuilder::new(
+    // When tx-time sort is requested, add chain_txs LEFT JOIN
+    let v1_base = if matches!(params.sort_by.as_deref(), Some("tx-time")) {
+        "SELECT p.item_hash AS original_item_hash, \
+         COALESCE(a.item_hash, p.item_hash) AS item_hash, \
+         COALESCE(a.content, p.content) AS content, \
+         p.address, \
+         p.ref_, p.channel, \
+         p.created_at AS created, \
+         COALESCE(a.created_at, p.created_at) AS last_updated, \
+         p.post_type AS original_type \
+         FROM posts p \
+         LEFT JOIN posts a ON p.latest_amend = a.item_hash \
+         LEFT JOIN (SELECT item_hash, MIN(created_at) as earliest_confirmation \
+         FROM chain_txs GROUP BY item_hash) ct \
+         ON ct.item_hash = COALESCE(a.item_hash, p.item_hash) \
+         WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
+    } else {
         "SELECT p.item_hash AS original_item_hash, \
          COALESCE(a.item_hash, p.item_hash) AS item_hash, \
          COALESCE(a.content, p.content) AS content, \
@@ -4126,7 +4257,8 @@ pub async fn get_posts_v1(
          FROM posts p \
          LEFT JOIN posts a ON p.latest_amend = a.item_hash \
          WHERE (p.amends IS NULL OR p.amends = '[]'::jsonb)"
-    );
+    };
+    let mut builder = crate::db::QueryBuilder::new(v1_base);
     let mut count_builder = crate::db::QueryBuilder::new(
         "SELECT COUNT(*) FROM posts p \
          LEFT JOIN posts a ON p.latest_amend = a.item_hash \
@@ -4178,27 +4310,32 @@ pub async fn get_posts_v1(
         }
     }
 
-    // Time filters
+    // Time filters - use COALESCE for date filtering
     if let Some(start) = params.start_date {
-        builder.and_gte("p.time", start);
-        count_builder.and_gte("p.time", start);
+        builder.and_raw(&format!("COALESCE(a.time, p.time) >= {}", start));
+        count_builder.and_raw(&format!("COALESCE(a.time, p.time) >= {}", start));
     }
     if let Some(end) = params.end_date {
-        builder.and_lte("p.time", end);
-        count_builder.and_lte("p.time", end);
+        builder.and_raw(&format!("COALESCE(a.time, p.time) < {}", end));
+        count_builder.and_raw(&format!("COALESCE(a.time, p.time) < {}", end));
     }
 
-    // Filter by tags
+    // Filter by tags - OR logic matching pyaleph
     if let Some(ref tags) = params.tags {
         let tag_list = crate::db::parse_csv_param(tags);
-        for tag in tag_list {
-            let check_obj = serde_json::json!({"tags": [&tag]});
-            let check_str = check_obj.to_string().replace('\'', "''");
-            let clause = format!("COALESCE(a.content, p.content) @> '{}'::jsonb", check_str);
+        if !tag_list.is_empty() {
+            let keys_array: Vec<String> = tag_list.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect();
+            let clause = format!(
+                "(COALESCE(a.content, p.content)->'tags') ?| ARRAY[{}]",
+                keys_array.join(", ")
+            );
             builder.and_raw(&clause);
             count_builder.and_raw(&clause);
         }
     }
+
+    // Determine if v1 also needs tx-time
+    let v1_needs_tx_time = matches!(params.sort_by.as_deref(), Some("tx-time"));
 
     // Sort column
     let sort_column = match params.sort_by.as_deref() {
@@ -4206,12 +4343,18 @@ pub async fn get_posts_v1(
         Some("address") => "p.address".to_string(),
         Some("post_type") => "p.post_type".to_string(),
         Some("channel") => "p.channel".to_string(),
+        Some("tx-time") => "ct.earliest_confirmation".to_string(),
         _ => "COALESCE(a.created_at, p.created_at)".to_string(),
     };
 
     let ascending = order_param.map(|o| o == 1).unwrap_or(false);
     let order_dir = if ascending { "ASC" } else { "DESC" };
-    builder.and_raw(&format!("1=1 ORDER BY {} {} LIMIT {} OFFSET {}", sort_column, order_dir, per_page, offset));
+    if v1_needs_tx_time {
+        let nulls = if ascending { "NULLS LAST" } else { "NULLS FIRST" };
+        builder.and_raw(&format!("1=1 ORDER BY {} {} {}, p.item_hash ASC LIMIT {} OFFSET {}", sort_column, order_dir, nulls, per_page, offset));
+    } else {
+        builder.and_raw(&format!("1=1 ORDER BY {} {}, p.item_hash ASC LIMIT {} OFFSET {}", sort_column, order_dir, per_page, offset));
+    }
 
     // Get total count
     let (count_query, count_args) = count_builder.build();
@@ -4484,15 +4627,20 @@ pub async fn get_address_post_types(
         }));
     }
     
-    // Query distinct post types from posts table
+    // Query distinct post types from messages table (matching pyaleph: content->'type')
     let post_types: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT post_type FROM posts WHERE address = $1 ORDER BY post_type"
+        "SELECT DISTINCT item_content::jsonb->>'type' AS post_type \
+         FROM messages \
+         WHERE sender = $1 AND message_type = 'POST' \
+         AND item_content IS NOT NULL AND item_content != '' \
+         AND (item_content::jsonb->>'type') IS NOT NULL \
+         ORDER BY post_type"
     )
     .bind(&address)
     .fetch_all(state.db())
     .await
     .unwrap_or_default();
-    
+
     let types: Vec<String> = post_types.into_iter().map(|(t,)| t).collect();
     
     Json(json!({
@@ -4577,24 +4725,27 @@ pub async fn get_addresses_stats_v1(
     let offset = ((page - 1) * per_page) as i64;
     let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
 
-    // Build WHERE clause for optional address filter
-    let address_filter = if let Some(ref search) = params.address_contains {
+    // Build WHERE clause for optional address filter (parameterized to prevent SQL injection)
+    let address_search = params.address_contains.as_ref().map(|search| {
         // Limit search string to 66 chars (max address length)
-        let search = &search[..search.len().min(66)];
-        format!("WHERE sender ILIKE '%{}%'", search.replace('\'', "''").replace('%', "\\%").replace('_', "\\_"))
-    } else {
-        String::new()
-    };
+        let truncated = &search[..search.len().min(66)];
+        // Escape LIKE wildcards in user input
+        format!("%{}%", truncated.replace('%', "\\%").replace('_', "\\_"))
+    });
 
     // Get total unique senders count (with filter)
-    let count_query = format!(
-        "SELECT COUNT(DISTINCT sender) FROM messages {}",
-        address_filter
-    );
-    let total: (i64,) = sqlx::query_as(&count_query)
-        .fetch_one(state.db())
-        .await
-        .unwrap_or((0,));
+    let total: (i64,) = if let Some(ref pattern) = address_search {
+        sqlx::query_as("SELECT COUNT(DISTINCT sender) FROM messages WHERE sender ILIKE $1")
+            .bind(pattern)
+            .fetch_one(state.db())
+            .await
+            .unwrap_or((0,))
+    } else {
+        sqlx::query_as("SELECT COUNT(DISTINCT sender) FROM messages")
+            .fetch_one(state.db())
+            .await
+            .unwrap_or((0,))
+    };
 
     // Determine sort column based on sortBy parameter
     let sort_column = match params.sort_by.as_deref() {
@@ -4607,23 +4758,41 @@ pub async fn get_addresses_stats_v1(
         _ => "COUNT(*)".to_string(),
     };
 
-    // Query addresses with their message counts
+    // Query addresses with their message counts (parameterized)
     let order_clause = if ascending { "ASC" } else { "DESC" };
-    let query = format!(
-        "SELECT sender, COUNT(*) as total_messages \
-         FROM messages {} \
-         GROUP BY sender \
-         ORDER BY {} {} \
-         LIMIT $1 OFFSET $2",
-        address_filter, sort_column, order_clause
-    );
 
-    let addresses: Vec<(String, i64)> = sqlx::query_as(&query)
-        .bind(per_page as i64)
-        .bind(offset)
-        .fetch_all(state.db())
-        .await
-        .unwrap_or_default();
+    let addresses: Vec<(String, i64)> = if let Some(ref pattern) = address_search {
+        let query = format!(
+            "SELECT sender, COUNT(*) as total_messages \
+             FROM messages WHERE sender ILIKE $1 \
+             GROUP BY sender \
+             ORDER BY {} {} \
+             LIMIT $2 OFFSET $3",
+            sort_column, order_clause
+        );
+        sqlx::query_as(&query)
+            .bind(pattern)
+            .bind(per_page as i64)
+            .bind(offset)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default()
+    } else {
+        let query = format!(
+            "SELECT sender, COUNT(*) as total_messages \
+             FROM messages \
+             GROUP BY sender \
+             ORDER BY {} {} \
+             LIMIT $1 OFFSET $2",
+            sort_column, order_clause
+        );
+        sqlx::query_as(&query)
+            .bind(per_page as i64)
+            .bind(offset)
+            .fetch_all(state.db())
+            .await
+            .unwrap_or_default()
+    };
     
     if addresses.is_empty() {
         return Json(json!({
@@ -4732,8 +4901,10 @@ pub async fn get_message_hashes(
     }
 
     let page = params.page.unwrap_or(1).max(1);
-    let per_page = params.pagination.unwrap_or(20).min(1000);
-    let offset = ((page - 1) * per_page) as i64;
+    let raw_hashes_pagination = params.pagination.unwrap_or(20);
+    let hashes_unlimited = raw_hashes_pagination == 0;
+    let per_page = if hashes_unlimited { 0 } else { raw_hashes_pagination.min(1000) };
+    let offset = if hashes_unlimited { 0 } else { ((page - 1) * per_page) as i64 };
     let ascending = params.sort_order.map(|o| o == 1).unwrap_or(false);
 
     // Build query
@@ -4743,12 +4914,19 @@ pub async fn get_message_hashes(
         builder.and_gte("time", start);
     }
     if let Some(end) = params.end_date {
-        builder.and_lte("time", end);
+        builder.and_lt("time", end);
     }
 
-    builder.order_by("time", ascending);
-    builder.limit(per_page as i64);
-    builder.offset(offset);
+    // Secondary sort on item_hash for determinism
+    if ascending {
+        builder.order_by_raw("time ASC, item_hash ASC");
+    } else {
+        builder.order_by_raw("time DESC, item_hash ASC");
+    }
+    if !hashes_unlimited {
+        builder.limit(per_page as i64);
+        builder.offset(offset);
+    }
 
     // Count query
     let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
@@ -4756,7 +4934,7 @@ pub async fn get_message_hashes(
         count_builder.and_gte("time", start);
     }
     if let Some(end) = params.end_date {
-        count_builder.and_lte("time", end);
+        count_builder.and_lt("time", end);
     }
 
     let (count_query, count_args) = count_builder.build();

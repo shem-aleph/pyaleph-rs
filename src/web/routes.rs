@@ -136,6 +136,10 @@ pub fn api_v0() -> Router<Arc<AppState>> {
         .route("/core/:node_id/metrics", get(handlers::get_ccn_metrics))
         .route("/compute/:node_id/metrics", get(handlers::get_crn_metrics))
 
+        // PubSub publish endpoints (also available at root level for compat)
+        .route("/ipfs/pubsub/pub", post(handlers::pub_json))
+        .route("/p2p/pubsub/pub", post(handlers::pub_json))
+
         // WebSocket - real-time message streaming
         .route("/ws", get(websocket::ws_handler))
 }
@@ -147,6 +151,7 @@ pub fn api_v1() -> Router<Arc<AppState>> {
     Router::new()
         .route("/posts.json", get(handlers::get_posts_v1))
         .route("/posts", get(handlers::get_posts_v1))
+        .route("/posts/page/:page", get(handlers::list_posts_v1_page))
         // P2: v1 addresses stats endpoint with pagination
         .route("/addresses/stats.json", get(handlers::get_addresses_stats_v1))
 }
@@ -163,7 +168,7 @@ pub fn api_ws0() -> Router<Arc<AppState>> {
 /// Legacy routes for backwards compatibility
 fn legacy_routes() -> Router<Arc<AppState>> {
     Router::new()
-        // PubSub publish endpoints
+        // PubSub publish endpoints (legacy root-level paths)
         .route("/ipfs/pubsub/pub", post(handlers::pub_json))
         .route("/p2p/pubsub/pub", post(handlers::pub_json))
         // Direct access to common endpoints
@@ -171,11 +176,13 @@ fn legacy_routes() -> Router<Arc<AppState>> {
         .route("/aggregates.json", get(handlers::list_aggregates))
         .route("/aggregates/:address.json", get(handlers::get_aggregates))
         .route("/posts.json", get(handlers::get_posts))
-        
+
         // Legacy pending/sync at root level
         .route("/pending", get(handlers::get_pending_messages))
         .route("/sync/status", get(handlers::get_sync_status))
-        
+
+        // Metrics - Prometheus format at /metrics (pyaleph compat)
+        .route("/metrics", get(handlers::prometheus_metrics))
         // Metrics JSON
         .route("/metrics.json", get(handlers::metrics_json))
 
