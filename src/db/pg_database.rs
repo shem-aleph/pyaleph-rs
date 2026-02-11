@@ -330,7 +330,7 @@ impl Database for PgDatabase {
         sqlx::query(
             "INSERT INTO file_pins (item_hash, owner, size, content_type, pin_type, ref_, delete_by, message_hash) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT ON CONSTRAINT idx_file_pins_unique_typed DO UPDATE SET \
+             ON CONFLICT (item_hash, owner, pin_type) DO UPDATE SET \
                size = EXCLUDED.size, \
                content_type = COALESCE(EXCLUDED.content_type, file_pins.content_type), \
                ref_ = EXCLUDED.ref_, \
@@ -429,7 +429,7 @@ impl Database for PgDatabase {
         sqlx::query(
             "INSERT INTO file_pins (item_hash, owner, size, pin_type, delete_by) \
              VALUES ($1, $2, 0, 'grace_period', $3) \
-             ON CONFLICT ON CONSTRAINT idx_file_pins_unique_typed DO UPDATE SET delete_by = $3"
+             ON CONFLICT (item_hash, owner, pin_type) DO UPDATE SET delete_by = $3"
         )
         .bind(file_hash)
         .bind(owner)
