@@ -991,14 +991,15 @@ pub async fn get_aggregates(
     
     // Build base query - different for with_info vs regular
     if with_info {
-        // Query with join to get metadata
-        let aggregates: Vec<(String, serde_json::Value, f64, f64, Option<String>, Option<String>)> = match &key_list {
+        // Query with join to get metadata — include dirty flag for lazy refresh
+        let aggregates: Vec<(String, serde_json::Value, f64, f64, Option<String>, Option<String>, bool)> = match &key_list {
             Some(keys) if !keys.is_empty() => {
                 let mut query_str = String::from(
                     "SELECT a.key, a.content, a.time as created, \
                      COALESCE(ae.time, a.time) as last_updated, \
                      a.last_revision_hash as last_update_item_hash, \
-                     ae.item_hash as original_item_hash \
+                     ae.item_hash as original_item_hash, \
+                     a.dirty \
                      FROM aggregates a \
                      LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
                      WHERE a.address = $1 AND a.key = ANY($2)"
@@ -1018,7 +1019,8 @@ pub async fn get_aggregates(
                     "SELECT a.key, a.content, a.time as created, \
                      COALESCE(ae.time, a.time) as last_updated, \
                      a.last_revision_hash as last_update_item_hash, \
-                     ae.item_hash as original_item_hash \
+                     ae.item_hash as original_item_hash, \
+                     a.dirty \
                      FROM aggregates a \
                      LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
                      WHERE a.address = $1"
@@ -1033,10 +1035,94 @@ pub async fn get_aggregates(
                     .unwrap_or_default()
             }
         };
-        
+
         if aggregates.is_empty() {
             return (StatusCode::NOT_FOUND, Json(json!({
                 "error": "No aggregate found for this address"
+            })));
+        }
+
+        // Lazy refresh: rebuild any dirty aggregates before returning
+        let dirty_keys: Vec<String> = aggregates.iter()
+            .filter(|(_, _, _, _, _, _, dirty)| *dirty)
+            .map(|(key, _, _, _, _, _, _)| key.clone())
+            .collect();
+
+        if !dirty_keys.is_empty() {
+            for key in &dirty_keys {
+                if let Err(e) = crate::handlers::aggregate::AggregateHandler::rebuild_aggregate_from_elements(
+                    state.db(), &address, key,
+                ).await {
+                    tracing::warn!("Failed to refresh dirty aggregate {}/{}: {}", address, key, e);
+                }
+            }
+
+            // Re-fetch after refresh
+            let refreshed: Vec<(String, serde_json::Value, f64, f64, Option<String>, Option<String>)> = match &key_list {
+                Some(keys) if !keys.is_empty() => {
+                    let mut query_str = String::from(
+                        "SELECT a.key, a.content, a.time as created, \
+                         COALESCE(ae.time, a.time) as last_updated, \
+                         a.last_revision_hash as last_update_item_hash, \
+                         ae.item_hash as original_item_hash \
+                         FROM aggregates a \
+                         LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
+                         WHERE a.address = $1 AND a.key = ANY($2)"
+                    );
+                    if let Some(lim) = limit {
+                        query_str.push_str(&format!(" LIMIT {}", lim));
+                    }
+                    sqlx::query_as(&query_str)
+                        .bind(&address)
+                        .bind(keys)
+                        .fetch_all(state.db())
+                        .await
+                        .unwrap_or_default()
+                }
+                _ => {
+                    let mut query_str = String::from(
+                        "SELECT a.key, a.content, a.time as created, \
+                         COALESCE(ae.time, a.time) as last_updated, \
+                         a.last_revision_hash as last_update_item_hash, \
+                         ae.item_hash as original_item_hash \
+                         FROM aggregates a \
+                         LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
+                         WHERE a.address = $1"
+                    );
+                    if let Some(lim) = limit {
+                        query_str.push_str(&format!(" LIMIT {}", lim));
+                    }
+                    sqlx::query_as(&query_str)
+                        .bind(&address)
+                        .fetch_all(state.db())
+                        .await
+                        .unwrap_or_default()
+                }
+            };
+
+            let mut data = serde_json::Map::new();
+            let mut info = serde_json::Map::new();
+
+            for (key, content, created, last_updated, last_update_hash, original_hash) in refreshed {
+                data.insert(key.clone(), content);
+                let created_dt = chrono::DateTime::from_timestamp(created as i64, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| created.to_string());
+                let last_updated_dt = chrono::DateTime::from_timestamp(last_updated as i64, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| last_updated.to_string());
+                info.insert(key, json!({
+                    "created": created_dt,
+                    "last_updated": last_updated_dt,
+                    "original_item_hash": original_hash.unwrap_or_default(),
+                    "last_update_item_hash": last_update_hash.unwrap_or_default(),
+                }));
+            }
+
+            return (StatusCode::OK, Json(json!({
+                "address": address,
+                "data": data,
+                "info": info,
             })));
         }
 
@@ -1044,7 +1130,7 @@ pub async fn get_aggregates(
         let mut data = serde_json::Map::new();
         let mut info = serde_json::Map::new();
 
-        for (key, content, created, last_updated, last_update_hash, original_hash) in aggregates {
+        for (key, content, created, last_updated, last_update_hash, original_hash, _dirty) in aggregates {
             data.insert(key.clone(), content);
 
             // Convert timestamps to ISO format
@@ -1069,11 +1155,11 @@ pub async fn get_aggregates(
             "info": info,
         })))
     } else {
-        // Regular query without metadata
-        let aggregates: Vec<(String, serde_json::Value)> = match &key_list {
+        // Regular query without metadata — include dirty flag for lazy refresh
+        let aggregates: Vec<(String, serde_json::Value, bool)> = match &key_list {
             Some(keys) if !keys.is_empty() => {
                 let mut query_str = String::from(
-                    "SELECT key, content FROM aggregates WHERE address = $1 AND key = ANY($2)"
+                    "SELECT key, content, dirty FROM aggregates WHERE address = $1 AND key = ANY($2)"
                 );
                 if let Some(lim) = limit {
                     query_str.push_str(&format!(" LIMIT {}", lim));
@@ -1087,7 +1173,7 @@ pub async fn get_aggregates(
             }
             _ => {
                 let mut query_str = String::from(
-                    "SELECT key, content FROM aggregates WHERE address = $1"
+                    "SELECT key, content, dirty FROM aggregates WHERE address = $1"
                 );
                 if let Some(lim) = limit {
                     query_str.push_str(&format!(" LIMIT {}", lim));
@@ -1099,10 +1185,82 @@ pub async fn get_aggregates(
                     .unwrap_or_default()
             }
         };
-        
+
         if aggregates.is_empty() {
             return (StatusCode::NOT_FOUND, Json(json!({
                 "error": "No aggregate found for this address"
+            })));
+        }
+
+        // Lazy refresh: rebuild any dirty aggregates before returning
+        // Reference: aleph/web/controllers/aggregates.py — refreshes dirty on read
+        let dirty_keys: Vec<String> = aggregates.iter()
+            .filter(|(_, _, dirty)| *dirty)
+            .map(|(key, _, _)| key.clone())
+            .collect();
+
+        if !dirty_keys.is_empty() {
+            for key in &dirty_keys {
+                if let Err(e) = crate::handlers::aggregate::AggregateHandler::rebuild_aggregate_from_elements(
+                    state.db(), &address, key,
+                ).await {
+                    tracing::warn!("Failed to refresh dirty aggregate {}/{}: {}", address, key, e);
+                }
+            }
+
+            // Re-fetch the refreshed aggregates
+            let refreshed: Vec<(String, serde_json::Value)> = match &key_list {
+                Some(keys) if !keys.is_empty() => {
+                    let mut query_str = String::from(
+                        "SELECT key, content FROM aggregates WHERE address = $1 AND key = ANY($2)"
+                    );
+                    if let Some(lim) = limit {
+                        query_str.push_str(&format!(" LIMIT {}", lim));
+                    }
+                    sqlx::query_as(&query_str)
+                        .bind(&address)
+                        .bind(keys)
+                        .fetch_all(state.db())
+                        .await
+                        .unwrap_or_default()
+                }
+                _ => {
+                    let mut query_str = String::from(
+                        "SELECT key, content FROM aggregates WHERE address = $1"
+                    );
+                    if let Some(lim) = limit {
+                        query_str.push_str(&format!(" LIMIT {}", lim));
+                    }
+                    sqlx::query_as(&query_str)
+                        .bind(&address)
+                        .fetch_all(state.db())
+                        .await
+                        .unwrap_or_default()
+                }
+            };
+
+            // Handle value_only
+            if value_only {
+                if let Some(ref keys) = key_list {
+                    if keys.len() == 1 {
+                        for (key, content) in &refreshed {
+                            if key == &keys[0] {
+                                return (StatusCode::OK, Json(content.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut data = serde_json::Map::new();
+            for (key, content) in refreshed {
+                data.insert(key, content);
+            }
+
+            return (StatusCode::OK, Json(json!({
+                "address": address,
+                "data": data,
+                "info": {},
             })));
         }
 
@@ -1110,7 +1268,7 @@ pub async fn get_aggregates(
         if value_only {
             if let Some(ref keys) = key_list {
                 if keys.len() == 1 {
-                    for (key, content) in &aggregates {
+                    for (key, content, _) in &aggregates {
                         if key == &keys[0] {
                             return (StatusCode::OK, Json(content.clone()));
                         }
@@ -1121,7 +1279,7 @@ pub async fn get_aggregates(
 
         // Build data map
         let mut data = serde_json::Map::new();
-        for (key, content) in aggregates {
+        for (key, content, _) in aggregates {
             data.insert(key, content);
         }
 
@@ -2960,9 +3118,13 @@ pub async fn list_aggregates(
         }));
     }
 
-    // Build query with filters
+    // Build query with filters — include dirty flag for lazy refresh
     let mut builder = crate::db::QueryBuilder::new(
-        "SELECT a.address, a.key, a.content, a.time as created,          COALESCE(ae.time, a.time) as last_updated          FROM aggregates a          LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash          WHERE 1=1"
+        "SELECT a.address, a.key, a.content, a.time as created, \
+         COALESCE(ae.time, a.time) as last_updated, a.dirty \
+         FROM aggregates a \
+         LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
+         WHERE 1=1"
     );
     let mut count_builder = crate::db::QueryBuilder::new(
         "SELECT COUNT(*) FROM aggregates WHERE 1=1"
@@ -2998,26 +3160,90 @@ pub async fn list_aggregates(
         "1=1 ORDER BY {} {} LIMIT {} OFFSET {}",
         sort_column, order_dir, per_page, offset
     ));
-    
+
     // Get total count
     let (count_query, count_args) = count_builder.build();
     let total: (i64,) = sqlx::query_as_with(&count_query, count_args)
         .fetch_one(state.db())
         .await
         .unwrap_or((0,));
-    
+
     // Get aggregates
     let (query, args) = builder.build();
-    let aggregates: Vec<(String, String, serde_json::Value, f64, f64)> = 
+    let aggregates: Vec<(String, String, serde_json::Value, f64, f64, bool)> =
         sqlx::query_as_with(&query, args)
             .fetch_all(state.db())
             .await
             .unwrap_or_default();
-    
+
+    // Lazy refresh: rebuild any dirty aggregates before returning
+    let dirty_aggs: Vec<(String, String)> = aggregates.iter()
+        .filter(|(_, _, _, _, _, dirty)| *dirty)
+        .map(|(addr, key, _, _, _, _)| (addr.clone(), key.clone()))
+        .collect();
+
+    if !dirty_aggs.is_empty() {
+        for (addr, key) in &dirty_aggs {
+            if let Err(e) = crate::handlers::aggregate::AggregateHandler::rebuild_aggregate_from_elements(
+                state.db(), addr, key,
+            ).await {
+                tracing::warn!("Failed to refresh dirty aggregate {}/{}: {}", addr, key, e);
+            }
+        }
+
+        // Re-fetch after refresh (reuse same query shape without dirty column)
+        let mut builder2 = crate::db::QueryBuilder::new(
+            "SELECT a.address, a.key, a.content, a.time as created, \
+             COALESCE(ae.time, a.time) as last_updated \
+             FROM aggregates a \
+             LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
+             WHERE 1=1"
+        );
+        if let Some(ref addresses) = params.addresses {
+            let addr_list = crate::db::parse_csv_param(addresses);
+            if !addr_list.is_empty() { builder2.and_in("a.address", &addr_list); }
+        }
+        if let Some(ref keys) = params.keys {
+            let key_list = crate::db::parse_csv_param(keys);
+            if !key_list.is_empty() { builder2.and_in("a.key", &key_list); }
+        }
+        builder2.and_raw(&format!(
+            "1=1 ORDER BY {} {} LIMIT {} OFFSET {}",
+            sort_column, order_dir, per_page, offset
+        ));
+        let (q2, a2) = builder2.build();
+        let refreshed: Vec<(String, String, serde_json::Value, f64, f64)> =
+            sqlx::query_as_with(&q2, a2)
+                .fetch_all(state.db())
+                .await
+                .unwrap_or_default();
+
+        let aggregate_items: Vec<AggregateListItem> = refreshed
+            .into_iter()
+            .map(|(address, key, content, created, last_updated)| {
+                let created_dt = chrono::DateTime::from_timestamp(created as i64, ((created.fract() * 1_000_000.0) as u32) * 1000)
+                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+                    .unwrap_or_else(|| format!("{}", created));
+                let last_updated_dt = chrono::DateTime::from_timestamp(last_updated as i64, ((last_updated.fract() * 1_000_000.0) as u32) * 1000)
+                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+                    .unwrap_or_else(|| format!("{}", last_updated));
+                AggregateListItem { address, key, content, created: created_dt, last_updated: last_updated_dt }
+            })
+            .collect();
+
+        return Json(json!({
+            "aggregates": aggregate_items,
+            "pagination_per_page": per_page,
+            "pagination_page": page,
+            "pagination_total": total.0,
+            "pagination_item": "aggregates",
+        }));
+    }
+
     // Format response with ISO timestamps
     let aggregate_items: Vec<AggregateListItem> = aggregates
         .into_iter()
-        .map(|(address, key, content, created, last_updated)| {
+        .map(|(address, key, content, created, last_updated, _dirty)| {
             // Convert Unix timestamps to ISO 8601 format
             let created_dt = chrono::DateTime::from_timestamp(created as i64, ((created.fract() * 1_000_000.0) as u32) * 1000)
                 .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
@@ -3025,7 +3251,7 @@ pub async fn list_aggregates(
             let last_updated_dt = chrono::DateTime::from_timestamp(last_updated as i64, ((last_updated.fract() * 1_000_000.0) as u32) * 1000)
                 .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
                 .unwrap_or_else(|| format!("{}", last_updated));
-            
+
             AggregateListItem {
                 address,
                 key,
@@ -3035,7 +3261,7 @@ pub async fn list_aggregates(
             }
         })
         .collect();
-    
+
     Json(json!({
         "aggregates": aggregate_items,
         "pagination_per_page": per_page,

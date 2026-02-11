@@ -153,9 +153,9 @@ impl MessageHandler for AggregateHandler {
 
             // If no rows affected, key exists - need to merge or rebuild
             if insert_result.rows_affected() == 0 {
-                // Fetch existing timestamp
-                let existing_row: Option<(Value, f64)> = sqlx::query_as(
-                    "SELECT content, time FROM aggregates WHERE address = $1 AND key = $2"
+                // Fetch existing state including dirty flag
+                let existing_row: Option<(Value, f64, bool)> = sqlx::query_as(
+                    "SELECT content, time, dirty FROM aggregates WHERE address = $1 AND key = $2"
                 )
                 .bind(&content.address)
                 .bind(&content.key)
@@ -163,8 +163,15 @@ impl MessageHandler for AggregateHandler {
                 .await
                 .map_err(|e| HandlerError::Database(e.to_string()))?;
 
-                if let Some((existing_content, existing_time)) = existing_row {
-                    if content.time >= existing_time {
+                if let Some((existing_content, existing_time, is_dirty)) = existing_row {
+                    if is_dirty {
+                        // Already dirty — element is stored, skip aggregate update entirely.
+                        // Will be rebuilt lazily on next API read.
+                        tracing::debug!(
+                            "Aggregate {}/{} already dirty, skipping update",
+                            content.address, content.key
+                        );
+                    } else if content.time >= existing_time {
                         // Normal case: new message is newer, deep merge on top
                         let mut merged = existing_content;
                         Self::deep_merge(&mut merged, &content.content);
@@ -183,13 +190,40 @@ impl MessageHandler for AggregateHandler {
                         .map_err(|e| HandlerError::Database(e.to_string()))?;
                     } else {
                         // Out-of-order: new message is older than existing aggregate.
-                        // Must rebuild from all elements in chronological order.
-                        // Reference: aleph/handlers/content/aggregate.py — mark dirty + rebuild
-                        tracing::info!(
-                            "Out-of-order aggregate {}/{}: new_time={} < existing_time={}, rebuilding",
-                            content.address, content.key, content.time, existing_time
-                        );
-                        Self::rebuild_aggregate_from_elements(pool, &content.address, &content.key).await?;
+                        // Reference: aleph/handlers/content/aggregate.py — dirty threshold
+                        // Check element count: if > 1000, mark dirty instead of rebuilding
+                        let count: (i64,) = sqlx::query_as(
+                            "SELECT COUNT(*) FROM aggregate_elements WHERE address = $1 AND key = $2"
+                        )
+                        .bind(&content.address)
+                        .bind(&content.key)
+                        .fetch_one(pool)
+                        .await
+                        .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+                        if count.0 > 1000 {
+                            // Large aggregate — mark dirty for lazy refresh
+                            sqlx::query(
+                                "UPDATE aggregates SET dirty = true WHERE address = $1 AND key = $2"
+                            )
+                            .bind(&content.address)
+                            .bind(&content.key)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| HandlerError::Database(e.to_string()))?;
+
+                            tracing::info!(
+                                "Out-of-order aggregate {}/{}: {} elements > threshold, marked dirty",
+                                content.address, content.key, count.0
+                            );
+                        } else {
+                            // Small aggregate — rebuild immediately
+                            tracing::debug!(
+                                "Out-of-order aggregate {}/{}: {} elements, rebuilding",
+                                content.address, content.key, count.0
+                            );
+                            Self::rebuild_aggregate_from_elements(pool, &content.address, &content.key).await?;
+                        }
                     }
                 }
             }

@@ -679,26 +679,38 @@ async fn fetch_ipfs_with_retry(
 }
 
 /// OPTIMIZED: Batch insert messages AND queue them to pending_messages for processing
+///
+/// When `block_heights` is provided, uses block number as reception_time so that
+/// the message processor (ORDER BY reception_time ASC) processes earlier blocks first.
+/// This reduces out-of-order aggregate rebuilds during chain sync.
 async fn batch_insert_messages_and_queue(
     pool: &PgPool,
     messages: &[Message],
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    batch_insert_messages_and_queue_ordered(pool, messages, None).await
+}
+
+async fn batch_insert_messages_and_queue_ordered(
+    pool: &PgPool,
+    messages: &[Message],
+    block_heights: Option<&HashMap<String, u64>>,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     if messages.is_empty() {
         return Ok(0);
     }
-    
+
     let mut total_inserted = 0;
     let now = Utc::now().timestamp() as f64;
-    
+
     // Process in batches
     for chunk in messages.chunks(DB_BATCH_SIZE) {
         // Build multi-value INSERT for messages table
         let mut query = String::from(
             "INSERT INTO messages (item_hash, message_type, chain, sender, signature, item_type, item_content, channel, time, created_at) VALUES "
         );
-        
+
         let mut param_idx = 1;
-        
+
         for (i, _) in chunk.iter().enumerate() {
             if i > 0 {
                 query.push_str(", ");
@@ -710,12 +722,12 @@ async fn batch_insert_messages_and_queue(
             ));
             param_idx += 9;
         }
-        
+
         query.push_str(" ON CONFLICT (item_hash) DO UPDATE SET item_content = EXCLUDED.item_content WHERE messages.item_content IS NULL RETURNING item_hash");
-        
+
         // Build and execute query
         let mut sqlx_query = sqlx::query_scalar::<_, String>(&query);
-        
+
         for msg in chunk {
             sqlx_query = sqlx_query
                 .bind(&msg.item_hash)
@@ -728,77 +740,87 @@ async fn batch_insert_messages_and_queue(
                 .bind(&msg.channel)
                 .bind(msg.time);
         }
-        
+
         // Get list of inserted/updated item_hashes
         let affected_hashes: Vec<String> = sqlx_query.fetch_all(pool).await?;
         let affected_count = affected_hashes.len();
-        
+
         if affected_count > 0 {
             // Queue messages that were inserted or had content updated
             let affected_set: HashSet<&str> = affected_hashes.iter().map(|s| s.as_str()).collect();
             let messages_to_queue: Vec<&Message> = chunk.iter()
                 .filter(|m| affected_set.contains(m.item_hash.as_str()))
                 .collect();
-            
+
             if !messages_to_queue.is_empty() {
-                queue_messages_for_processing(pool, &messages_to_queue, now).await?;
+                queue_messages_for_processing(pool, &messages_to_queue, now, block_heights).await?;
             }
         }
-        
+
         total_inserted += affected_count;
     }
-    
+
     Ok(total_inserted)
 }
 
 /// Queue messages for processing by inserting into pending_messages
+///
+/// When `block_heights` is provided, uses block number as reception_time per message
+/// so the processor handles earlier blocks first (reduces out-of-order aggregate rebuilds).
 async fn queue_messages_for_processing(
     pool: &PgPool,
     messages: &[&Message],
     now: f64,
+    block_heights: Option<&HashMap<String, u64>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if messages.is_empty() {
         return Ok(());
     }
-    
+
     // Build multi-value INSERT for pending_messages
     let mut query = String::from(
         "INSERT INTO pending_messages (item_hash, message, reception_time, fetched, check_message, retries, next_attempt, trusted_source) VALUES "
     );
-    
+
     let mut param_idx = 1;
-    
+
     for (i, _) in messages.iter().enumerate() {
         if i > 0 {
             query.push_str(", ");
         }
         query.push_str(&format!(
             "(${}, ${}, ${}, ${}, ${}, ${}, ${}, true)",
-            param_idx, param_idx + 1, param_idx + 2, param_idx + 3, 
+            param_idx, param_idx + 1, param_idx + 2, param_idx + 3,
             param_idx + 4, param_idx + 5, param_idx + 6
         ));
         param_idx += 7;
     }
-    
+
     query.push_str(" ON CONFLICT (item_hash) DO NOTHING");
-    
+
     let mut sqlx_query = sqlx::query(&query);
-    
+
     for msg in messages {
         let message_json = serde_json::to_value(msg)?;
-        
+        // Use block height as reception_time when available (chain sync),
+        // otherwise use wall clock (P2P/API submissions)
+        let reception_time = block_heights
+            .and_then(|bh| bh.get(&msg.item_hash))
+            .map(|&block| block as f64)
+            .unwrap_or(now);
+
         sqlx_query = sqlx_query
             .bind(&msg.item_hash)
             .bind(message_json)
-            .bind(now)
+            .bind(reception_time)
             .bind(msg.item_content.is_some())  // fetched = true only if we have content
             .bind(true)  // check_message
             .bind(0i32)  // retries
-            .bind(now);  // next_attempt (process immediately)
+            .bind(reception_time);  // next_attempt
     }
-    
+
     sqlx_query.execute(pool).await?;
-    
+
     debug!("Queued {} messages for processing", messages.len());
     Ok(())
 }
@@ -1098,6 +1120,12 @@ async fn rpc_sync_cycle(
         successful_fetches, cids_to_fetch.len(), all_messages.len()
     );
 
+    // Build item_hash → block_number map for ordering pending_messages by block height
+    let block_height_map: HashMap<String, u64> = confirmation_data
+        .iter()
+        .map(|(item_hash, _tx, block, _pub, _ts)| (item_hash.clone(), *block))
+        .collect();
+
     // Deduplicate messages by item_hash
     let mut seen: HashMap<String, crate::types::Message> = HashMap::new();
     for msg in all_messages {
@@ -1117,8 +1145,14 @@ async fn rpc_sync_cycle(
     }
 
     // Filter out existing messages
-    let all_messages = filter_new_messages(pool, all_messages).await;
+    let mut all_messages = filter_new_messages(pool, all_messages).await;
     info!("RPC sync: {} truly new messages after DB dedup", all_messages.len());
+
+    // Sort messages by block height so the processor handles earlier blocks first.
+    // This reduces out-of-order aggregate rebuilds (e.g. corechannel with ~7000 elements).
+    all_messages.sort_by_key(|m| {
+        block_height_map.get(&m.item_hash).copied().unwrap_or(u64::MAX)
+    });
 
     let mut total_messages = 0;
 
@@ -1128,9 +1162,9 @@ async fn rpc_sync_cycle(
             .into_iter()
             .partition(|m| m.item_content.is_some());
 
-        // Insert inline messages immediately
+        // Insert inline messages immediately (ordered by block height)
         if !have_content.is_empty() {
-            let inserted = batch_insert_messages_and_queue(pool, &have_content).await?;
+            let inserted = batch_insert_messages_and_queue_ordered(pool, &have_content, Some(&block_height_map)).await?;
             total_messages += inserted;
             info!("RPC sync: inserted {} inline messages", inserted);
         }
@@ -1138,7 +1172,7 @@ async fn rpc_sync_cycle(
         // Insert storage-type message shells and resolve content in background
         if !need_content.is_empty() {
             let storage_count = need_content.len();
-            let inserted = batch_insert_messages_and_queue(pool, &need_content).await?;
+            let inserted = batch_insert_messages_and_queue_ordered(pool, &need_content, Some(&block_height_map)).await?;
             total_messages += inserted;
 
             // Resolve content in background
