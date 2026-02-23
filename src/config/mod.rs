@@ -230,7 +230,7 @@ pub struct DatabaseConfig {
 }
 
 fn default_db_url() -> String { "postgres://localhost/aleph".to_string() }
-fn default_max_connections() -> u32 { 20 }
+fn default_max_connections() -> u32 { 50 }
 fn default_min_connections() -> u32 { 2 }
 fn default_connect_timeout() -> u64 { 30 }
 fn default_idle_timeout() -> u64 { 600 }

@@ -193,11 +193,19 @@ pub struct MessageQuery {
     /// End block number filter (inclusive) - filters via chain_txs.height
     #[serde(rename = "endBlock")]
     pub end_block: Option<i64>,
+    /// Filter by payment type (comma-separated: hold, superfluid, credit)
+    #[serde(rename = "paymentTypes")]
+    pub payment_types: Option<String>,
+    /// Cursor for keyset pagination (format: `{time}_{item_hash}`)
+    /// When provided, skips count query and uses keyset filtering instead of OFFSET.
+    pub cursor: Option<String>,
 }
 
 /// List messages - matches pyaleph /messages.json response format
 ///
 /// Uses parameterized queries to prevent SQL injection.
+/// Supports cursor-based pagination: when `cursor` param is provided, uses keyset
+/// pagination (no COUNT query, returns `has_more` + `next_cursor` instead of total).
 pub async fn list_messages(
     State(state): State<Arc<AppState>>,
     Query(params): Query<MessageQuery>,
@@ -209,6 +217,19 @@ pub async fn list_messages(
     let unlimited = raw_pagination == 0;
     let per_page = if unlimited { 0 } else { raw_pagination.min(1000) };
     let offset = if unlimited { 0 } else { ((page - 1) * per_page) as i64 };
+
+    // Parse cursor for keyset pagination (format: {time}_{item_hash})
+    let cursor_parts: Option<(f64, String)> = params.cursor.as_ref().and_then(|c| {
+        let underscore_pos = c.find('_')?;
+        let time_str = &c[..underscore_pos];
+        let hash = &c[underscore_pos + 1..];
+        if hash.is_empty() {
+            return None;
+        }
+        let time = time_str.parse::<f64>().ok()?;
+        Some((time, hash.to_string()))
+    });
+    let use_cursor = cursor_parts.is_some();
 
     // Merge msgType and msgTypes (msgType takes precedence)
     let message_type_filter = params.message_type.or(params.message_types);
@@ -312,11 +333,11 @@ pub async fn list_messages(
         }
     }
     
-    // Parse refs filter (content.ref field - requires JSONB query)
+    // Parse refs filter (content.ref field - uses denormalized content_ref column)
     if let Some(ref refs) = params.refs {
         let ref_list = crate::db::parse_csv_param(refs);
         if !ref_list.is_empty() {
-            builder.and_jsonb_text_in("item_content", "ref", &ref_list);
+            builder.and_in("content_ref", &ref_list);
         }
     }
     
@@ -328,27 +349,27 @@ pub async fn list_messages(
         }
     }
     
-    // Parse contentTypes filter (content.type field)
+    // Parse contentTypes filter (uses denormalized content_type column)
     if let Some(ref content_types) = params.content_types {
         let type_list = crate::db::parse_csv_param(content_types);
         if !type_list.is_empty() {
-            builder.and_jsonb_text_in("item_content", "type", &type_list);
+            builder.and_in("content_type", &type_list);
         }
     }
     
-    // Parse contentHashes filter (content.item_hash field)
+    // Parse contentHashes filter (uses denormalized content_item_hash column)
     if let Some(ref content_hashes) = params.content_hashes {
         let hash_list = crate::db::parse_csv_param(content_hashes);
         if !hash_list.is_empty() {
-            builder.and_jsonb_text_in("item_content", "item_hash", &hash_list);
+            builder.and_in("content_item_hash", &hash_list);
         }
     }
     
-    // Parse owners filter (content.address field for programs/instances)
+    // Parse owners filter (uses denormalized owner column)
     if let Some(ref owners) = params.owners {
         let owner_list = crate::db::parse_csv_param(owners);
         if !owner_list.is_empty() {
-            builder.and_jsonb_text_in("item_content", "address", &owner_list);
+            builder.and_in("owner", &owner_list);
         }
     }
 
@@ -367,6 +388,17 @@ pub async fn list_messages(
         }
     }
 
+    // Parse paymentTypes filter (uses denormalized payment_type column)
+    if let Some(ref payment_types) = params.payment_types {
+        let pt_list: Vec<String> = crate::db::parse_csv_param(payment_types)
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        if !pt_list.is_empty() {
+            builder.and_in("payment_type", &pt_list);
+        }
+    }
+
     // Time filters (parameterized) - endDate uses strict less-than to match pyaleph
     if let Some(start) = params.start_date {
         builder.and_gte("time", start);
@@ -380,8 +412,6 @@ pub async fn list_messages(
     if params.start_block.is_some() || params.end_block.is_some() {
         // Build subquery to get item_hashes matching block range
         let mut block_conditions = Vec::new();
-        let mut block_params: Vec<String> = Vec::new();
-        
         if let Some(start_block) = params.start_block {
             block_conditions.push(format!("height >= {}", start_block));
         }
@@ -401,6 +431,20 @@ pub async fn list_messages(
     let order_value = params.sort_order.or(params.order);
     let ascending = order_value.map(|o| o == 1).unwrap_or(false);
 
+    // Cursor-based keyset filter (only for non-tx-time sorting)
+    // For tx-time sorting, cursor is not supported — fall back to offset pagination.
+    //
+    // The sort order is `time DESC, item_hash ASC` (or ASC, ASC for ascending).
+    // Because the secondary sort direction differs from the primary in DESC mode,
+    // we cannot use a simple tuple comparison. Instead we use an explicit condition:
+    //   DESC: (time < cursor_time) OR (time = cursor_time AND item_hash > cursor_hash)
+    //   ASC:  (time > cursor_time) OR (time = cursor_time AND item_hash > cursor_hash)
+    if let Some((cursor_time, ref cursor_hash)) = cursor_parts {
+        if !needs_tx_time_join {
+            builder.and_cursor_keyset("time", cursor_time, "item_hash", cursor_hash.clone(), ascending);
+        }
+    }
+
     if needs_tx_time_join {
         // Sort by earliest chain confirmation time, with NULLS handling
         // and secondary sorts for deterministic ordering (matches pyaleph)
@@ -417,134 +461,182 @@ pub async fn list_messages(
             builder.order_by_raw("time DESC, item_hash ASC");
         }
     }
+
+    // When using cursor, fetch one extra row to detect has_more
+    let fetch_limit = if use_cursor && !needs_tx_time_join && !unlimited {
+        per_page as i64 + 1
+    } else if !unlimited {
+        per_page as i64
+    } else {
+        0
+    };
+
     if !unlimited {
-        builder.limit(per_page as i64);
-        builder.offset(offset);
+        builder.limit(if use_cursor && !needs_tx_time_join { fetch_limit } else { per_page as i64 });
+        if !use_cursor || needs_tx_time_join {
+            builder.offset(offset);
+        }
     }
 
-    // Get total count - re-apply the same filters for count query
-    let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
+    // Cursor mode: active when cursor param provided and not using tx-time sorting
+    let cursor_active = use_cursor && !needs_tx_time_join;
 
-    // Exclude forgotten messages (must match the data query filter)
-    if !include_forgotten {
-        count_builder.and_raw("NOT EXISTS (SELECT 1 FROM forgotten_messages WHERE forgotten_messages.item_hash = messages.item_hash)");
-    }
-
-    if let Some(ref addresses) = params.addresses {
-        let addr_list = crate::db::parse_csv_param(addresses);
-        if !addr_list.is_empty() {
-            count_builder.and_in("sender", &addr_list);
-        }
-    }
-    if let Some(ref msg_type) = message_type_filter {
-        let type_list: Vec<String> = crate::db::parse_csv_param(msg_type).iter().map(|t| t.to_uppercase()).collect();
-        if type_list.len() == 1 {
-            count_builder.and_eq("message_type", type_list[0].clone());
-        } else if !type_list.is_empty() {
-            count_builder.and_in("message_type", &type_list);
-        }
-    }
-    if let Some(ref channels) = params.channels {
-        let channel_list = crate::db::parse_csv_param(channels);
-        if !channel_list.is_empty() {
-            count_builder.and_in("channel", &channel_list);
-        }
-    }
-    // Add same filters to count builder
-    if let Some(ref hashes) = params.hashes {
-        let hash_list = crate::db::parse_csv_param(hashes);
-        if !hash_list.is_empty() {
-            count_builder.and_in("item_hash", &hash_list);
-        }
-    }
-    if let Some(ref chains) = params.chains {
-        let chain_list = crate::db::parse_csv_param(chains);
-        if !chain_list.is_empty() {
-            count_builder.and_in("chain", &chain_list);
-        }
-    }
-    if let Some(ref refs) = params.refs {
-        let ref_list = crate::db::parse_csv_param(refs);
-        if !ref_list.is_empty() {
-            count_builder.and_jsonb_text_in("item_content", "ref", &ref_list);
-        }
-    }
-    if let Some(ref tags) = params.tags {
-        let tag_list = crate::db::parse_csv_param(tags);
-        if !tag_list.is_empty() {
-            count_builder.and_jsonb_has_any("item_content", "content.tags", &tag_list);
-        }
-    }
-    if let Some(ref content_types) = params.content_types {
-        let type_list = crate::db::parse_csv_param(content_types);
-        if !type_list.is_empty() {
-            count_builder.and_jsonb_text_in("item_content", "type", &type_list);
-        }
-    }
-    if let Some(ref content_hashes) = params.content_hashes {
-        let hash_list = crate::db::parse_csv_param(content_hashes);
-        if !hash_list.is_empty() {
-            count_builder.and_jsonb_text_in("item_content", "item_hash", &hash_list);
-        }
-    }
-    if let Some(ref owners) = params.owners {
-        let owner_list = crate::db::parse_csv_param(owners);
-        if !owner_list.is_empty() {
-            count_builder.and_jsonb_text_in("item_content", "address", &owner_list);
-        }
-    }
-    // contentKeys filter for count query
-    if let Some(ref content_keys) = params.content_keys {
-        let key_list = crate::db::parse_csv_param(content_keys);
-        if !key_list.is_empty() {
-            let keys_array: Vec<String> = key_list.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect();
-            let clause = format!(
-                "(item_content::jsonb->'content') ?| ARRAY[{}]",
-                keys_array.join(", ")
-            );
-            count_builder.and_raw(&clause);
-        }
-    }
-    if let Some(start) = params.start_date {
-        count_builder.and_gte("time", start);
-    }
-    if let Some(end) = params.end_date {
-        count_builder.and_lt("time", end);
-    }
-
-    // Block number filters for count query
-    if params.start_block.is_some() || params.end_block.is_some() {
-        let mut block_conditions = Vec::new();
-        if let Some(start_block) = params.start_block {
-            block_conditions.push(format!("height >= {}", start_block));
-        }
-        if let Some(end_block) = params.end_block {
-            block_conditions.push(format!("height <= {}", end_block));
-        }
-        let block_filter = format!(
-            "item_hash IN (SELECT item_hash FROM chain_txs WHERE {})",
-            block_conditions.join(" AND ")
-        );
-        count_builder.and_raw(&block_filter);
-    }
-    
-    let (count_query, count_args) = count_builder.build();
-    let total: (i64,) = sqlx::query_as_with(&count_query, count_args)
-        .fetch_one(state.db())
-        .await
-        .unwrap_or((0,));
-
-    // Now get the messages with the main query
+    // Fetch messages with the main query
     let (query, args) = builder.build();
-    let messages = sqlx::query_as_with::<_, crate::db::models::MessageDb, _>(&query, args)
+    let mut messages = sqlx::query_as_with::<_, crate::db::models::MessageDb, _>(&query, args)
         .fetch_all(state.db())
         .await
         .unwrap_or_default();
-    
+
+    // Detect has_more for cursor mode by checking if we got the extra row
+    let has_more = if cursor_active && !unlimited {
+        if messages.len() > per_page as usize {
+            messages.truncate(per_page as usize);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Build next_cursor from the last returned row
+    let next_cursor = if cursor_active && has_more {
+        messages.last().map(|msg| format!("{}_{}", msg.time, msg.item_hash))
+    } else {
+        None
+    };
+
+    // Get total count (skip entirely in cursor mode)
+    let total: i64 = if cursor_active {
+        // Cursor mode: no count query needed
+        0
+    } else if !unlimited && (messages.len() as u32) < per_page {
+        // Skip-count optimization: if we got fewer rows than per_page,
+        // we know the total without running COUNT(*)
+        (page as i64 - 1) * per_page as i64 + messages.len() as i64
+    } else {
+        // Full count query needed
+        let mut count_builder = crate::db::QueryBuilder::new("SELECT COUNT(*) FROM messages WHERE 1=1");
+
+        if !include_forgotten {
+            count_builder.and_raw("NOT EXISTS (SELECT 1 FROM forgotten_messages WHERE forgotten_messages.item_hash = messages.item_hash)");
+        }
+        if let Some(ref addresses) = params.addresses {
+            let addr_list = crate::db::parse_csv_param(addresses);
+            if !addr_list.is_empty() {
+                count_builder.and_in("sender", &addr_list);
+            }
+        }
+        if let Some(ref msg_type) = message_type_filter {
+            let type_list: Vec<String> = crate::db::parse_csv_param(msg_type).iter().map(|t| t.to_uppercase()).collect();
+            if type_list.len() == 1 {
+                count_builder.and_eq("message_type", type_list[0].clone());
+            } else if !type_list.is_empty() {
+                count_builder.and_in("message_type", &type_list);
+            }
+        }
+        if let Some(ref channels) = params.channels {
+            let channel_list = crate::db::parse_csv_param(channels);
+            if !channel_list.is_empty() {
+                count_builder.and_in("channel", &channel_list);
+            }
+        }
+        if let Some(ref hashes) = params.hashes {
+            let hash_list = crate::db::parse_csv_param(hashes);
+            if !hash_list.is_empty() {
+                count_builder.and_in("item_hash", &hash_list);
+            }
+        }
+        if let Some(ref chains) = params.chains {
+            let chain_list = crate::db::parse_csv_param(chains);
+            if !chain_list.is_empty() {
+                count_builder.and_in("chain", &chain_list);
+            }
+        }
+        if let Some(ref refs) = params.refs {
+            let ref_list = crate::db::parse_csv_param(refs);
+            if !ref_list.is_empty() {
+                count_builder.and_in("content_ref", &ref_list);
+            }
+        }
+        if let Some(ref tags) = params.tags {
+            let tag_list = crate::db::parse_csv_param(tags);
+            if !tag_list.is_empty() {
+                count_builder.and_jsonb_has_any("item_content", "content.tags", &tag_list);
+            }
+        }
+        if let Some(ref content_types) = params.content_types {
+            let type_list = crate::db::parse_csv_param(content_types);
+            if !type_list.is_empty() {
+                count_builder.and_in("content_type", &type_list);
+            }
+        }
+        if let Some(ref content_hashes) = params.content_hashes {
+            let hash_list = crate::db::parse_csv_param(content_hashes);
+            if !hash_list.is_empty() {
+                count_builder.and_in("content_item_hash", &hash_list);
+            }
+        }
+        if let Some(ref owners) = params.owners {
+            let owner_list = crate::db::parse_csv_param(owners);
+            if !owner_list.is_empty() {
+                count_builder.and_in("owner", &owner_list);
+            }
+        }
+        if let Some(ref content_keys) = params.content_keys {
+            let key_list = crate::db::parse_csv_param(content_keys);
+            if !key_list.is_empty() {
+                let keys_array: Vec<String> = key_list.iter().map(|k| format!("'{}'", k.replace('\'', "''"))).collect();
+                let clause = format!(
+                    "(item_content::jsonb->'content') ?| ARRAY[{}]",
+                    keys_array.join(", ")
+                );
+                count_builder.and_raw(&clause);
+            }
+        }
+        if let Some(ref payment_types) = params.payment_types {
+            let pt_list: Vec<String> = crate::db::parse_csv_param(payment_types)
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect();
+            if !pt_list.is_empty() {
+                count_builder.and_in("payment_type", &pt_list);
+            }
+        }
+        if let Some(start) = params.start_date {
+            count_builder.and_gte("time", start);
+        }
+        if let Some(end) = params.end_date {
+            count_builder.and_lt("time", end);
+        }
+        if params.start_block.is_some() || params.end_block.is_some() {
+            let mut block_conditions = Vec::new();
+            if let Some(start_block) = params.start_block {
+                block_conditions.push(format!("height >= {}", start_block));
+            }
+            if let Some(end_block) = params.end_block {
+                block_conditions.push(format!("height <= {}", end_block));
+            }
+            let block_filter = format!(
+                "item_hash IN (SELECT item_hash FROM chain_txs WHERE {})",
+                block_conditions.join(" AND ")
+            );
+            count_builder.and_raw(&block_filter);
+        }
+
+        let (count_query, count_args) = count_builder.build();
+        let row: (i64,) = sqlx::query_as_with(&count_query, count_args)
+            .fetch_one(state.db())
+            .await
+            .unwrap_or((0,));
+        row.0
+    };
+
     // Batch fetch confirmations for all messages
     let item_hashes: Vec<String> = messages.iter().map(|m| m.item_hash.clone()).collect();
     let mut confirmations_map: HashMap<String, Vec<ConfirmationResponse>> = HashMap::new();
-    
+
     if !item_hashes.is_empty() {
         // Batch fetch confirmations in chunks to avoid exceeding PostgreSQL's u16::MAX param limit
         for chunk in item_hashes.chunks(10_000) {
@@ -571,7 +663,7 @@ pub async fn list_messages(
             }
         }
     }
-    
+
     // Convert to response format with confirmations
     let message_responses: Vec<MessageResponse> = messages.iter()
         .map(|msg| {
@@ -582,14 +674,27 @@ pub async fn list_messages(
             MessageResponse::from_db(msg, confirmations)
         })
         .collect();
-    
-    Json(json!({
-        "messages": message_responses,
-        "pagination_total": total.0,
-        "pagination_page": page,
-        "pagination_per_page": if unlimited { raw_pagination } else { per_page },
-        "pagination_item": "messages",
-    }))
+
+    // Build response: cursor mode returns has_more/next_cursor, legacy returns total/page
+    if cursor_active {
+        let mut resp = json!({
+            "messages": message_responses,
+            "pagination_per_page": if unlimited { raw_pagination } else { per_page },
+            "has_more": has_more,
+        });
+        if let Some(cursor) = next_cursor {
+            resp["next_cursor"] = serde_json::Value::String(cursor);
+        }
+        Json(resp)
+    } else {
+        Json(json!({
+            "messages": message_responses,
+            "pagination_total": total,
+            "pagination_page": page,
+            "pagination_per_page": if unlimited { raw_pagination } else { per_page },
+            "pagination_item": "messages",
+        }))
+    }
 }
 
 /// Get a single message by hash - matches pyaleph format
@@ -987,7 +1092,7 @@ pub async fn get_aggregates(
     
     let with_info = params.with_info.unwrap_or(false);
     let value_only = params.value_only.unwrap_or(false);
-    let limit = params.limit;
+    let limit = params.limit.unwrap_or(1000); // pyaleph default: 1000
     
     // Build base query - different for with_info vs regular
     if with_info {
@@ -1002,34 +1107,28 @@ pub async fn get_aggregates(
                      a.dirty \
                      FROM aggregates a \
                      LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
-                     WHERE a.address = $1 AND a.key = ANY($2)"
+                     WHERE a.address = $1 AND a.key = ANY($2) LIMIT $3"
                 );
-                if let Some(lim) = limit {
-                    query_str.push_str(&format!(" LIMIT {}", lim));
-                }
                 sqlx::query_as(&query_str)
                     .bind(&address)
                     .bind(keys)
+                    .bind(limit as i64)
                     .fetch_all(state.db())
                     .await
                     .unwrap_or_default()
             }
             _ => {
-                let mut query_str = String::from(
-                    "SELECT a.key, a.content, a.time as created, \
+                let query_str = "SELECT a.key, a.content, a.time as created, \
                      COALESCE(ae.time, a.time) as last_updated, \
                      a.last_revision_hash as last_update_item_hash, \
                      ae.item_hash as original_item_hash, \
                      a.dirty \
                      FROM aggregates a \
                      LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
-                     WHERE a.address = $1"
-                );
-                if let Some(lim) = limit {
-                    query_str.push_str(&format!(" LIMIT {}", lim));
-                }
-                sqlx::query_as(&query_str)
+                     WHERE a.address = $1 LIMIT $2";
+                sqlx::query_as(query_str)
                     .bind(&address)
+                    .bind(limit as i64)
                     .fetch_all(state.db())
                     .await
                     .unwrap_or_default()
@@ -1060,40 +1159,32 @@ pub async fn get_aggregates(
             // Re-fetch after refresh
             let refreshed: Vec<(String, serde_json::Value, f64, f64, Option<String>, Option<String>)> = match &key_list {
                 Some(keys) if !keys.is_empty() => {
-                    let mut query_str = String::from(
-                        "SELECT a.key, a.content, a.time as created, \
+                    let query_str = "SELECT a.key, a.content, a.time as created, \
                          COALESCE(ae.time, a.time) as last_updated, \
                          a.last_revision_hash as last_update_item_hash, \
                          ae.item_hash as original_item_hash \
                          FROM aggregates a \
                          LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
-                         WHERE a.address = $1 AND a.key = ANY($2)"
-                    );
-                    if let Some(lim) = limit {
-                        query_str.push_str(&format!(" LIMIT {}", lim));
-                    }
-                    sqlx::query_as(&query_str)
+                         WHERE a.address = $1 AND a.key = ANY($2) LIMIT $3";
+                    sqlx::query_as(query_str)
                         .bind(&address)
                         .bind(keys)
+                        .bind(limit as i64)
                         .fetch_all(state.db())
                         .await
                         .unwrap_or_default()
                 }
                 _ => {
-                    let mut query_str = String::from(
-                        "SELECT a.key, a.content, a.time as created, \
+                    let query_str = "SELECT a.key, a.content, a.time as created, \
                          COALESCE(ae.time, a.time) as last_updated, \
                          a.last_revision_hash as last_update_item_hash, \
                          ae.item_hash as original_item_hash \
                          FROM aggregates a \
                          LEFT JOIN aggregate_elements ae ON a.last_revision_hash = ae.item_hash \
-                         WHERE a.address = $1"
-                    );
-                    if let Some(lim) = limit {
-                        query_str.push_str(&format!(" LIMIT {}", lim));
-                    }
-                    sqlx::query_as(&query_str)
+                         WHERE a.address = $1 LIMIT $2";
+                    sqlx::query_as(query_str)
                         .bind(&address)
+                        .bind(limit as i64)
                         .fetch_all(state.db())
                         .await
                         .unwrap_or_default()
@@ -1158,28 +1249,22 @@ pub async fn get_aggregates(
         // Regular query without metadata — include dirty flag for lazy refresh
         let aggregates: Vec<(String, serde_json::Value, bool)> = match &key_list {
             Some(keys) if !keys.is_empty() => {
-                let mut query_str = String::from(
-                    "SELECT key, content, dirty FROM aggregates WHERE address = $1 AND key = ANY($2)"
-                );
-                if let Some(lim) = limit {
-                    query_str.push_str(&format!(" LIMIT {}", lim));
-                }
-                sqlx::query_as(&query_str)
+                sqlx::query_as(
+                    "SELECT key, content, dirty FROM aggregates WHERE address = $1 AND key = ANY($2) LIMIT $3"
+                )
                     .bind(&address)
                     .bind(keys)
+                    .bind(limit as i64)
                     .fetch_all(state.db())
                     .await
                     .unwrap_or_default()
             }
             _ => {
-                let mut query_str = String::from(
-                    "SELECT key, content, dirty FROM aggregates WHERE address = $1"
-                );
-                if let Some(lim) = limit {
-                    query_str.push_str(&format!(" LIMIT {}", lim));
-                }
-                sqlx::query_as(&query_str)
+                sqlx::query_as(
+                    "SELECT key, content, dirty FROM aggregates WHERE address = $1 LIMIT $2"
+                )
                     .bind(&address)
+                    .bind(limit as i64)
                     .fetch_all(state.db())
                     .await
                     .unwrap_or_default()
@@ -1211,28 +1296,22 @@ pub async fn get_aggregates(
             // Re-fetch the refreshed aggregates
             let refreshed: Vec<(String, serde_json::Value)> = match &key_list {
                 Some(keys) if !keys.is_empty() => {
-                    let mut query_str = String::from(
-                        "SELECT key, content FROM aggregates WHERE address = $1 AND key = ANY($2)"
-                    );
-                    if let Some(lim) = limit {
-                        query_str.push_str(&format!(" LIMIT {}", lim));
-                    }
-                    sqlx::query_as(&query_str)
+                    sqlx::query_as(
+                        "SELECT key, content FROM aggregates WHERE address = $1 AND key = ANY($2) LIMIT $3"
+                    )
                         .bind(&address)
                         .bind(keys)
+                        .bind(limit as i64)
                         .fetch_all(state.db())
                         .await
                         .unwrap_or_default()
                 }
                 _ => {
-                    let mut query_str = String::from(
-                        "SELECT key, content FROM aggregates WHERE address = $1"
-                    );
-                    if let Some(lim) = limit {
-                        query_str.push_str(&format!(" LIMIT {}", lim));
-                    }
-                    sqlx::query_as(&query_str)
+                    sqlx::query_as(
+                        "SELECT key, content FROM aggregates WHERE address = $1 LIMIT $2"
+                    )
                         .bind(&address)
+                        .bind(limit as i64)
                         .fetch_all(state.db())
                         .await
                         .unwrap_or_default()

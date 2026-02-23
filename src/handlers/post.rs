@@ -159,7 +159,7 @@ impl MessageHandler for PostHandler {
         
         let is_amend = Self::is_amend(&content.post_type);
         
-        tracing::info!(
+        tracing::debug!(
             "Processing post: address={}, type={}, amend={}",
             content.address,
             content.post_type,
@@ -230,7 +230,7 @@ impl MessageHandler for PostHandler {
             .await
             .map_err(|e| HandlerError::Database(e.to_string()))?;
             
-            tracing::info!("Stored post: {}", record.item_hash);
+            tracing::debug!("Stored post: {}", record.item_hash);
             
             // If this is an amend, update the original's latest_amend
             if is_amend {

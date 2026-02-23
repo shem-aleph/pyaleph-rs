@@ -26,7 +26,7 @@ use futures::stream::{self, StreamExt};
 const PROCESS_INTERVAL_MS: u64 = 50;
 
 /// Maximum messages to process per batch
-const BATCH_SIZE: i64 = 2000;
+const BATCH_SIZE: i64 = 5000;
 
 /// Maximum number of retries before rejecting a message
 const MAX_RETRIES: i32 = 10;
@@ -91,16 +91,15 @@ pub async fn run(ctx: Arc<ProcessorContext>) {
 /// Process a batch of pending messages
 pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError> {
     let now = Utc::now().timestamp() as f64;
-    
+
     // Fetch messages that are due for processing
+    // No FOR UPDATE — single processor loop, no concurrent contention
     let pending_messages = sqlx::query_as::<_, PendingMessageDb>(
         r#"
-        SELECT * FROM pending_messages 
+        SELECT * FROM pending_messages
         WHERE next_attempt <= $1 AND retries < $2
-        ORDER BY
-            reception_time ASC
+        ORDER BY reception_time ASC
         LIMIT $3
-        FOR UPDATE SKIP LOCKED
         "#
     )
     .bind(now)
@@ -109,92 +108,171 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
     .fetch_all(&ctx.db)
     .await
     .map_err(|e| ProcessorError::Database(e.to_string()))?;
-    
+
     if pending_messages.is_empty() {
         return Ok(0);
     }
-    
-    // Group messages by sender address for safe parallel processing
-    // Messages from the same address must be processed sequentially
-    const MAX_PER_ADDRESS: usize = 1000;  // Higher cap
+
+    let batch_size = pending_messages.len();
+
     // Blacklisted addresses (skip processing entirely)
     const BLACKLISTED_ADDRESSES: &[&str] = &[
         "0x51A58800b26AA1451aaA803d1746687cB88E0501", // UNSLASHED - 3.2M spam messages
     ];
+
+    // --- Phase 1: Batch pre-filter duplicates and forgotten ---
+    let all_hashes: Vec<String> = pending_messages.iter().map(|m| m.item_hash.clone()).collect();
+
+    // Batch duplicate check — one query instead of N
+    let duplicate_hashes: std::collections::HashSet<String> = batch_check_duplicates(&ctx.db, &all_hashes).await?;
+
+    // Batch forgotten check — one query instead of N
+    let forgotten_hashes: std::collections::HashSet<String> = batch_check_forgotten(&ctx.db, &all_hashes).await?;
+
+    // Record chain confirmations for duplicates that came from chain sync
+    for msg in &pending_messages {
+        if duplicate_hashes.contains(&msg.item_hash) {
+            record_chain_confirmation_if_present(&ctx.db, &msg.item_hash, &msg.message).await;
+        }
+    }
+
+    // Collect hashes to delete immediately (duplicates + forgotten)
+    let mut to_delete: Vec<String> = Vec::new();
+    to_delete.extend(duplicate_hashes.iter().cloned());
+
+    // --- Phase 2: Classify remaining messages ---
     use std::collections::HashMap;
-    
-    // Group by address — all message types together, processed sequentially per address.
-    // Within each group, messages are in reception_time order (from SQL ORDER BY).
-    // This means aggregates created before posts get processed first for the same address.
-    // Cross-address dependencies resolve on retry.
-    let mut by_address: HashMap<String, Vec<PendingMessageDb>> = HashMap::new();
+
+    // Security aggregates: group by content.address, process sequentially
+    // Everything else: process fully in parallel
+    let mut security_agg_groups: HashMap<String, Vec<PendingMessageDb>> = HashMap::new();
+    let mut parallel_msgs: Vec<PendingMessageDb> = Vec::new();
     let mut blacklisted_hashes: Vec<String> = Vec::new();
+    let mut forgotten_count = 0u32;
+
     for msg in pending_messages {
-        let addr = msg.message.get("sender").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        if BLACKLISTED_ADDRESSES.contains(&addr.as_str()) {
+        // Skip already-handled messages
+        if duplicate_hashes.contains(&msg.item_hash) {
+            continue;
+        }
+        if forgotten_hashes.contains(&msg.item_hash) {
+            forgotten_count += 1;
+            to_delete.push(msg.item_hash.clone());
+            continue;
+        }
+
+        let sender = msg.message.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+        if BLACKLISTED_ADDRESSES.contains(&sender) {
             blacklisted_hashes.push(msg.item_hash.clone());
             continue;
         }
-        let entry = by_address.entry(addr).or_default();
-        if entry.len() < MAX_PER_ADDRESS {
-            entry.push(msg);
+
+        // Classify: is this a security aggregate?
+        let msg_type = msg.message.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if msg_type == "AGGREGATE" {
+            // Parse item_content to check if key == "security"
+            let is_security = msg.message.get("item_content")
+                .and_then(|ic| ic.as_str())
+                .and_then(|ic_str| serde_json::from_str::<serde_json::Value>(ic_str).ok())
+                .and_then(|parsed| parsed.get("key").and_then(|k| k.as_str()).map(|k| k == "security"))
+                .unwrap_or(false);
+
+            if is_security {
+                // Group by content.address for sequential processing
+                let content_address = msg.message.get("item_content")
+                    .and_then(|ic| ic.as_str())
+                    .and_then(|ic_str| serde_json::from_str::<serde_json::Value>(ic_str).ok())
+                    .and_then(|parsed| parsed.get("address").and_then(|a| a.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_default();
+                security_agg_groups.entry(content_address).or_default().push(msg);
+                continue;
+            }
         }
+
+        // Everything else: fully parallel
+        parallel_msgs.push(msg);
     }
-    // Delete blacklisted messages from pending
+
+    // Delete blacklisted
     if !blacklisted_hashes.is_empty() {
-        tracing::info!("Skipping {} blacklisted messages", blacklisted_hashes.len());
-        let _ = batch_delete_pending(&ctx.db, &blacklisted_hashes).await;
+        to_delete.extend(blacklisted_hashes);
     }
-    
-    tracing::info!("Processing {} address groups", by_address.len());
-    
-    // Process address groups in parallel — within each group, messages are sequential
-    let results: Vec<_> = stream::iter(by_address.into_values())
-        .map(|address_msgs| {
+
+    let parallel_count = parallel_msgs.len();
+    let security_group_count = security_agg_groups.len();
+    let security_msg_count: usize = security_agg_groups.values().map(|v| v.len()).sum();
+    tracing::info!(
+        "Batch {}: {} duplicates, {} forgotten, {} parallel, {} security-agg ({} groups)",
+        batch_size, duplicate_hashes.len(), forgotten_count,
+        parallel_count, security_msg_count, security_group_count,
+    );
+
+    // --- Phase 3: Process messages ---
+
+    // Process parallel messages — each as an independent task
+    let parallel_results: Vec<_> = stream::iter(parallel_msgs)
+        .map(|pending| {
+            let ctx = ctx.clone();
+            async move {
+                let hash = pending.item_hash.clone();
+                let result = match timeout(Duration::from_secs(30), process_single_message(&ctx, &pending)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(ProcessorError::InvalidMessage("Timeout".to_string())),
+                };
+                (hash, pending, result)
+            }
+        })
+        // Limit concurrency to ~2x connection pool size (default 50) to avoid
+        // starving the pool — each task may need multiple connections.
+        .buffer_unordered(100)
+        .collect::<Vec<_>>()
+        .await;
+
+    // Process security aggregate groups — sequential within each group, parallel across groups
+    let security_results: Vec<_> = stream::iter(security_agg_groups.into_values())
+        .map(|group_msgs| {
             let ctx = ctx.clone();
             async move {
                 let mut group_results = Vec::new();
-                for pending in address_msgs {
+                for pending in group_msgs {
                     let hash = pending.item_hash.clone();
-                    let result = match timeout(std::time::Duration::from_secs(30), process_single_message(&ctx, &pending)).await {
+                    let result = match timeout(Duration::from_secs(30), process_single_message(&ctx, &pending)).await {
                         Ok(r) => r,
-                        Err(_) => Err(ProcessorError::InvalidMessage("Timeout".to_string()))
+                        Err(_) => Err(ProcessorError::InvalidMessage("Timeout".to_string())),
                     };
                     group_results.push((hash, pending, result));
                 }
                 group_results
             }
         })
-        .buffer_unordered(200)
+        // Limit to pool size — each group runs sequential queries internally.
+        .buffer_unordered(50)
         .collect::<Vec<_>>()
         .await;
-    
-    // Flatten results
-    let results: Vec<_> = results.into_iter().flatten().collect();
-    tracing::info!("Processed {} messages", results.len());
-    // Batch collect successful deletions
-    let mut to_delete: Vec<String> = Vec::new();
-    let mut processed_count = 0u32;
-    tracing::info!("Results to process: {}", results.len());
-    
-    for (hash, pending, result) in results {
+
+    // --- Phase 4: Collect results ---
+    let all_results: Vec<_> = parallel_results.into_iter()
+        .chain(security_results.into_iter().flatten())
+        .collect();
+
+    let mut processed_count = duplicate_hashes.len() as u32 + forgotten_count;
+
+    for (hash, pending, result) in all_results {
         match result {
             Ok(status) => {
                 processed_count += 1;
                 match status {
                     ProcessResult::Processed => {
-                         to_delete.push(hash);
+                        to_delete.push(hash);
                     }
                     ProcessResult::Rejected(code, msg) => {
-                        tracing::info!("Message {} rejected: {:?} - {}", hash, code, msg);
+                        debug!("Message {} rejected: {:?} - {}", hash, code, msg);
                         let _ = move_to_rejected(&ctx.db, &pending, code, &msg).await;
                     }
                     ProcessResult::Retry(reason) => {
                         let _ = update_retry(&ctx.db, &pending, &reason).await;
                     }
-                    ProcessResult::Deferred => {
-                        // Left in pending_messages — next_attempt already updated
-                    }
+                    ProcessResult::Deferred => {}
                 }
             }
             Err(e) => {
@@ -203,14 +281,56 @@ pub async fn process_batch(ctx: &ProcessorContext) -> Result<u32, ProcessorError
             }
         }
     }
-    
-    // Batch delete processed messages
-    tracing::info!("End of batch: to_delete has {} items", to_delete.len());
+
+    // Batch delete all processed messages
     if !to_delete.is_empty() {
+        tracing::info!("Batch done: processed {}, deleting {} from pending", processed_count, to_delete.len());
         batch_delete_pending(&ctx.db, &to_delete).await?;
     }
-    
+
     Ok(processed_count)
+}
+
+/// Batch check which item_hashes already have derived data (duplicates)
+async fn batch_check_duplicates(db: &PgPool, hashes: &[String]) -> Result<std::collections::HashSet<String>, ProcessorError> {
+    if hashes.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT item_hash FROM posts WHERE item_hash = ANY($1)
+        UNION
+        SELECT item_hash FROM aggregate_elements WHERE item_hash = ANY($1)
+        UNION
+        SELECT item_hash FROM file_pins WHERE item_hash = ANY($1)
+        UNION
+        SELECT item_hash FROM programs WHERE item_hash = ANY($1)
+        UNION
+        SELECT item_hash FROM instances WHERE item_hash = ANY($1)
+        "#
+    )
+    .bind(hashes)
+    .fetch_all(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+
+    Ok(rows.into_iter().map(|(h,)| h).collect())
+}
+
+/// Batch check which item_hashes are forgotten
+async fn batch_check_forgotten(db: &PgPool, hashes: &[String]) -> Result<std::collections::HashSet<String>, ProcessorError> {
+    if hashes.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT item_hash FROM forgotten_messages WHERE item_hash = ANY($1)"
+    )
+    .bind(hashes)
+    .fetch_all(db)
+    .await
+    .map_err(|e| ProcessorError::Database(e.to_string()))?;
+
+    Ok(rows.into_iter().map(|(h,)| h).collect())
 }
 
 /// Result of processing a single message
@@ -227,38 +347,17 @@ enum ProcessResult {
 }
 
 /// Process a single pending message
+///
+/// NOTE: Duplicate and forgotten checks are done in batch before this is called.
 async fn process_single_message(
     ctx: &ProcessorContext,
     pending: &PendingMessageDb,
 ) -> Result<ProcessResult, ProcessorError> {
-    debug!("Processing message: {}", pending.item_hash);
-    
     // Step 1: Parse the message
     let message: Message = serde_json::from_value(pending.message.clone())
         .map_err(|e| ProcessorError::InvalidMessage(format!("Failed to parse: {}", e)))?;
-    
-    // Step 2: Check for duplicate (already processed)
-    if is_duplicate(&ctx.db, &message.item_hash).await? {
-        debug!("Message {} is a duplicate, skipping", message.item_hash);
 
-        // Record chain confirmation if the duplicate came from chain sync
-        // The pending message JSON may contain chain tx metadata from store_chain_message()
-        record_chain_confirmation_if_present(&ctx.db, &message.item_hash, &pending.message).await;
-
-        return Ok(ProcessResult::Processed); // Just remove from pending
-    }
-
-    // Step 2b: Check if already forgotten (race condition: FORGET processed before target)
-    // Reference: aleph/handlers/message_handler.py:443-457
-    if is_forgotten(&ctx.db, &message.item_hash).await? {
-        debug!("Message {} is already forgotten, rejecting", message.item_hash);
-        return Ok(ProcessResult::Rejected(
-            ErrorCode::InvalidFormat,
-            "Message already forgotten".to_string(),
-        ));
-    }
-
-    // Step 3: Fetch content if needed
+    // Step 2: Fetch content if needed
     // Try to fetch directly (IPFS/peer), defer only if fetch fails
     let message = if needs_content_fetch(&message) {
         match fetch_message_content(ctx, &message).await {
@@ -327,7 +426,7 @@ async fn process_single_message(
     match status.status.as_str() {
         "processed" => {
             // Store in messages table
-            store_processed_message(&ctx.db, &message).await?;
+            store_processed_message(&ctx.db, &message, pending.reception_time).await?;
 
             // Publish to RabbitMQ (fire-and-forget: log warnings but don't block processing)
             if let Some(ref rmq) = ctx.rabbitmq {
@@ -394,19 +493,6 @@ async fn fetch_message_content(
 }
 
 
-/// Reload item_content from messages table (after content_fetch has stored it)
-async fn reload_message_content(db: &PgPool, item_hash: &str) -> Result<Option<String>, ProcessorError> {
-    let result: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT item_content FROM messages WHERE item_hash = $1"
-    )
-    .bind(item_hash)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| ProcessorError::Database(e.to_string()))?;
-
-    Ok(result.and_then(|(content,)| content))
-}
-
 /// Defer a pending message by pushing its next_attempt forward without incrementing retries
 async fn defer_pending(db: &PgPool, item_hash: &str, delay_secs: f64) -> Result<(), ProcessorError> {
     let next_attempt = chrono::Utc::now().timestamp() as f64 + delay_secs;
@@ -419,28 +505,8 @@ async fn defer_pending(db: &PgPool, item_hash: &str, delay_secs: f64) -> Result<
     Ok(())
 }
 
-/// Check if a message has already been processed (duplicate detection)
-/// 
-/// NOTE: We check if derived data exists, not just if the message exists in messages table.
-/// This is because chain_sync inserts to messages table first, then queues for processing.
-async fn is_duplicate(db: &PgPool, item_hash: &str) -> Result<bool, ProcessorError> {
-    // Check if this message already has derived data (posts, aggregates, stores)
-    let has_derived = sqlx::query_scalar::<_, bool>(
-        r#"SELECT EXISTS(
-            SELECT 1 FROM posts WHERE item_hash = $1
-            UNION ALL
-            SELECT 1 FROM aggregate_elements WHERE item_hash = $1
-            UNION ALL
-            SELECT 1 FROM file_pins WHERE item_hash = $1
-        )"#
-    )
-    .bind(item_hash)
-    .fetch_one(db)
-    .await
-    .map_err(|e| ProcessorError::Database(e.to_string()))?;
-    
-    Ok(has_derived)
-}
+// Per-message duplicate/forgotten checks removed — now done in batch by
+// batch_check_duplicates() and batch_check_forgotten() in process_batch().
 
 /// Record a chain confirmation for a duplicate message if chain tx metadata is present.
 ///
@@ -462,15 +528,15 @@ async fn record_chain_confirmation_if_present(
     if let (Some(tx_hash), Some(chain), Some(height)) = (tx_hash, chain, height) {
         let result = sqlx::query(
             r#"
-            INSERT INTO chain_txs (item_hash, tx_hash, chain, height, confirmed_at)
-            VALUES ($1, $2, $3, $4, NOW())
-            ON CONFLICT (item_hash, tx_hash) DO NOTHING
+            INSERT INTO chain_txs (hash, chain, height, item_hash, protocol, created_at)
+            VALUES ($1, $2, $3, $4, 'on-chain', NOW())
+            ON CONFLICT (hash, item_hash) DO NOTHING
             "#,
         )
-        .bind(item_hash)
         .bind(tx_hash)
         .bind(chain)
         .bind(height)
+        .bind(item_hash)
         .execute(db)
         .await;
 
@@ -489,42 +555,15 @@ async fn record_chain_confirmation_if_present(
     }
 }
 
-/// Check if a message has already been forgotten
-async fn is_forgotten(db: &PgPool, item_hash: &str) -> Result<bool, ProcessorError> {
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM forgotten_messages WHERE item_hash = $1)"
-    )
-    .bind(item_hash)
-    .fetch_one(db)
-    .await
-    .map_err(|e| ProcessorError::Database(e.to_string()))?;
-    Ok(exists)
-}
-
-/// Mark a pending message as fetched
-async fn mark_fetched(db: &PgPool, item_hash: &str) -> Result<(), ProcessorError> {
-    sqlx::query("UPDATE pending_messages SET fetched = true WHERE item_hash = $1")
-        .bind(item_hash)
-        .execute(db)
-        .await
-        .map_err(|e| ProcessorError::Database(e.to_string()))?;
-    
-    Ok(())
-}
 
 /// Delete a pending message after successful processing
 async fn delete_pending(db: &PgPool, item_hash: &str) -> Result<(), ProcessorError> {
-    let result = sqlx::query("DELETE FROM pending_messages WHERE item_hash = $1")
+    sqlx::query("DELETE FROM pending_messages WHERE item_hash = $1")
         .bind(item_hash)
         .execute(db)
-        .await;
-    
-    match &result {
-        Ok(r) => tracing::info!("delete_pending: {} rows affected for {}", r.rows_affected(), item_hash),
-        Err(e) => tracing::error!("delete_pending FAILED for {}: {}", item_hash, e),
-    }
-    
-    result.map(|_| ()).map_err(|e| ProcessorError::Database(e.to_string()))
+        .await
+        .map(|_| ())
+        .map_err(|e| ProcessorError::Database(e.to_string()))
 }
 
 /// Batch delete pending messages
@@ -622,14 +661,49 @@ async fn update_retry(
 }
 
 /// Store a processed message in the main messages table
-async fn store_processed_message(db: &PgPool, message: &Message) -> Result<(), ProcessorError> {
+async fn store_processed_message(db: &PgPool, message: &Message, reception_time: f64) -> Result<(), ProcessorError> {
+    // Parse denormalized fields from item_content JSON
+    let parsed_content: Option<serde_json::Value> = message.item_content.as_ref()
+        .and_then(|ic| serde_json::from_str(ic).ok());
+
+    let owner = parsed_content.as_ref()
+        .and_then(|c| c.get("address").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    let content_type = parsed_content.as_ref()
+        .and_then(|c| c.get("type").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    let content_ref = parsed_content.as_ref()
+        .and_then(|c| c.get("ref").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    let content_key = parsed_content.as_ref()
+        .and_then(|c| c.get("key").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    let content_item_hash = parsed_content.as_ref()
+        .and_then(|c| c.get("item_hash").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    let payment_type = parsed_content.as_ref()
+        .and_then(|c| c.get("payment").and_then(|p| p.get("type")).and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+
     sqlx::query(
         r#"
         INSERT INTO messages (
-            item_hash, message_type, chain, sender, signature, 
-            item_type, item_content, channel, time, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-        ON CONFLICT (item_hash) DO UPDATE SET created_at = NOW()
+            item_hash, message_type, chain, sender, signature,
+            item_type, item_content, channel, time, created_at,
+            status, reception_time, owner, content_type, content_ref,
+            content_key, content_item_hash, payment_type
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
+                  'processed', $10, $11, $12, $13, $14, $15, $16)
+        ON CONFLICT (item_hash) DO UPDATE SET
+            created_at = NOW(),
+            status = EXCLUDED.status,
+            reception_time = COALESCE(messages.reception_time, EXCLUDED.reception_time),
+            owner = COALESCE(messages.owner, EXCLUDED.owner),
+            content_type = COALESCE(messages.content_type, EXCLUDED.content_type),
+            content_ref = COALESCE(messages.content_ref, EXCLUDED.content_ref),
+            content_key = COALESCE(messages.content_key, EXCLUDED.content_key),
+            content_item_hash = COALESCE(messages.content_item_hash, EXCLUDED.content_item_hash),
+            payment_type = COALESCE(messages.payment_type, EXCLUDED.payment_type)
         "#
     )
     .bind(&message.item_hash)
@@ -641,10 +715,17 @@ async fn store_processed_message(db: &PgPool, message: &Message) -> Result<(), P
     .bind(&message.item_content)
     .bind(&message.channel)
     .bind(normalize_timestamp(message.time))
+    .bind(reception_time)
+    .bind(&owner)
+    .bind(&content_type)
+    .bind(&content_ref)
+    .bind(&content_key)
+    .bind(&content_item_hash)
+    .bind(&payment_type)
     .execute(db)
     .await
     .map_err(|e| ProcessorError::Database(e.to_string()))?;
-    
+
     Ok(())
 }
 

@@ -35,8 +35,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Error> {
     create_pending_txs_table(pool).await?;
     create_peers_table(pool).await?;
     widen_narrow_columns(pool).await?;
+    denormalize_messages(pool).await?;
+    create_message_confirmations_table(pool).await?;
+    alter_chain_txs(pool).await?;
+    create_message_counts_table(pool).await?;
     create_indexes(pool).await?;
-    
+
     info!("Database migrations completed");
     Ok(())
 }
@@ -524,6 +528,158 @@ async fn widen_narrow_columns(pool: &PgPool) -> Result<(), Error> {
     Ok(())
 }
 
+/// Add denormalized columns to messages table for query performance.
+/// Reference: aleph/db/migrations/versions/0046_add_message_fields.py
+async fn denormalize_messages(pool: &PgPool) -> Result<(), Error> {
+    // status tracks processing state (processed, pending, rejected, forgotten)
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS status VARCHAR NOT NULL DEFAULT 'processed'"
+    ).execute(pool).await?;
+
+    // reception_time — when the node first received this message
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS reception_time DOUBLE PRECISION"
+    ).execute(pool).await?;
+
+    // Denormalized fields extracted from message content JSON
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS owner VARCHAR(256)"
+    ).execute(pool).await?;
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_type VARCHAR(50)"
+    ).execute(pool).await?;
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_ref TEXT"
+    ).execute(pool).await?;
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_key VARCHAR(256)"
+    ).execute(pool).await?;
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_item_hash VARCHAR(128)"
+    ).execute(pool).await?;
+
+    // Chain confirmation metadata
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS first_confirmed_at TIMESTAMPTZ"
+    ).execute(pool).await?;
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS first_confirmed_height BIGINT"
+    ).execute(pool).await?;
+
+    // Payment type denormalized from content
+    sqlx::query(
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS payment_type VARCHAR(20)"
+    ).execute(pool).await?;
+
+    info!("Added denormalized columns to messages table");
+    Ok(())
+}
+
+/// Create message_confirmations table — links messages to chain_txs.
+/// Referenced by chain_sync.rs for recording blockchain confirmations.
+async fn create_message_confirmations_table(pool: &PgPool) -> Result<(), Error> {
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS message_confirmations (
+            item_hash VARCHAR(128) NOT NULL,
+            tx_hash VARCHAR(256) NOT NULL,
+            PRIMARY KEY (item_hash, tx_hash)
+        )
+    "#)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_msg_confirmations_item_hash ON message_confirmations(item_hash)"
+    ).execute(pool).await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_msg_confirmations_tx_hash ON message_confirmations(tx_hash)"
+    ).execute(pool).await?;
+
+    Ok(())
+}
+
+/// Add missing columns to chain_txs that the processor and chain_sync reference.
+async fn alter_chain_txs(pool: &PgPool) -> Result<(), Error> {
+    sqlx::query(
+        "ALTER TABLE chain_txs ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ"
+    ).execute(pool).await?;
+    sqlx::query(
+        "ALTER TABLE chain_txs ADD COLUMN IF NOT EXISTS datetime TIMESTAMPTZ"
+    ).execute(pool).await?;
+    sqlx::query(
+        "ALTER TABLE chain_txs ADD COLUMN IF NOT EXISTS content JSONB"
+    ).execute(pool).await?;
+
+    Ok(())
+}
+
+/// Create message_counts table and trigger for fast count queries.
+/// Reference: aleph/db/migrations/versions/0047_message_counts.py, 0050_fix_counts.py
+async fn create_message_counts_table(pool: &PgPool) -> Result<(), Error> {
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS message_counts (
+            type VARCHAR NOT NULL DEFAULT '',
+            status VARCHAR NOT NULL DEFAULT '',
+            sender VARCHAR NOT NULL DEFAULT '',
+            owner VARCHAR NOT NULL DEFAULT '',
+            count BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (type, status, sender, owner)
+        )
+    "#)
+    .execute(pool)
+    .await?;
+
+    // Create or replace the trigger function that maintains message_counts.
+    // Tracks 5 dimension combinations per message change for fast filtered counts.
+    sqlx::query(r#"
+        CREATE OR REPLACE FUNCTION update_message_counts() RETURNS TRIGGER AS $$
+        BEGIN
+            IF TG_OP = 'DELETE' OR TG_OP = 'UPDATE' THEN
+                UPDATE message_counts SET count = count - 1
+                WHERE (type, status, sender, owner) IN (
+                    (OLD.message_type, OLD.status, OLD.sender, COALESCE(OLD.owner, '')),
+                    (OLD.message_type, OLD.status, '', ''),
+                    ('', OLD.status, OLD.sender, ''),
+                    ('', '', OLD.sender, ''),
+                    (OLD.message_type, '', '', '')
+                );
+            END IF;
+            IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+                INSERT INTO message_counts (type, status, sender, owner, count)
+                VALUES
+                    (NEW.message_type, NEW.status, NEW.sender, COALESCE(NEW.owner, ''), 1),
+                    (NEW.message_type, NEW.status, '', '', 1),
+                    ('', NEW.status, NEW.sender, '', 1),
+                    ('', '', NEW.sender, '', 1),
+                    (NEW.message_type, '', '', '', 1)
+                ON CONFLICT (type, status, sender, owner)
+                DO UPDATE SET count = message_counts.count + 1;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+    "#)
+    .execute(pool)
+    .await?;
+
+    // Attach trigger to messages table (DROP first for idempotency)
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS trg_message_counts ON messages"
+    ).execute(pool).await?;
+
+    sqlx::query(r#"
+        CREATE TRIGGER trg_message_counts
+        AFTER INSERT OR UPDATE OR DELETE ON messages
+        FOR EACH ROW EXECUTE FUNCTION update_message_counts()
+    "#)
+    .execute(pool)
+    .await?;
+
+    info!("Created message_counts table and trigger");
+    Ok(())
+}
+
 async fn create_indexes(pool: &PgPool) -> Result<(), Error> {
     // Messages indexes
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender)")
@@ -539,6 +695,9 @@ async fn create_indexes(pool: &PgPool) -> Result<(), Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_next_attempt ON pending_messages(next_attempt)")
         .execute(pool).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_retries ON pending_messages(retries)")
+        .execute(pool).await?;
+    // Composite index for the processor query: WHERE next_attempt <= $1 AND retries < 10 ORDER BY reception_time
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_processing ON pending_messages(next_attempt, reception_time ASC) WHERE retries < 10")
         .execute(pool).await?;
     
     // Aggregates indexes
@@ -612,7 +771,33 @@ async fn create_indexes(pool: &PgPool) -> Result<(), Error> {
         .execute(pool).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen)")
         .execute(pool).await?;
-    
+
+    // Denormalized messages indexes
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_messages_type_status_time ON messages(message_type, status, time DESC)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_messages_owner_time ON messages(owner, time DESC)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_messages_status ON messages(status)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_messages_content_ref ON messages(content_ref) WHERE content_ref IS NOT NULL")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_messages_content_type ON messages(content_type) WHERE content_type IS NOT NULL")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_messages_content_key ON messages(content_key) WHERE content_key IS NOT NULL")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_messages_reception_time ON messages(reception_time DESC)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_messages_payment_type ON messages(payment_type) WHERE payment_type IS NOT NULL")
+        .execute(pool).await?;
+
+    // file_pins coalesced ref index for store handler lookups
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_file_pins_coalesced_ref ON file_pins(COALESCE(ref_, item_hash)) WHERE pin_type = 'message'")
+        .execute(pool).await?;
+
+    // account_costs composite index
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_account_costs_owner_payment_type ON account_costs(owner, payment_type)")
+        .execute(pool).await?;
+
     info!("Created database indexes");
     Ok(())
 }

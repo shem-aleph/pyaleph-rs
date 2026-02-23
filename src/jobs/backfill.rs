@@ -17,9 +17,8 @@
 
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error};
 
 /// Batch size for backfill processing
 const BACKFILL_BATCH_SIZE: i64 = 5000;
@@ -42,6 +41,7 @@ pub struct BackfillResult {
     pub instances_errors: u64,
     pub programs_inserted: u64,
     pub programs_errors: u64,
+    pub messages_denorm_updated: u64,
     pub duration_secs: f64,
 }
 
@@ -49,7 +49,7 @@ impl std::fmt::Display for BackfillResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Backfill complete in {:.1}s: posts inserted={}, skipped={}, errors={} | aggregates inserted={}, errors={} | instances inserted={}, errors={} | programs inserted={}, errors={}",
+            "Backfill complete in {:.1}s: posts inserted={}, skipped={}, errors={} | aggregates inserted={}, errors={} | instances inserted={}, errors={} | programs inserted={}, errors={} | messages denorm={}",
             self.duration_secs,
             self.posts_inserted,
             self.posts_skipped,
@@ -60,6 +60,7 @@ impl std::fmt::Display for BackfillResult {
             self.instances_errors,
             self.programs_inserted,
             self.programs_errors,
+            self.messages_denorm_updated,
         )
     }
 }
@@ -77,6 +78,30 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
     }
 
     let start = Instant::now();
+
+    // Skip backfill when the pending queue is large — the message processor will handle
+    // everything. Backfill only matters after sync is mostly done and there are stragglers.
+    let pending_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_messages")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("Failed to count pending: {}", e))?;
+
+    if pending_count.0 > 10_000 {
+        BACKFILL_RUNNING.store(false, Ordering::SeqCst);
+        info!(
+            "Backfill skipped: {} pending messages in queue — processor will handle them",
+            pending_count.0
+        );
+        return Ok(BackfillResult {
+            posts_inserted: 0, posts_skipped: 0, posts_errors: 0,
+            aggregates_inserted: 0, aggregates_errors: 0,
+            instances_inserted: 0, instances_errors: 0,
+            programs_inserted: 0, programs_errors: 0,
+            messages_denorm_updated: 0,
+            duration_secs: start.elapsed().as_secs_f64(),
+        });
+    }
+
     info!("Starting backfill: checking for unprocessed messages...");
 
     // Check how many POST messages lack entries in the posts table
@@ -136,7 +161,20 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
         missing_posts.0, missing_aggregates.0, missing_instances.0, missing_programs.0
     );
 
-    if missing_posts.0 == 0 && missing_aggregates.0 == 0 && missing_instances.0 == 0 && missing_programs.0 == 0 {
+    // Check if denormalized columns need backfilling
+    let missing_denorm: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages WHERE owner IS NULL AND item_content IS NOT NULL AND item_content != ''"
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("Failed to count missing denorm: {}", e))?;
+
+    info!(
+        "Backfill needed: {} denormalized messages to update",
+        missing_denorm.0
+    );
+
+    if missing_posts.0 == 0 && missing_aggregates.0 == 0 && missing_instances.0 == 0 && missing_programs.0 == 0 && missing_denorm.0 == 0 {
         BACKFILL_RUNNING.store(false, Ordering::SeqCst);
         let result = BackfillResult {
             posts_inserted: 0,
@@ -148,6 +186,7 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
             instances_errors: 0,
             programs_inserted: 0,
             programs_errors: 0,
+            messages_denorm_updated: 0,
             duration_secs: start.elapsed().as_secs_f64(),
         };
         info!("Backfill: nothing to do, all tables up to date");
@@ -159,6 +198,7 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
     let aggregates_result = backfill_aggregates(pool).await;
     let instances_result = backfill_instances(pool).await;
     let programs_result = backfill_programs(pool).await;
+    let denorm_result = backfill_message_denorm(pool).await;
 
     BACKFILL_RUNNING.store(false, Ordering::SeqCst);
 
@@ -170,6 +210,8 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
         .map_err(|e| format!("Instances backfill failed: {}", e))?;
     let (programs_inserted, programs_errors) = programs_result
         .map_err(|e| format!("Programs backfill failed: {}", e))?;
+    let messages_denorm_updated = denorm_result
+        .map_err(|e| format!("Message denorm backfill failed: {}", e))?;
 
     let result = BackfillResult {
         posts_inserted,
@@ -181,6 +223,7 @@ pub async fn run_startup_backfill(pool: &PgPool) -> Result<BackfillResult, Strin
         instances_errors,
         programs_inserted,
         programs_errors,
+        messages_denorm_updated,
         duration_secs: start.elapsed().as_secs_f64(),
     };
 
@@ -373,6 +416,14 @@ async fn backfill_aggregates(pool: &PgPool) -> Result<(u64, u64), String> {
         return Ok((0, 0));
     }
 
+    // Ensure unique index on item_hash exists for ON CONFLICT
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agg_elements_item_hash ON aggregate_elements(item_hash)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create aggregate_elements unique index: {}", e))?;
+
     loop {
         batch_num += 1;
 
@@ -382,7 +433,6 @@ async fn backfill_aggregates(pool: &PgPool) -> Result<(u64, u64), String> {
             WITH raw_batch AS (
                 SELECT
                     m.item_hash,
-                    m.created_at,
                     m.time AS msg_time,
                     replace(m.item_content, '\u0000', '')::jsonb AS jb
                 FROM messages m
@@ -398,25 +448,22 @@ async fn backfill_aggregates(pool: &PgPool) -> Result<(u64, u64), String> {
                 SELECT
                     item_hash,
                     jb->>'key' AS agg_key,
-                    jb->>'address' AS owner,
+                    jb->>'address' AS address,
                     jb->'content' AS content,
-                    COALESCE(
-                        to_timestamp((jb->>'time')::double precision),
-                        created_at
-                    ) AS creation_datetime,
+                    COALESCE((jb->>'time')::double precision, msg_time) AS time,
                     msg_time
                 FROM raw_batch
             )
-            INSERT INTO aggregate_elements (item_hash, key, owner, content, creation_datetime)
+            INSERT INTO aggregate_elements (item_hash, key, address, content, time)
             SELECT
                 b.item_hash,
                 b.agg_key,
-                b.owner,
+                b.address,
                 COALESCE(b.content, '{}'::jsonb),
-                b.creation_datetime
+                b.time
             FROM batch b
             WHERE b.agg_key IS NOT NULL
-            AND b.owner IS NOT NULL
+            AND b.address IS NOT NULL
             ON CONFLICT (item_hash) DO NOTHING
             "#
         )
@@ -477,32 +524,31 @@ async fn backfill_aggregates(pool: &PgPool) -> Result<(u64, u64), String> {
 
     let rebuild_result = sqlx::query(
         r#"
-        INSERT INTO aggregates (key, owner, content, creation_datetime, last_revision_hash, dirty)
+        INSERT INTO aggregates (address, key, content, time, last_revision_hash, dirty)
         SELECT
+            ae.address,
             ae.key,
-            ae.owner,
-            -- Use jsonb_object_agg or a custom merge; for now just use the latest element's content
-            -- as a placeholder. Proper merge needs the jsonb_merge aggregate function.
-            -- If jsonb_merge exists, use it; otherwise fall back to marking as dirty.
+            -- Use the latest element's content as a placeholder.
+            -- Marked dirty so they get properly rebuilt on first access.
             (
                 SELECT ae2.content
                 FROM aggregate_elements ae2
-                WHERE ae2.key = ae.key AND ae2.owner = ae.owner
-                ORDER BY ae2.creation_datetime DESC
+                WHERE ae2.key = ae.key AND ae2.address = ae.address
+                ORDER BY ae2.time DESC
                 LIMIT 1
             ),
-            MIN(ae.creation_datetime),
+            MIN(ae.time),
             (
                 SELECT ae3.item_hash
                 FROM aggregate_elements ae3
-                WHERE ae3.key = ae.key AND ae3.owner = ae.owner
-                ORDER BY ae3.creation_datetime DESC
+                WHERE ae3.key = ae.key AND ae3.address = ae.address
+                ORDER BY ae3.time DESC
                 LIMIT 1
             ),
             true  -- Mark as dirty so they get properly rebuilt on first access
         FROM aggregate_elements ae
-        GROUP BY ae.key, ae.owner
-        ON CONFLICT (key, owner) DO UPDATE SET
+        GROUP BY ae.address, ae.key
+        ON CONFLICT (address, key) DO UPDATE SET
             dirty = true
         "#
     )
@@ -633,6 +679,191 @@ async fn backfill_programs(pool: &PgPool) -> Result<(u64, u64), String> {
     let inserted = result.rows_affected();
     info!("Programs backfill complete: inserted={}", inserted);
     Ok((inserted, 0))
+}
+
+/// Backfill denormalized columns on the messages table and populate message_counts.
+///
+/// Extracts fields from item_content JSON (stored as TEXT) into dedicated columns
+/// for fast filtering without JSON parsing at query time. Also populates
+/// first_confirmed_at/first_confirmed_height from chain_txs, and rebuilds
+/// the message_counts materialization.
+async fn backfill_message_denorm(pool: &PgPool) -> Result<u64, String> {
+    info!("Backfilling denormalized message columns...");
+
+    // Disable the message_counts trigger during backfill to avoid:
+    // 1. Wasted trigger overhead during bulk Phase 1 UPDATEs
+    // 2. Race condition: Phase 3 TRUNCATEs message_counts and rebuilds, but
+    //    concurrent processor inserts between TRUNCATE and rebuild lose counts
+    sqlx::query("ALTER TABLE messages DISABLE TRIGGER trg_message_counts")
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to disable message_counts trigger: {}", e))?;
+
+    // Use a helper closure pattern: run the actual work, then always re-enable the trigger
+    let result = backfill_message_denorm_inner(pool).await;
+
+    // Always re-enable the trigger, even on error
+    if let Err(e) = sqlx::query("ALTER TABLE messages ENABLE TRIGGER trg_message_counts")
+        .execute(pool)
+        .await
+    {
+        error!("Failed to re-enable message_counts trigger: {} — manual intervention needed", e);
+    }
+
+    result
+}
+
+/// Inner implementation of message denorm backfill (runs with trigger disabled).
+async fn backfill_message_denorm_inner(pool: &PgPool) -> Result<u64, String> {
+    let mut total_updated: u64 = 0;
+    let mut last_time: f64 = 0.0;
+    let mut batch_num: u64 = 0;
+
+    // Phase 1: Backfill content-derived columns in batches
+    loop {
+        batch_num += 1;
+
+        // Use a single CTE that updates and returns the cursor + count,
+        // avoiding a separate query that can race with the UPDATE on duplicate times.
+        let row: Option<(Option<f64>, i64)> = sqlx::query_as(
+            r#"
+            WITH batch AS (
+                SELECT item_hash, time,
+                       replace(item_content, '\u0000', '')::jsonb AS jb
+                FROM messages
+                WHERE owner IS NULL
+                AND item_content IS NOT NULL AND item_content != ''
+                AND time > $1
+                ORDER BY time ASC
+                LIMIT $2
+            ),
+            updated AS (
+                UPDATE messages m SET
+                    owner = b.jb->>'address',
+                    content_type = b.jb->>'type',
+                    content_ref = b.jb->>'ref',
+                    content_key = b.jb->>'key',
+                    content_item_hash = b.jb->>'item_hash',
+                    payment_type = b.jb->'payment'->>'type',
+                    status = 'processed'
+                FROM batch b
+                WHERE m.item_hash = b.item_hash
+                RETURNING m.time
+            )
+            SELECT MAX(time) AS max_time, COUNT(*) AS cnt FROM updated
+            "#
+        )
+        .bind(last_time)
+        .bind(BACKFILL_BATCH_SIZE)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Message denorm batch {} failed: {}", batch_num, e))?;
+
+        let (max_time, batch_count) = match row {
+            Some((Some(t), c)) if c > 0 => (t, c as u64),
+            _ => break, // No rows updated — we're done
+        };
+
+        total_updated += batch_count;
+        last_time = max_time;
+
+        if batch_num % 20 == 0 {
+            info!(
+                "Message denorm progress: batch={}, updated={}, cursor_time={:.0}",
+                batch_num, total_updated, last_time
+            );
+        }
+
+        if batch_count as i64 >= BACKFILL_BATCH_SIZE {
+            tokio::time::sleep(tokio::time::Duration::from_millis(BATCH_PAUSE_MS)).await;
+        } else {
+            break;
+        }
+    }
+
+    // Also set status='processed' for any rows that still have NULL owner
+    // (messages with no item_content, e.g. storage/ipfs types)
+    let status_result = sqlx::query(
+        "UPDATE messages SET status = 'processed' WHERE status IS NULL OR status = ''"
+    )
+    .execute(pool)
+    .await;
+
+    match status_result {
+        Ok(r) if r.rows_affected() > 0 => {
+            info!("Set status='processed' on {} messages without content", r.rows_affected());
+        }
+        Ok(_) => {}
+        Err(e) => warn!("Failed to set default status: {}", e),
+    }
+
+    // Phase 2: Backfill first_confirmed_at / first_confirmed_height from chain_txs
+    info!("Backfilling chain confirmation metadata...");
+    let confirm_result = sqlx::query(
+        r#"
+        UPDATE messages m SET
+            first_confirmed_at = ct.min_confirmed,
+            first_confirmed_height = ct.min_height
+        FROM (
+            SELECT item_hash,
+                   MIN(COALESCE(confirmed_at, created_at)) AS min_confirmed,
+                   MIN(height) AS min_height
+            FROM chain_txs
+            GROUP BY item_hash
+        ) ct
+        WHERE m.item_hash = ct.item_hash
+        AND m.first_confirmed_at IS NULL
+        "#
+    )
+    .execute(pool)
+    .await;
+
+    match confirm_result {
+        Ok(r) => info!("Backfilled chain confirmations for {} messages", r.rows_affected()),
+        Err(e) => warn!("Chain confirmation backfill failed: {}", e),
+    }
+
+    // Phase 3: Rebuild message_counts from scratch
+    info!("Rebuilding message_counts table...");
+    let truncate_result = sqlx::query("TRUNCATE message_counts")
+        .execute(pool)
+        .await;
+    if let Err(e) = truncate_result {
+        warn!("Failed to truncate message_counts (may not exist yet): {}", e);
+    }
+
+    // Insert the 5 dimension combinations
+    let counts_result = sqlx::query(
+        r#"
+        INSERT INTO message_counts (type, status, sender, owner, count)
+        SELECT message_type, status, sender, COALESCE(owner, ''), COUNT(*)
+        FROM messages GROUP BY message_type, status, sender, COALESCE(owner, '')
+        UNION ALL
+        SELECT message_type, status, '', '', COUNT(*)
+        FROM messages GROUP BY message_type, status
+        UNION ALL
+        SELECT '', status, sender, '', COUNT(*)
+        FROM messages GROUP BY status, sender
+        UNION ALL
+        SELECT '', '', sender, '', COUNT(*)
+        FROM messages GROUP BY sender
+        UNION ALL
+        SELECT message_type, '', '', '', COUNT(*)
+        FROM messages GROUP BY message_type
+        ON CONFLICT (type, status, sender, owner)
+        DO UPDATE SET count = EXCLUDED.count
+        "#
+    )
+    .execute(pool)
+    .await;
+
+    match counts_result {
+        Ok(r) => info!("Populated message_counts with {} rows", r.rows_affected()),
+        Err(e) => warn!("message_counts population failed: {}", e),
+    }
+
+    info!("Message denorm backfill complete: {} rows updated", total_updated);
+    Ok(total_updated)
 }
 
 /// Check if backfill is needed (quick check, doesn't run it)

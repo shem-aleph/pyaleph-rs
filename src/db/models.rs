@@ -22,6 +22,37 @@ pub struct MessageDb {
     pub channel: Option<String>,
     pub time: f64,
     pub created_at: DateTime<Utc>,
+    // --- Denormalized columns (populated by message processor, backfilled on startup) ---
+    /// Message processing status (default: 'processed')
+    #[sqlx(default)]
+    pub status: Option<String>,
+    /// When message was first received (Unix timestamp)
+    #[sqlx(default)]
+    pub reception_time: Option<f64>,
+    /// content.address (owner of programs/instances)
+    #[sqlx(default)]
+    pub owner: Option<String>,
+    /// content.type (e.g. "amend", "vm-function")
+    #[sqlx(default)]
+    pub content_type: Option<String>,
+    /// content.ref (reference hash for amends)
+    #[sqlx(default)]
+    pub content_ref: Option<String>,
+    /// content.content key name (for aggregates)
+    #[sqlx(default)]
+    pub content_key: Option<String>,
+    /// content.item_hash (content hash for store/program/instance)
+    #[sqlx(default)]
+    pub content_item_hash: Option<String>,
+    /// Earliest chain confirmation timestamp
+    #[sqlx(default)]
+    pub first_confirmed_at: Option<DateTime<Utc>>,
+    /// Earliest chain confirmation block height
+    #[sqlx(default)]
+    pub first_confirmed_height: Option<i64>,
+    /// payment.type (hold, superfluid, credit)
+    #[sqlx(default)]
+    pub payment_type: Option<String>,
 }
 
 /// Pending message record

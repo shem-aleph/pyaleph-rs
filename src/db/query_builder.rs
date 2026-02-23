@@ -159,6 +159,39 @@ impl QueryBuilder {
         self
     }
 
+    /// Add a cursor-based keyset condition for `ORDER BY col_a {ASC|DESC}, col_b ASC`.
+    ///
+    /// The secondary sort column (`col_b`) is always ASC, so a simple tuple comparison
+    /// would only work when the primary is also ASC. For DESC primary we need:
+    ///   `(col_a < $time) OR (col_a = $time AND col_b > $hash)`
+    /// For ASC primary:
+    ///   `(col_a > $time) OR (col_a = $time AND col_b > $hash)`
+    pub fn and_cursor_keyset(
+        &mut self,
+        col_a: &str,
+        val_a: f64,
+        col_b: &str,
+        val_b: String,
+        ascending: bool,
+    ) -> &mut Self {
+        let primary_op = if ascending { ">" } else { "<" };
+        let p1 = self.param_index;
+        let p2 = self.param_index + 1;
+        let p3 = self.param_index + 2;
+        let clause = format!(
+            " AND ({col_a} {primary_op} ${p1} OR ({col_a} = ${p2} AND {col_b} > ${p3}))"
+        );
+        self.query.push_str(&clause);
+        // Bind val_a twice (for the < and = comparisons) and val_b once
+        let _ = self.args.add(val_a);
+        self.param_index += 1;
+        let _ = self.args.add(val_a);
+        self.param_index += 1;
+        let _ = self.args.add(val_b);
+        self.param_index += 1;
+        self
+    }
+
     /// Add an AND condition checking if JSONB array contains ANY of the given values (OR logic)
     /// Uses the `?|` operator: `(column::jsonb->'path') ?| ARRAY[$1, $2, ...]`
     /// Supports nested paths like "content.tags"

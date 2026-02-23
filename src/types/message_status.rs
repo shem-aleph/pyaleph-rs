@@ -67,9 +67,10 @@ pub enum ErrorCode {
     PostAmendTargetNotFound = 101,
     PostAmendAmend = 102,
     
-    // Store-specific errors (200-201)
+    // Store-specific errors (200-202)
     StoreRefNotFound = 200,
     StoreUpdateUpdate = 201,
+    InvalidPaymentMethod = 202,
     
     // VM-specific errors (300-304)
     VmRefNotFound = 300,
@@ -106,6 +107,7 @@ impl ErrorCode {
             102 => Some(ErrorCode::PostAmendAmend),
             200 => Some(ErrorCode::StoreRefNotFound),
             201 => Some(ErrorCode::StoreUpdateUpdate),
+            202 => Some(ErrorCode::InvalidPaymentMethod),
             300 => Some(ErrorCode::VmRefNotFound),
             301 => Some(ErrorCode::VmVolumeNotFound),
             302 => Some(ErrorCode::VmAmendNotAllowed),
@@ -135,6 +137,7 @@ impl ErrorCode {
             ErrorCode::PostAmendAmend => "Cannot amend an amend post",
             ErrorCode::StoreRefNotFound => "Store reference not found",
             ErrorCode::StoreUpdateUpdate => "Cannot update an update message",
+            ErrorCode::InvalidPaymentMethod => "Messages with non-credit payment types are no longer allowed",
             ErrorCode::VmRefNotFound => "VM reference not found",
             ErrorCode::VmVolumeNotFound => "VM volume not found",
             ErrorCode::VmAmendNotAllowed => "VM does not allow amendments",
